@@ -1,0 +1,14 @@
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Namespace and image are appended by scripts/05-deploy.sh from .env, so this
+# file is identical whether you are on ROSA, self-managed OCP, or SNO.
+#
+# No label transformer on purpose: commonLabels also rewrites selectors, and
+# Deployment selectors are immutable, so it turns a later label change into a
+# failed apply for no benefit. The labels that matter are already on the
+# resources themselves.
+resources:
+  - deployment.yaml
+  - service.yaml

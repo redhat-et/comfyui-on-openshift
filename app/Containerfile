@@ -1,0 +1,106 @@
+# ComfyUI image that actually runs under OpenShift's restricted-v2 SCC.
+#
+# The whole trick is the last third of this file. OpenShift will run this
+# container as an arbitrary UID it picks at admission time — not 1000, not the
+# USER below — with GID 0 as a supplementary group. So every path the process
+# writes to has to be group-writable and owned by root group. Images that work
+# under `podman run` and crash-loop on OpenShift almost always fail on exactly
+# this.
+#
+#   podman build -t comfyui:latest -f app/Containerfile app/
+#
+# Or let the cluster build it: leave COMFYUI_IMAGE empty in .env and
+# `make deploy` will create a BuildConfig from this file.
+
+FROM nvcr.io/nvidia/cuda:12.6.2-cudnn-runtime-ubi9
+
+ARG COMFYUI_REF=master
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    APP_ROOT=/opt/comfyui
+
+# ---------------------------------------------------------------------------
+# System packages
+#
+# git is needed to fetch ComfyUI and custom nodes at build time. mesa-libGL and
+# libglib are pulled in by opencv, which half the custom node ecosystem depends
+# on and which fails at import time without them.
+# ---------------------------------------------------------------------------
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        python3.11 python3.11-pip python3.11-devel \
+        git mesa-libGL glib2 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+# ---------------------------------------------------------------------------
+# ComfyUI and PyTorch
+#
+# Torch is installed first and separately so it lands in its own layer — it is
+# ~2.5 GB and you do not want to re-pull it every time a requirement changes.
+# ---------------------------------------------------------------------------
+
+WORKDIR ${APP_ROOT}
+
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+    && python3 -m pip install --index-url ${TORCH_INDEX} \
+        torch torchvision torchaudio
+
+RUN git clone --depth 1 --branch ${COMFYUI_REF} \
+        https://github.com/comfyanonymous/ComfyUI.git . \
+    && python3 -m pip install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Your code
+#
+# Drop custom nodes, workflows, and any backend of your own into app/src/ and
+# they land here. Keep pip installs at BUILD time — the container cannot install
+# anything at start, it has no network guarantees and no write access outside
+# the volumes.
+# ---------------------------------------------------------------------------
+
+COPY requirements-extra.txt ${APP_ROOT}/requirements-extra.txt
+COPY src/ ${APP_ROOT}/
+
+RUN if [ -s ${APP_ROOT}/requirements-extra.txt ]; then \
+        python3 -m pip install -r ${APP_ROOT}/requirements-extra.txt; \
+    fi
+
+# ---------------------------------------------------------------------------
+# OpenShift arbitrary-UID compatibility
+#
+# Everything below this line is what makes the image portable to OpenShift.
+# Removing any of it will produce a permission error at start that looks like a
+# volume problem and is not.
+# ---------------------------------------------------------------------------
+
+# Model and output dirs are mount points for PVCs. They must exist and be
+# group-writable so the arbitrary UID can write through the mount.
+RUN mkdir -p /models /output ${APP_ROOT}/temp ${APP_ROOT}/input
+
+# Group root, group-writable, and the setgid bit on directories so anything
+# created later inherits the group.
+RUN chgrp -R 0 ${APP_ROOT} /models /output \
+    && chmod -R g=u ${APP_ROOT} /models /output \
+    && find ${APP_ROOT} /models /output -type d -exec chmod g+s {} \;
+
+# Declared for local `podman run` clarity. OpenShift overrides it, which is
+# fine — the permissions above are what make that safe.
+USER 1001
+
+EXPOSE 8188
+
+# ComfyUI resolves model dirs relative to its own tree by default, so point it
+# at the volumes explicitly. --listen 0.0.0.0 is required for the readiness
+# probe to reach it from the kubelet.
+ENTRYPOINT ["python3", "main.py"]
+CMD ["--listen", "0.0.0.0", \
+     "--port", "8188", \
+     "--base-directory", "/models", \
+     "--output-directory", "/output", \
+     "--temp-directory", "/tmp"]

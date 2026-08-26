@@ -1,0 +1,2 @@
+# Extra pip dependencies for your custom nodes.
+# Installed at BUILD time — the running container cannot pip install.

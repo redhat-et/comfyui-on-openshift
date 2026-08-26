@@ -1,0 +1,141 @@
+---
+# ComfyUI.
+#
+# Three OpenShift-specific things that break most ComfyUI container images, and
+# what this manifest does about each:
+#
+#   1. The restricted-v2 SCC runs your container as an arbitrary high UID, not
+#      the one in the Dockerfile, and with a random supplemental GID. Anything
+#      the process writes must be a volume or be group-writable at build time.
+#      Hence: PVCs on /models and /output, emptyDir on /tmp, and the chmod g+rwX
+#      in app/Containerfile.
+#   2. There is no implied root. An image that runs apt-get or pip install at
+#      container start will fail here. Bake dependencies into the image.
+#   3. The GPU node is tainted, so every pod that wants the card needs the
+#      matching toleration below.
+#
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfyui
+  labels:
+    app: comfyui
+spec:
+  # One replica on purpose. There is one GPU; ComfyUI pins models in VRAM; a
+  # second replica would fight the first for the card and lose.
+  replicas: 1
+
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: comfyui
+
+  template:
+    metadata:
+      labels:
+        app: comfyui
+    spec:
+      # This label comes from Node Feature Discovery (10de is NVIDIA's PCI
+      # vendor id), so it works identically on ROSA, self-managed OCP, and SNO —
+      # no cloud-specific node labels involved.
+      nodeSelector:
+        feature.node.kubernetes.io/pci-10de.present: "true"
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: comfyui
+          image: comfyui:latest
+          imagePullPolicy: Always
+
+          # No `args` here on purpose. A pod-spec args REPLACES the image's CMD
+          # wholesale, so listing a couple of flags would silently drop the
+          # --base-directory / --output-directory / --temp-directory flags that
+          # app/Containerfile sets — and ComfyUI would quietly write to its own
+          # tree instead of the mounted volumes, losing every output on restart.
+          # If you need to change the flags, change CMD in the Containerfile.
+
+          ports:
+            - name: http
+              containerPort: 8188
+              protocol: TCP
+
+          # ComfyUI takes its paths from CLI flags, not environment variables —
+          # see CMD in app/Containerfile. These are for the libraries underneath
+          # it, which do read the environment.
+          env:
+            - name: HF_HOME
+              value: /models/.cache/huggingface
+            - name: TORCH_HOME
+              value: /models/.cache/torch
+            # Cuts fragmentation-driven OOM on 24 GB cards running long queues.
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              memory: 8Gi
+              cpu: "1"
+            limits:
+              # GPUs are not divisible — request and limit must match.
+              nvidia.com/gpu: 1
+              memory: 24Gi
+              cpu: "3"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: output
+              mountPath: /output
+            - name: scratch
+              mountPath: /tmp
+
+          # Loading a checkpoint into VRAM on first start takes minutes. The
+          # generous startupProbe budget is what stops the livenessProbe from
+          # killing the pod mid-load — far and away the most common cause of a
+          # CrashLoopBackOff here.
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: comfyui-models
+        - name: output
+          persistentVolumeClaim:
+            claimName: comfyui-output
+        - name: scratch
+          emptyDir: {}

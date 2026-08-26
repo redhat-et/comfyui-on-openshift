@@ -1,0 +1,16 @@
+# Contains ROSA_TOKEN and your AWS profile name. Never commit.
+.env
+
+# Written by scripts/02-cluster.sh
+.cluster-state
+
+# Local model files, if you stage them here before rsync
+models/
+checkpoints/
+*.safetensors
+*.ckpt
+*.pt
+
+# Editor / OS
+.DS_Store
+*.swp

@@ -1,0 +1,26 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfyui
+  labels:
+    app: comfyui
+spec:
+  selector:
+    app: comfyui
+  ports:
+    - name: http
+      port: 8188
+      targetPort: http
+      protocol: TCP
+---
+# Deliberately no Route.
+#
+# ComfyUI ships with no authentication, and its custom-node system executes
+# arbitrary Python by design. A public Route on this Service is a remote code
+# execution endpoint attached to a node that holds cloud credentials. Use:
+#
+#     make forward        # localhost:8188, over the cluster API, authenticated
+#
+# If you do need it reachable by other people, put an oauth-proxy sidecar in
+# front and expose that — see docs/04-exposing.md — rather than exposing 8188.
