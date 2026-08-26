@@ -63,6 +63,33 @@ RUN git clone --depth 1 --branch ${COMFYUI_REF} \
     && python3 -m pip install -r requirements.txt
 
 # ---------------------------------------------------------------------------
+# ComfyUI-Manager (ENABLE_MANAGER=true in .env, then `make deploy` to rebuild)
+#
+# Its headline feature here: load a workflow, Manager lists every model the
+# workflow needs that you do not have, and one click downloads them — into
+# /models, the persistent volume, where ComfyUI actually reads them (that is
+# the --models-directory flag at the bottom of this file doing its job).
+#
+# It lives in custom_nodes/ inside the ComfyUI install, like any other node
+# pack — before the permissions section below, so the arbitrary UID can write
+# its config and cache.
+#
+# Know the limits: model downloads persist; runtime custom-NODE installs do
+# not (container filesystem, gone on restart, and their pip deps cannot
+# install into read-only site-packages at all — bake nodes into src/ instead).
+# And keep this pod behind `make forward`: Manager is an install-and-run-code
+# button, which is fine for you and catastrophic on a public Route.
+# ---------------------------------------------------------------------------
+
+ARG ENABLE_MANAGER=false
+
+RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
+        git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
+            custom_nodes/ComfyUI-Manager && \
+        python3 -m pip install -r custom_nodes/ComfyUI-Manager/requirements.txt; \
+    fi
+
+# ---------------------------------------------------------------------------
 # Your code
 #
 # Drop custom nodes, workflows, and any backend of your own into app/src/ and

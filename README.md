@@ -166,6 +166,7 @@ Everything lives in `.env`. The ones you are most likely to change:
 | `STORAGE_MODE` | `rwo` | `rwx` for EFS shared across pods — see docs/03-storage.md |
 | `COMFYUI_IMAGE` | empty | empty means build in-cluster from `app/Containerfile` |
 | `COMFYUI_REF` | `v0.32.0` | ComfyUI tag both images build — pinning is deliberate |
+| `ENABLE_MANAGER` | `false` | bake in ComfyUI-Manager (one-click missing-model downloads) — read the note in `.env.example` |
 | `BUDGET_ALERT_EMAIL` | empty | **set this** |
 
 ## Three things that will bite you
