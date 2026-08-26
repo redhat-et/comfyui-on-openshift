@@ -10,6 +10,6 @@
 # than 5s raise "Timeout reading from ..." instead of waiting. Raise the
 # ceiling only after re-testing the blocking paths (./enterprise/test/run.sh)
 # and, if needed, passing socket_timeout=None explicitly.
-fastapi>=0.115,<0.117
+fastapi>=0.141.1,<0.142
 uvicorn[standard]>=0.32,<0.36
 redis>=5.2,<7
