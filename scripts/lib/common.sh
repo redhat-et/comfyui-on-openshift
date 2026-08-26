@@ -107,6 +107,48 @@ die()
 }
 
 # ---------------------------------------------------------------------------
+# Pure helpers — unit-tested by scripts/unit-tests.sh. Logic lives here, not
+# inline in the step scripts, precisely so a test can reach it.
+# ---------------------------------------------------------------------------
+
+# True when $2 appears as a whole element of $1, a list separated by spaces,
+# tabs, or newlines. Tabs matter: AWS CLI `--output text` tab-separates flat
+# lists, and a naive space-padded pattern match against that never matches —
+# the bug that once made every multi-AZ region look like it did not offer the
+# GPU instance type.
+list_contains()
+{
+    local haystack needle="$2"
+
+    haystack=" $(printf '%s' "$1" | tr '\t\n' '  ') "
+
+    [[ "$haystack" == *" $needle "* ]]
+}
+
+# Emit the kustomize `images:` fields for one resolved image reference:
+# `digest:` for @sha256 refs (an ImageStreamTag resolves to one, and kustomize
+# rejects a digest passed as newTag), `newTag:` otherwise — defaulting to
+# latest when the ref has no tag, or when its only colon belongs to a
+# registry port (the "tag" then contains a slash).
+kustomize_image_fields()
+{
+    local image="$1" tag
+
+    if [[ "$image" == *"@"* ]]; then
+        printf '    newName: %s\n    digest: %s\n' "${image%@*}" "${image#*@}"
+        return 0
+    fi
+
+    tag="${image##*:}"
+
+    if [[ "$tag" == "$image" || "$tag" == */* ]]; then
+        printf '    newName: %s\n    newTag: latest\n' "$image"
+    else
+        printf '    newName: %s\n    newTag: %s\n' "${image%:*}" "$tag"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Guards
 # ---------------------------------------------------------------------------
 

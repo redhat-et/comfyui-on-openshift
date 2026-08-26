@@ -122,22 +122,10 @@ cp -r "${REPO_ROOT}/manifests/base/." "$WORKDIR/"
     # needs those expressed as `digest:`, and getting this wrong yields an
     # image ref like `registry/comfyui@sha256:sha256:abc...` that fails to pull
     # with a message that does not mention kustomize at all.
-    if [[ "$RESOLVED_IMAGE" == *"@"* ]]; then
-        printf '    newName: %s\n    digest: %s\n' \
-            "${RESOLVED_IMAGE%@*}" "${RESOLVED_IMAGE#*@}"
-    else
-        image_tag="${RESOLVED_IMAGE##*:}"
-
-        # A ref with no tag (or whose only colon is a registry port, in which
-        # case the "tag" contains a slash) would otherwise emit the whole ref
-        # as newTag and fail the pull with a baffling message.
-        if [[ "$image_tag" == "$RESOLVED_IMAGE" || "$image_tag" == */* ]]; then
-            printf '    newName: %s\n    newTag: latest\n' "$RESOLVED_IMAGE"
-        else
-            printf '    newName: %s\n    newTag: %s\n' \
-                "${RESOLVED_IMAGE%:*}" "$image_tag"
-        fi
-    fi
+    # Digest-vs-tag handling lives in common.sh (kustomize_image_fields),
+    # where scripts/unit-tests.sh pins its edge cases: digest refs, untagged
+    # refs, and registries with a port.
+    kustomize_image_fields "$RESOLVED_IMAGE"
 } >> "${WORKDIR}/kustomization.yaml"
 
 # S3 as the canonical model store: sync the bucket into the volume before
