@@ -50,11 +50,13 @@ spec:
     type: Docker
     dockerStrategy:
       dockerfilePath: Containerfile
-      # Without this the Containerfile's ARG default wins and the build
-      # silently tracks whatever tag that default names, not the .env pin.
+      # Without this the Containerfile's ARG defaults win and the build
+      # silently ignores what .env says.
       buildArgs:
         - name: COMFYUI_REF
           value: "${COMFYUI_REF}"
+        - name: ENABLE_MANAGER
+          value: "${ENABLE_MANAGER}"
   output:
     to:
       kind: ImageStreamTag
@@ -85,8 +87,21 @@ if [[ -n "$COMFYUI_IMAGE" ]]; then
     RESOLVED_IMAGE="$COMFYUI_IMAGE"
     log "Using image from .env"
     ok "$RESOLVED_IMAGE"
+
+    if [[ "$ENABLE_MANAGER" == "true" ]]; then
+        warn "ENABLE_MANAGER only affects images built here — your prebuilt"
+        warn "image ships whatever it ships."
+    fi
 else
     build_in_cluster
+
+    if [[ "$ENABLE_MANAGER" == "true" ]]; then
+        warn "ComfyUI-Manager is baked in. Fine for one person behind 'make forward';"
+        warn "never put a public Route in front of this pod — Manager installs and"
+        warn "runs arbitrary code on a node holding cloud credentials."
+        info "Model downloads land on the models volume and survive restarts."
+        info "Custom-NODE installs do not — bake nodes into app/src/custom_nodes/."
+    fi
 fi
 
 # ---------------------------------------------------------------------------
