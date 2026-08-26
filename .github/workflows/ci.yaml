@@ -14,7 +14,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install lint tools
         run: |
@@ -28,7 +28,7 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: install redis and python deps
         run: |
@@ -50,7 +50,7 @@ jobs:
   comfyui-smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: boot ComfyUI on CPU and assert the path contract
         run: |
@@ -69,7 +69,7 @@ jobs:
   image-uid:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: build the gateway image
         run: docker build -t gateway-uid-test -f enterprise/gateway/Containerfile enterprise/gateway
