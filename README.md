@@ -128,6 +128,8 @@ scripts/
   10-push-models.sh       rsync local models into the cluster
   99-teardown.sh          park | cluster | all
   lint.sh                 everything CI checks, runnable locally
+  unit-tests.sh           the parsing edge cases, pinned
+  ci-smoke-comfyui.sh     real ComfyUI on CPU proving the model-path contract
 manifests/base/           single-user Deployment and Service, kustomize
 app/
   Containerfile           OpenShift-compatible ComfyUI image

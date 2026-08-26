@@ -12,6 +12,10 @@ pip install -r enterprise/gateway/requirements.txt websocket-client
 make test
 ```
 
+That runs the shell unit tests first (`scripts/unit-tests.sh` — instant, no
+dependencies, pins the parsing edge cases like AWS CLI's tab-separated
+output), then the e2e suite.
+
 Install from the requirements file rather than a bare `pip install redis` —
 the `redis<7` pin is load-bearing (redis-py 8 breaks blocking reads; the
 requirements file says why).
@@ -29,8 +33,13 @@ make lint
 That is shellcheck, bash syntax, a macOS-bash-3.2 portability check, Python
 compilation, and manifest parsing — the logic lives in `scripts/lint.sh`.
 CI (`.github/workflows/ci.yaml`) runs exactly `make lint` and `make test` on
-every pull request, so a red check means one of those two commands fails for
-you locally too.
+every pull request — a red check on those means the same command fails for
+you locally — plus two jobs that need more than a laptop usually has lying
+around: `comfyui-smoke` boots the real pinned ComfyUI on CPU and asserts the
+`--models-directory` path contract (runnable locally:
+`MODELS_DIR=/tmp/m OUTPUT_DIR=/tmp/o scripts/ci-smoke-comfyui.sh`), and
+`image-uid` builds the gateway image and runs it as an arbitrary high UID,
+the way OpenShift's restricted-v2 SCC will.
 
 Shell is Allman-braced with blank lines between logical sections; keep it that
 way. Variable names are descriptive except for loop counters and well-known
