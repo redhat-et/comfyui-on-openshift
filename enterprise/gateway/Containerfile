@@ -1,0 +1,32 @@
+# The gateway. Small on purpose.
+#
+# The tempting shortcut is to reuse the GPU worker image and just change the
+# command — one image, one build. Do not: that image is ~10 GB of CUDA and
+# torch, and this pod runs on the cheap CPU nodes where scheduling latency and
+# image pull time are the whole point. A ~200 MB image starts in seconds; the
+# worker image takes minutes.
+#
+# UBI9's python image already runs as an arbitrary UID with a group-writable
+# app root, so none of the chgrp/chmod gymnastics the GPU image needs applies
+# here.
+
+FROM registry.access.redhat.com/ubi9/python-312:latest
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /opt/app-root/src
+
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY hub.py ./
+COPY static/ ./static/
+
+EXPOSE 8000
+
+# One worker process. The work here is IO-bound async, and holding WebSockets
+# across several processes buys nothing — scale with replicas, not workers.
+CMD ["uvicorn", "hub:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "*"]

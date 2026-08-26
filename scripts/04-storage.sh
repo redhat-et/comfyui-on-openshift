@@ -316,12 +316,39 @@ kind: StorageClass
 metadata:
   name: efs-sc
 provisioner: efs.csi.aws.com
+
+# Retain, not the default Delete. Deleting a PVC by accident should not take a
+# 100 GB model library with it. The cost is that removed PVCs leave Released PVs
+# behind, which you clean up deliberately:
+#   oc get pv | grep Released
+reclaimPolicy: Retain
+
 parameters:
   provisioningMode: efs-ap
   fileSystemId: ${file_system_id}
   directoryPerms: "775"
   gidRangeStart: "1000"
   gidRangeEnd: "2000"
+
+mountOptions:
+  # noresvport is the one that matters for the volume-release problem.
+  #
+  # By default an NFS client reconnecting after any network interruption comes
+  # back on a new source port, and the server rejects it as a different client.
+  # The mount does not fail — it hangs, permanently, and because NFS mounts are
+  # 'hard' by default every process that touches it goes into uninterruptible
+  # sleep. Uninterruptible means SIGKILL does not work: the pod sits in
+  # Terminating forever, the kubelet can never unmount, and the volume is never
+  # released. That is one of the two ways you end up here.
+  #
+  # noresvport lets the reconnect succeed instead.
+  - noresvport
+  # Bound how long a single NFS operation retries before returning an error, so
+  # an EFS blip degrades into slow-and-erroring rather than wedged-forever.
+  # Still 'hard' semantics — writes are not silently lost, which is why 'soft'
+  # is deliberately not in this list.
+  - timeo=600
+  - retrans=2
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

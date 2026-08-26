@@ -1,0 +1,10 @@
+# Pinned to minors so a rebuild six months from now still starts.
+#
+# NOTE on redis: use redis[asyncio], NOT the aioredis package. aioredis was
+# merged into redis-py as redis.asyncio and archived; the standalone package
+# fails to import on Python 3.11+ (duplicate base class TimeoutError). Any
+# example you find using `import aioredis` predates that merge.
+fastapi>=0.115,<0.117
+uvicorn[standard]>=0.32,<0.36
+redis>=5.2,<7
+python-multipart>=0.0.20,<0.1

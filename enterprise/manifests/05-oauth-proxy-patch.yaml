@@ -1,0 +1,87 @@
+---
+# Strategic-merge patch applied to the comfy-gateway Deployment when
+# AUTH_MODE=oauth. Adds the proxy sidecar and, critically, rebinds the gateway
+# itself to loopback so the proxy cannot be bypassed.
+spec:
+  template:
+    spec:
+      serviceAccountName: comfy-gateway
+
+      volumes:
+        - name: proxy-tls
+          secret:
+            secretName: comfy-gateway-tls
+        - name: proxy-session
+          secret:
+            secretName: comfy-gateway-session
+
+      containers:
+        # Named to match the container in 01-gateway.yaml, so this merges into
+        # it rather than adding a second one. The command override is the whole
+        # point: without it the gateway is still listening on 0.0.0.0:8000 and
+        # anything inside the cluster can skip the login.
+        - name: gateway
+          command:
+            - uvicorn
+            - hub:app
+            - --host
+            - 127.0.0.1
+            - --port
+            - "8000"
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - "*"
+
+          # The kubelet cannot reach loopback-bound ports either, so the HTTP
+          # probes from the base manifest have to become exec probes.
+          livenessProbe:
+            httpGet: null
+            exec:
+              command: ["python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=5)"]
+            periodSeconds: 20
+
+          readinessProbe:
+            httpGet: null
+            exec:
+              command: ["python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/readyz',timeout=5)"]
+            periodSeconds: 10
+
+        - name: oauth-proxy
+          image: registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:latest
+
+          ports:
+            - name: public
+              containerPort: 8443
+
+          args:
+            - --https-address=:8443
+            - --http-address=
+            - --provider=openshift
+            - --openshift-service-account=comfy-gateway
+            - --upstream=http://127.0.0.1:8000
+            - --tls-cert=/etc/tls/private/tls.crt
+            - --tls-key=/etc/tls/private/tls.key
+            - --cookie-secret-file=/etc/proxy/secrets/session_secret
+            # Authorisation, not just authentication: a user must be able to
+            # 'get' this namespace to be let through. Grant access by granting
+            # a role in the namespace, and revoke it the same way.
+            - --openshift-sar={"namespace":"NAMESPACE_PLACEHOLDER","resource":"namespaces","verb":"get"}
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: proxy-tls
+              mountPath: /etc/tls/private
+            - name: proxy-session
+              mountPath: /etc/proxy/secrets
