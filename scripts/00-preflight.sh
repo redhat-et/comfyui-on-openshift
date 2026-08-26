@@ -14,10 +14,12 @@ check()
     local status="$2"      # ok | warn | fail
     local detail="${3:-}"
 
+    # stderr, same as log/info/ok in common.sh — mixing streams makes the
+    # report interleave out of order the moment anyone pipes or redirects it.
     case "$status" in
-        ok)   printf '  \033[1;32m  ok  \033[0m  %-46s %s\n' "$label" "$detail" ;;
-        warn) printf '  \033[1;33m warn \033[0m  %-46s %s\n' "$label" "$detail" ;;
-        fail) printf '  \033[1;31m fail \033[0m  %-46s %s\n' "$label" "$detail"
+        ok)   printf '  \033[1;32m  ok  \033[0m  %-46s %s\n' "$label" "$detail" >&2 ;;
+        warn) printf '  \033[1;33m warn \033[0m  %-46s %s\n' "$label" "$detail" >&2 ;;
+        fail) printf '  \033[1;31m fail \033[0m  %-46s %s\n' "$label" "$detail" >&2
               FAILURES=$(( FAILURES + 1 )) ;;
     esac
 }
@@ -148,10 +150,11 @@ quota_check vpc L-F678F1CE 5                  "VPCs per region"
 
 log "GPU capacity"
 
+# tr: `--output text` tab-separates list output; spaces read better.
 GPU_AZS="$(aws ec2 describe-instance-type-offerings \
     --location-type availability-zone \
     --filters "Name=instance-type,Values=${GPU_INSTANCE_TYPE}" \
-    --query 'InstanceTypeOfferings[].Location' --output text 2>/dev/null || echo "")"
+    --query 'InstanceTypeOfferings[].Location' --output text 2>/dev/null | tr '\t' ' ' || echo "")"
 
 if [[ -n "$GPU_AZS" ]]; then
     check "$GPU_INSTANCE_TYPE offered in" ok "$GPU_AZS"

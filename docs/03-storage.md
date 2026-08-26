@@ -54,6 +54,14 @@ eight things that all have to be right simultaneously:
 Getting six of eight right produces a PVC stuck in `Pending` with no useful
 event. That is why it is scripted.
 
+The script assumes an AWS-hosted cluster — EFS is an AWS service. On a
+non-AWS OpenShift cluster (`PLATFORM=openshift` on bare metal, vSphere, …),
+skip `make storage` in rwx mode: provision whatever RWX storage that platform
+offers (ODF, an NFS provisioner), and create `comfyui-models` and
+`comfyui-output` PVCs with `accessModes: [ReadWriteMany]` yourself. On an
+AWS-hosted BYO cluster whose VPC the script cannot discover by name, set
+`VPC_ID` in `.env`.
+
 ### S3 + a sync job — the pragmatic middle
 
 Keep gp3 for speed, keep the canonical models in S3, and sync on startup.

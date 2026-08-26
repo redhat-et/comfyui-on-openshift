@@ -192,11 +192,27 @@ efs_filesystem()
     fi
 
     # Mount targets need a security group that lets the cluster nodes reach NFS.
-    vpc_id="$(aws ec2 describe-vpcs \
-        --filters "Name=tag:Name,Values=*${CLUSTER_NAME}*" \
-        --query 'Vpcs[0].VpcId' --output text)"
+    #
+    # Discovery is by Name tag, which works for the VPC 02-cluster.sh creates.
+    # A bring-your-own cluster's VPC may be named anything, so an explicit
+    # VPC_ID (from .env, the environment, or the .cluster-state this repo
+    # wrote) always wins over discovery.
+    if [[ -z "${VPC_ID:-}" && -f "${REPO_ROOT}/.cluster-state" ]]; then
+        # shellcheck disable=SC1091
+        source "${REPO_ROOT}/.cluster-state"
+    fi
 
-    [[ "$vpc_id" != "None" ]] || die "Could not find the cluster VPC. Set VPC_ID manually."
+    if [[ -n "${VPC_ID:-}" ]]; then
+        vpc_id="$VPC_ID"
+    else
+        vpc_id="$(aws ec2 describe-vpcs \
+            --filters "Name=tag:Name,Values=*${CLUSTER_NAME}*" \
+            --query 'Vpcs[0].VpcId' --output text)"
+    fi
+
+    [[ "$vpc_id" != "None" && -n "$vpc_id" ]] \
+        || die "Could not find the cluster VPC by tag Name=*${CLUSTER_NAME}*.
+          Set VPC_ID in .env to the VPC your cluster's nodes live in."
 
     vpc_cidr="$(aws ec2 describe-vpcs --vpc-ids "$vpc_id" \
         --query 'Vpcs[0].CidrBlock' --output text)"
@@ -250,6 +266,13 @@ setup_rwx()
 
     log "Installing aws-efs-csi-driver-operator"
 
+    # Resolve the channel off the package manifest like the other operator
+    # installs in this repo, falling back to stable if the catalog is slow.
+    local efs_channel
+    efs_channel="$(oc get packagemanifest aws-efs-csi-driver-operator \
+        -n openshift-marketplace -o jsonpath='{.status.defaultChannel}' 2>/dev/null)"
+    efs_channel="${efs_channel:-stable}"
+
     oc apply -f - <<EOF
 apiVersion: operators.coreos.com/v1alpha1
 kind: Subscription
@@ -257,7 +280,7 @@ metadata:
   name: aws-efs-csi-driver-operator
   namespace: openshift-cluster-csi-drivers
 spec:
-  channel: stable
+  channel: ${efs_channel}
   installPlanApproval: Automatic
   name: aws-efs-csi-driver-operator
   source: redhat-operators

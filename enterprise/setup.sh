@@ -72,8 +72,9 @@ fi
 
 ok "storage mode rwx"
 
+# No `oc project`: every command below passes -n explicitly, and mutating the
+# user's current kubeconfig context is a rude side effect for a setup script.
 oc get namespace "$APP_NAMESPACE" >/dev/null 2>&1 || oc create namespace "$APP_NAMESPACE"
-oc project "$APP_NAMESPACE" >/dev/null
 
 for claim in comfyui-models comfyui-output; do
     oc get pvc "$claim" -n "$APP_NAMESPACE" >/dev/null 2>&1 \
@@ -335,7 +336,10 @@ sed -e "s#image: comfy-worker:latest#image: ${WORKER_IMAGE}#" \
 ok "workers select ${GPU_NODE_LABEL}"
 
 if [[ "$SCALE_TO_ZERO" == "true" ]]; then
-    sed -e "s/maxReplicaCount: 3/maxReplicaCount: ${MAX_GPU_WORKERS}/" \
+    # Match the key, not the key plus its default value: matching a literal
+    # "maxReplicaCount: 3" silently stops substituting the day someone edits
+    # the manifest's default, and MAX_GPU_WORKERS quietly stops working.
+    sed -E -e "s/^([[:space:]]*maxReplicaCount:).*/\1 ${MAX_GPU_WORKERS}/" \
         -e "s/NAMESPACE_PLACEHOLDER/${APP_NAMESPACE}/" \
         "${MANIFESTS}/03-autoscale.yaml" | oc apply -n "$APP_NAMESPACE" -f -
     ok "ScaledObject: 0..${MAX_GPU_WORKERS} workers on queue depth"
@@ -364,6 +368,20 @@ if [[ "$AUTH_MODE" == "oauth" ]]; then
 
     ok "oauth-proxy sidecar added; gateway rebound to loopback"
 else
+    # A previous oauth run added the sidecar and rebound the gateway to
+    # loopback via `oc patch` — changes `oc apply` of the base manifest can
+    # never see or undo, because they were never in last-applied-configuration.
+    # Left in place, the plain route below would point at a gateway nothing
+    # can reach. Recreate the deployment from the base manifest instead.
+    if oc get deployment comfy-gateway -n "$APP_NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[*].name}' 2>/dev/null \
+        | grep -qw oauth-proxy; then
+        warn "removing the oauth-proxy sidecar left over from AUTH_MODE=oauth"
+        oc delete deployment comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
+        oc delete route comfy -n "$APP_NAMESPACE" --ignore-not-found
+        apply_with_image "${MANIFESTS}/01-gateway.yaml" "comfy-gateway:latest" "$GATEWAY_IMAGE"
+    fi
+
     warn "AUTH_MODE=none — the gateway will be public with no login."
     oc apply -n "$APP_NAMESPACE" -f "${MANIFESTS}/04-route-plain.yaml"
 fi

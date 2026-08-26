@@ -6,15 +6,23 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 # us-east-2 on-demand, August 2026. Close enough to make decisions with; check
 # the Cost Explorer for what you were actually billed.
-declare -A HOURLY_EC2=(
-    [m5.xlarge]=0.192
-    [m5.2xlarge]=0.384
-    [g5.xlarge]=1.006
-    [g6.xlarge]=0.805
-    [g6.2xlarge]=1.087
-    [g6e.xlarge]=1.861
-    [g4dn.xlarge]=0.526
-)
+#
+# A case statement, not `declare -A`: associative arrays need bash 4, and the
+# stock macOS bash is 3.2 — this script has to run on the laptop driving the
+# cluster, not just in CI.
+ec2_hourly_rate()
+{
+    case "$1" in
+        m5.xlarge)   echo 0.192 ;;
+        m5.2xlarge)  echo 0.384 ;;
+        g5.xlarge)   echo 1.006 ;;
+        g6.xlarge)   echo 0.805 ;;
+        g6.2xlarge)  echo 1.087 ;;
+        g6e.xlarge)  echo 1.861 ;;
+        g4dn.xlarge) echo 0.526 ;;
+        *)           echo 0 ;;
+    esac
+}
 
 ROSA_FEE_PER_4_VCPU=0.171
 ROSA_HCP_CLUSTER_FEE=0.25
@@ -52,7 +60,7 @@ if [[ "$PLATFORM" == "rosa" ]] && command -v rosa >/dev/null 2>&1 && rosa whoami
         vcpus="$(aws ec2 describe-instance-types --instance-types "$instance_type" \
             --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text 2>/dev/null || echo 4)"
 
-        ec2_rate="${HOURLY_EC2[$instance_type]:-0}"
+        ec2_rate="$(ec2_hourly_rate "$instance_type")"
         ec2_cost="$(awk "BEGIN { printf \"%.3f\", $ec2_rate * $replicas }")"
         rosa_cost="$(awk "BEGIN { printf \"%.3f\", ($vcpus * $replicas / 4) * $ROSA_FEE_PER_4_VCPU }")"
         line_cost="$(awk "BEGIN { printf \"%.3f\", $ec2_cost + $rosa_cost }")"
@@ -74,9 +82,24 @@ fi
 if oc whoami >/dev/null 2>&1; then
 
     log "GPU nodes"
-    oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true \
-        -o custom-columns='NODE:.metadata.name,GPU:.status.capacity.nvidia\.com/gpu,TYPE:.metadata.labels.node\.kubernetes\.io/instance-type,READY:.status.conditions[-1].status' \
-        2>/dev/null || info "none"
+    # jq rather than custom-columns: the Ready condition has to be selected by
+    # type — conditions[-1] is not guaranteed to be Ready on every version.
+    gpu_node_rows="$(oc get nodes -l feature.node.kubernetes.io/pci-10de.present=true -o json 2>/dev/null \
+        | jq -r '.items[] | [
+              .metadata.name,
+              (.status.capacity."nvidia.com/gpu" // "0"),
+              (.metadata.labels."node.kubernetes.io/instance-type" // "?"),
+              ([.status.conditions[] | select(.type == "Ready") | .status] | first // "?")
+          ] | @tsv')"
+
+    if [[ -n "$gpu_node_rows" ]]; then
+        printf '  %-52s %-5s %-14s %s\n' NODE GPU TYPE READY
+        while IFS=$'\t' read -r node_name gpu_count instance_type ready; do
+            printf '  %-52s %-5s %-14s %s\n' "$node_name" "$gpu_count" "$instance_type" "$ready"
+        done <<< "$gpu_node_rows"
+    else
+        info "none"
+    fi
 
     log "Workload in $APP_NAMESPACE"
     oc get pods -n "$APP_NAMESPACE" 2>/dev/null || info "namespace not found"

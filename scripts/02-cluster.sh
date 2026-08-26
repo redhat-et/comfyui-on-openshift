@@ -46,10 +46,14 @@ ok "G/VT quota $GPU_VCPU_QUOTA vCPUs (need $GPU_VCPUS_NEEDED)"
 
 # Offerings tell you the instance type exists in an AZ. They do not tell you
 # there is capacity. This catches the first failure mode, not the second.
+#
+# The tr matters: `--output text` emits a flat list TAB-separated on one line,
+# and the space-delimited containment check below would otherwise fail for
+# every AZ whenever the type is offered in more than one — i.e. always.
 GPU_AZS="$(aws ec2 describe-instance-type-offerings \
     --location-type availability-zone \
     --filters "Name=instance-type,Values=${GPU_INSTANCE_TYPE}" \
-    --query 'InstanceTypeOfferings[].Location' --output text)"
+    --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' ' ')"
 
 [[ -n "$GPU_AZS" ]] || die "$GPU_INSTANCE_TYPE is not offered in $AWS_REGION. Try us-east-1 or us-west-2."
 ok "$GPU_INSTANCE_TYPE offered in: $GPU_AZS"
