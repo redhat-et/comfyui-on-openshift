@@ -12,4 +12,4 @@
 # and, if needed, passing socket_timeout=None explicitly.
 fastapi>=0.115,<0.117
 uvicorn[standard]>=0.32,<0.36
-redis>=5.2,<7
+redis>=8.1.0,<9
