@@ -5,4 +5,4 @@
 # socket_timeout of 5 seconds, which breaks the agent's blocking BLMOVE.
 # See the longer note in enterprise/gateway/requirements.txt.
 redis>=5.2,<7
-websocket-client>=1.8,<2
+websocket-client>=1.9.0,<2
