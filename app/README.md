@@ -56,3 +56,22 @@ oc rsync ./checkpoints comfyui-<pod>:/models/checkpoints -n comfyui
 
 For anything you would hate to re-download, see `docs/03-storage.md` — either
 `STORAGE_MODE=rwx` (models outlive the cluster) or an S3 sync job.
+
+## ComfyUI-Manager
+
+`ENABLE_MANAGER=true` in `.env`, then `make deploy` to rebuild. Its best trick
+in this setup: load a workflow, and Manager lists every model the workflow
+needs that you do not have — **Install Missing Models** downloads them
+straight into `/models`, the persistent volume, where they survive restarts
+and redeploys.
+
+Two limits worth knowing before you rely on it:
+
+- **Model downloads persist; custom-node installs do not.** Nodes Manager
+  installs at runtime land on the container filesystem and vanish on restart —
+  and their pip dependencies cannot install at runtime at all (read-only
+  site-packages). The durable path for nodes is this directory:
+  `src/custom_nodes/` plus `requirements-extra.txt`.
+- **Keep the pod behind `make forward`.** Manager is an install-and-run-code
+  button — exactly why `docs/04-exposing.md` never puts raw ComfyUI on a
+  Route, and doubly true with Manager baked in.

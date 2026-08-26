@@ -189,7 +189,11 @@ hostnames appear in certificate transparency logs within minutes.
 
 ## ComfyUI-Manager and auto-downloaders
 
-Off by default (`ENABLE_MANAGER=false`), for two reasons.
+Off by default (`ENABLE_MANAGER=false`), for two reasons. (The single-user
+configuration honors the same flag, where the calculus differs: one person
+behind an authenticated port-forward is the "single-user sandbox" below, and
+Manager's missing-model downloads land on the persistent volume. The
+reasoning here is about *this* configuration — a shared cluster.)
 
 **Security.** Manager installs arbitrary Python from the internet and runs it in
 the worker pod. In a single-user sandbox that is a convenience. In a shared
