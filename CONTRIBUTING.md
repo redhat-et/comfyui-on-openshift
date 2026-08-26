@@ -4,27 +4,41 @@
 
 The gateway and worker have an end-to-end test that needs no cluster, no GPU,
 and no AWS account — it runs the real code against a real Redis and a stub
-ComfyUI on your machine.
+ComfyUI on your machine. You need `redis-server` on PATH (`brew install redis`
+or `apt-get install redis-server`) and:
 
 ```bash
-pip install redis websocket-client fastapi 'uvicorn[standard]'
+pip install -r enterprise/gateway/requirements.txt websocket-client
 ./enterprise/test/run.sh
 ```
 
-24 assertions, ~40 seconds. `enterprise/test/README.md` explains what each one
-is defending against and why. Run it before sending a change to `hub.py` or
-`worker_agent.py`.
+Install from the requirements file rather than a bare `pip install redis` —
+the `redis<7` pin is load-bearing (redis-py 8 breaks blocking reads; the
+requirements file says why).
+
+29 assertions, about a minute. `enterprise/test/README.md` explains what each
+one is defending against and why. Run it before sending a change to `hub.py`
+or `worker_agent.py`.
 
 ## Linting
 
 ```bash
-shellcheck -x scripts/*.sh scripts/lib/*.sh enterprise/*.sh enterprise/worker/start.sh
+shellcheck -x scripts/*.sh scripts/lib/*.sh enterprise/*.sh \
+    enterprise/worker/start.sh enterprise/test/run.sh
 python3 -m py_compile enterprise/gateway/hub.py enterprise/worker/worker_agent.py
 ```
+
+CI (`.github/workflows/ci.yaml`) runs both of the above plus the e2e suite on
+every pull request, so a red check means one of these commands fails.
 
 Shell is Allman-braced with blank lines between logical sections; keep it that
 way. Variable names are descriptive except for loop counters and well-known
 short forms.
+
+Everything in `scripts/` must run under the stock macOS bash, which is 3.2:
+no associative arrays (`declare -A`), no `wait -n`. Code that runs inside a
+container (`enterprise/worker/start.sh`) may use newer bash. CI greps for the
+common offenders.
 
 ## Comments
 

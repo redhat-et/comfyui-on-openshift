@@ -10,7 +10,11 @@
 #   ENABLE_MANAGER=true bakes in ComfyUI-Manager. Read the security note before
 #   you turn it on.
 
-FROM nvcr.io/nvidia/cuda:12.6.2-cudnn-runtime-ubi9
+# The -base- variant, not -cudnn-runtime-: the pip-installed torch wheels
+# vendor their own cuDNN/cuBLAS and load those, so cudnn-runtime would ship
+# ~1.5-2 GB of duplicate libraries. On a pool that scales from zero, image
+# size is pull time is cold-start time — the number this whole design fights.
+FROM nvcr.io/nvidia/cuda:12.6.2-base-ubi9
 
 ARG COMFYUI_REF=v0.32.0
 ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git

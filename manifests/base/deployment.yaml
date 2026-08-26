@@ -60,7 +60,7 @@ spec:
 
           # No `args` here on purpose. A pod-spec args REPLACES the image's CMD
           # wholesale, so listing a couple of flags would silently drop the
-          # --base-directory / --output-directory / --temp-directory flags that
+          # --models-directory / --output-directory / --temp-directory flags that
           # app/Containerfile sets — and ComfyUI would quietly write to its own
           # tree instead of the mounted volumes, losing every output on restart.
           # If you need to change the flags, change CMD in the Containerfile.

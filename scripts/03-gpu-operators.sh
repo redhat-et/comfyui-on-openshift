@@ -12,6 +12,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 require_cluster
+require_tools jq
 
 NFD_NAMESPACE="openshift-nfd"
 GPU_NAMESPACE="nvidia-gpu-operator"
@@ -30,16 +31,23 @@ default_channel_for()
         -o jsonpath='{.status.defaultChannel}' 2>/dev/null
 }
 
+# Both helpers filter CSVs by name prefix, never `.items[0]` or "any
+# Succeeded": an operator installed AllNamespaces-mode anywhere on the cluster
+# copies its CSV into every namespace, so on a bring-your-own cluster the
+# first list entry can be somebody else's operator entirely.
+
 wait_for_csv()
 {
-    local namespace="$1"
+    local namespace="$1" csv_prefix="$2"
     local deadline=$(( SECONDS + WAIT_TIMEOUT ))
 
-    printf '          waiting for CSV in %s ' "$namespace"
+    printf '          waiting for the %s CSV in %s ' "$csv_prefix" "$namespace"
 
     while (( SECONDS < deadline )); do
-        if oc get csv -n "$namespace" -o jsonpath='{.items[*].status.phase}' 2>/dev/null \
-            | grep -q Succeeded; then
+        if oc get csv -n "$namespace" -o json 2>/dev/null \
+            | jq -e --arg prefix "$csv_prefix" \
+                '.items[] | select(.metadata.name | startswith($prefix))
+                          | select(.status.phase == "Succeeded")' >/dev/null 2>&1; then
             printf ' ready\n'
             return 0
         fi
@@ -49,7 +57,7 @@ wait_for_csv()
     done
 
     printf '\n'
-    die "CSV in $namespace never reached Succeeded.
+    die "CSV ${csv_prefix}* in $namespace never reached Succeeded.
           oc get csv -n $namespace
           oc get installplan -n $namespace"
 }
@@ -58,10 +66,15 @@ wait_for_csv()
 # shape always matches the operator version that actually got installed.
 apply_alm_example()
 {
-    local namespace="$1" kind="$2"
+    local namespace="$1" csv_prefix="$2" kind="$3"
     local csv_name example
 
-    csv_name="$(oc get csv -n "$namespace" -o jsonpath='{.items[0].metadata.name}')"
+    csv_name="$(oc get csv -n "$namespace" -o json \
+        | jq -r --arg prefix "$csv_prefix" \
+            '[.items[] | select(.metadata.name | startswith($prefix))][0].metadata.name // empty')"
+
+    [[ -n "$csv_name" ]] || die "No CSV named ${csv_prefix}* in $namespace"
+
     example="$(oc get csv "$csv_name" -n "$namespace" \
         -o jsonpath='{.metadata.annotations.alm-examples}' \
         | jq --arg kind "$kind" '.[] | select(.kind == $kind)')"
@@ -113,8 +126,8 @@ spec:
   sourceNamespace: openshift-marketplace
 EOF
 
-wait_for_csv "$NFD_NAMESPACE"
-apply_alm_example "$NFD_NAMESPACE" NodeFeatureDiscovery
+wait_for_csv "$NFD_NAMESPACE" nfd
+apply_alm_example "$NFD_NAMESPACE" nfd NodeFeatureDiscovery
 ok "NodeFeatureDiscovery created"
 
 # ---------------------------------------------------------------------------
@@ -155,8 +168,8 @@ spec:
   sourceNamespace: openshift-marketplace
 EOF
 
-wait_for_csv "$GPU_NAMESPACE"
-apply_alm_example "$GPU_NAMESPACE" ClusterPolicy
+wait_for_csv "$GPU_NAMESPACE" gpu-operator-certified
+apply_alm_example "$GPU_NAMESPACE" gpu-operator-certified ClusterPolicy
 ok "ClusterPolicy created"
 
 # The driver container compiles against the running RHCOS kernel and pulls

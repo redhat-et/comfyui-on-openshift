@@ -12,9 +12,16 @@
 # Or let the cluster build it: leave COMFYUI_IMAGE empty in .env and
 # `make deploy` will create a BuildConfig from this file.
 
-FROM nvcr.io/nvidia/cuda:12.6.2-cudnn-runtime-ubi9
+# The -base- variant, not -cudnn-runtime-. The torch wheels pip installs below
+# vendor their own cuDNN/cuBLAS (the nvidia-*-cu12 packages) and load those, so
+# the cudnn-runtime image ships ~1.5-2 GB of libraries nothing uses — which on
+# a node that pulls this image cold is minutes of startup for zero benefit.
+FROM nvcr.io/nvidia/cuda:12.6.2-base-ubi9
 
-ARG COMFYUI_REF=master
+# Kept in sync with COMFYUI_REF in .env.example; scripts/05-deploy.sh passes
+# the .env value through as a build arg. Pinned here too so a local
+# `podman build` with no args builds the same thing the cluster does.
+ARG COMFYUI_REF=v0.32.0
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
 
 ENV PYTHONUNBUFFERED=1 \
@@ -98,9 +105,15 @@ EXPOSE 8188
 # ComfyUI resolves model dirs relative to its own tree by default, so point it
 # at the volumes explicitly. --listen 0.0.0.0 is required for the readiness
 # probe to reach it from the kubelet.
+#
+# --models-directory, NOT --base-directory. --base-directory relocates the
+# whole tree: models would be looked up under /models/models/... and — worse —
+# custom_nodes under /models/custom_nodes, so every node baked into this image
+# would silently never load. --models-directory moves only the model search
+# path, which is the thing the volume actually holds.
 ENTRYPOINT ["python3", "main.py"]
 CMD ["--listen", "0.0.0.0", \
      "--port", "8188", \
-     "--base-directory", "/models", \
+     "--models-directory", "/models", \
      "--output-directory", "/output", \
      "--temp-directory", "/tmp"]

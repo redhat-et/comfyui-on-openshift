@@ -4,6 +4,12 @@
 # Written by scripts/02-cluster.sh
 .cluster-state
 
+# enterprise/setup.sh copies app/src/custom_nodes/ in here at build time so
+# both images carry the same nodes. The canonical copy is app/src/custom_nodes;
+# committing the duplicates would just let the two drift.
+enterprise/worker/custom_nodes/*
+!enterprise/worker/custom_nodes/README.md
+
 # Local model files, if you stage them here before rsync
 models/
 checkpoints/
