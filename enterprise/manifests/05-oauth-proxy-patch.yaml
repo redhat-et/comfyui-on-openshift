@@ -47,6 +47,10 @@ spec:
             periodSeconds: 10
 
         - name: oauth-proxy
+          # :latest is deliberate here: the proxy must track the cluster's
+          # OAuth server, and Red Hat rebuilds this image against supported
+          # OpenShift releases. Pin a digest only if your cluster version is
+          # itself pinned.
           image: registry.redhat.io/openshift4/ose-oauth-proxy-rhel9:latest
 
           ports:

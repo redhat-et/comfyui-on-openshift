@@ -6,7 +6,7 @@ Runs alongside ComfyUI in the GPU pod. ComfyUI binds 127.0.0.1 only, so this
 agent is the sole path in or out — no user can reach the GPU pod directly, and
 the pod needs no Service, no Route, and no ingress rules.
 
-Four things here that the obvious version of this script gets wrong, each of
+Five things here that the obvious version of this script gets wrong, each of
 which produces an intermittent bug that is miserable to diagnose in a cluster:
 
   1. Connect the WebSocket BEFORE submitting the prompt. ComfyUI starts emitting
@@ -26,6 +26,14 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      a matter of routine, not as a failure. Without a handler the worker is
      killed mid-generation and the job vanishes with no terminal event, leaving
      the user's browser on a progress bar that never moves.
+
+  5. Move jobs, don't pop them, and heartbeat while running. SIGTERM is the
+     polite case; SIGKILL (an OOM, a node reclaim) gives no warning at all.
+     BLMOVE parks the in-flight job in a per-worker processing list and a
+     TTL'd heartbeat key marks this worker alive; when the heartbeat lapses,
+     the gateway's reaper fails the stranded job loudly instead of letting it
+     disappear. Failed, not requeued — a workflow that OOM-killed one worker
+     would OOM-kill the next one too.
 """
 
 from __future__ import annotations
@@ -67,6 +75,20 @@ BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
 WORKER_ID = os.environ.get("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
 CLIENT_ID = str(uuid.uuid4())
 
+# The heartbeat is how the gateway distinguishes a busy worker from a dead one.
+# It is refreshed on every pass through both the polling loop and the per-job
+# event loop, so the TTL must comfortably exceed RECV_TIMEOUT — the longest
+# this process legitimately goes without touching Redis.
+HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
+
+WORKER_KEY = f"comfy:worker:{WORKER_ID}"
+
+# The job currently being executed lives in this list (moved there from the
+# queue by BLMOVE, removed on any terminal state). If this process dies without
+# removing it, the gateway's reaper fails the job loudly instead of letting it
+# vanish. Key shape is shared with hub.py — change both or neither.
+PROCESSING_KEY = f"comfy:processing:{WORKER_ID}"
+
 shutting_down = False
 
 
@@ -106,6 +128,14 @@ def connect_redis() -> redis.Redis:
     conn.ping()
 
     return conn
+
+
+def heartbeat(conn: redis.Redis) -> None:
+    """Tell the gateway this worker is alive. Expiry does the deregistering."""
+    try:
+        conn.set(WORKER_KEY, str(int(time.time())), ex=HEARTBEAT_TTL)
+    except redis.RedisError:
+        pass  # transient; the next refresh re-arms it well within the TTL
 
 
 def stream_key(job_id: str) -> str:
@@ -198,6 +228,11 @@ def run_job(conn: redis.Redis, job_id: str, workflow: dict) -> None:
         deadline = time.time() + JOB_TIMEOUT
 
         while True:
+            # Refreshed here as well as in the polling loop: a generation can
+            # legally run for JOB_TIMEOUT seconds, which is far longer than the
+            # heartbeat TTL. Each pass is bounded by RECV_TIMEOUT, which is not.
+            heartbeat(conn)
+
             if time.time() > deadline:
                 raise TimeoutError(f"job exceeded {JOB_TIMEOUT}s")
 
@@ -321,46 +356,60 @@ def main() -> int:
     wait_for_comfy()
 
     conn = connect_redis()
-    conn.sadd("comfy:workers", WORKER_ID)
+    heartbeat(conn)
 
     log(f"worker {WORKER_ID} ready, polling {QUEUE_KEY}")
 
     try:
         while not shutting_down:
-            # Short BRPOP timeout rather than blocking forever, so the SIGTERM
-            # flag is noticed promptly instead of at the end of the grace period.
-            item = conn.brpop(QUEUE_KEY, timeout=5)
+            heartbeat(conn)
 
-            if item is None:
+            # Move, don't pop. BLMOVE parks the job in this worker's processing
+            # list, so if this process dies mid-job the gateway's reaper can
+            # find and fail it. A plain BRPOP would make the job cease to exist
+            # anywhere the moment it was picked up.
+            #
+            # Short timeout rather than blocking forever, so the SIGTERM flag
+            # is noticed promptly instead of at the end of the grace period.
+            raw = conn.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=5, src="RIGHT", dest="LEFT")
+
+            if raw is None:
                 continue
 
-            _key, raw = item
-
             try:
-                payload = json.loads(raw)
-                job_id = payload["job_id"]
-                workflow = payload["workflow"]
+                try:
+                    payload = json.loads(raw)
+                    job_id = payload["job_id"]
+                    workflow = payload["workflow"]
 
-            except (json.JSONDecodeError, KeyError) as exc:
-                log(f"discarding malformed queue entry: {exc}")
-                continue
+                except (json.JSONDecodeError, KeyError) as exc:
+                    log(f"discarding malformed queue entry: {exc}")
+                    continue
 
-            log(f"picked up {job_id}")
-
-            try:
-                run_job(conn, job_id, workflow)
-
-            except Exception as exc:  # noqa: BLE001 - every failure must reach the user
-                log(f"job {job_id} failed: {exc}")
+                log(f"picked up {job_id}")
 
                 try:
-                    finish(conn, job_id, "failed", {"error": str(exc)})
+                    run_job(conn, job_id, workflow)
+
+                except Exception as exc:  # noqa: BLE001 - every failure must reach the user
+                    log(f"job {job_id} failed: {exc}")
+
+                    try:
+                        finish(conn, job_id, "failed", {"error": str(exc)})
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            finally:
+                # The job reached a terminal state (or was malformed); take it
+                # out of the processing list so the reaper never touches it.
+                try:
+                    conn.lrem(PROCESSING_KEY, 1, raw)
                 except Exception:  # noqa: BLE001
                     pass
 
     finally:
         try:
-            conn.srem("comfy:workers", WORKER_ID)
+            conn.delete(WORKER_KEY)
         except Exception:  # noqa: BLE001
             pass
 

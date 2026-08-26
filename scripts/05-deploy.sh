@@ -29,7 +29,7 @@ build_in_cluster()
 {
     log "Building in-cluster from app/Containerfile"
 
-    oc apply -n "$APP_NAMESPACE" -f - <<'EOF'
+    oc apply -n "$APP_NAMESPACE" -f - <<EOF
 apiVersion: image.openshift.io/v1
 kind: ImageStream
 metadata:
@@ -50,6 +50,11 @@ spec:
     type: Docker
     dockerStrategy:
       dockerfilePath: Containerfile
+      # Without this the Containerfile's ARG default wins and the build
+      # silently tracks whatever tag that default names, not the .env pin.
+      buildArgs:
+        - name: COMFYUI_REF
+          value: "${COMFYUI_REF}"
   output:
     to:
       kind: ImageStreamTag
@@ -106,8 +111,17 @@ cp -r "${REPO_ROOT}/manifests/base/." "$WORKDIR/"
         printf '    newName: %s\n    digest: %s\n' \
             "${RESOLVED_IMAGE%@*}" "${RESOLVED_IMAGE#*@}"
     else
-        printf '    newName: %s\n    newTag: %s\n' \
-            "${RESOLVED_IMAGE%:*}" "${RESOLVED_IMAGE##*:}"
+        image_tag="${RESOLVED_IMAGE##*:}"
+
+        # A ref with no tag (or whose only colon is a registry port, in which
+        # case the "tag" contains a slash) would otherwise emit the whole ref
+        # as newTag and fail the pull with a baffling message.
+        if [[ "$image_tag" == "$RESOLVED_IMAGE" || "$image_tag" == */* ]]; then
+            printf '    newName: %s\n    newTag: latest\n' "$RESOLVED_IMAGE"
+        else
+            printf '    newName: %s\n    newTag: %s\n' \
+                "${RESOLVED_IMAGE%:*}" "$image_tag"
+        fi
     fi
 } >> "${WORKDIR}/kustomization.yaml"
 

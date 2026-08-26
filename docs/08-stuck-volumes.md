@@ -103,11 +103,12 @@ move the workload, and let the machine pool replace the node.
 ## Prevention, in the order that matters
 
 **Give the pod time to shut down, and make it use that time.** The worker's
-`terminationGracePeriodSeconds: 900` is only useful because the agent traps
-SIGTERM, finishes the job in flight, and exits. A pod that is SIGKILLed at the
-end of the grace period is a pod that never unmounted cleanly. This matters far
-more here than in a normal deployment, because the worker pool scales to zero —
-termination is routine, not exceptional.
+`terminationGracePeriodSeconds` (1980 — deliberately longer than the 1800s
+`JOB_TIMEOUT`, so a legally long job can still drain) is only useful because
+the agent traps SIGTERM, finishes the job in flight, and exits. A pod that is
+SIGKILLed at the end of the grace period is a pod that never unmounted cleanly.
+This matters far more here than in a normal deployment, because the worker pool
+scales to zero — termination is routine, not exceptional.
 
 **Reconsider spot for GPU workers.** GPU spot capacity is reclaimed often, and
 every reclaim is a hard node death and another chance at this. The two-minute

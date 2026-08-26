@@ -224,6 +224,12 @@ format rather than behind a button in a shared UI.
 - **Redis HA.** One instance with AOF persistence. It survives a pod restart; it
   does not survive a zone outage. At one-GPU scale, adding three Redis nodes
   protects against a failure less likely than the ones you have not fixed yet.
+- **Job retry.** A worker that dies without warning — OOM, node reclaim — does
+  not lose its job silently: the agent parks each job in a per-worker
+  processing list (BLMOVE) and holds a TTL'd heartbeat, and the gateway fails
+  stranded jobs loudly once the heartbeat lapses. But failed means *failed*,
+  not requeued: a workflow that OOM-killed one worker would OOM-kill each
+  worker it was retried on, in sequence, at GPU prices. The user resubmits.
 - **Interrupting a running sampler.** Cancel is cooperative — it stops a queued
   job and asks a running one to stop between events. Truly interrupting mid-step
   is ComfyUI's `/interrupt`, and the workers are not reachable from the gateway.

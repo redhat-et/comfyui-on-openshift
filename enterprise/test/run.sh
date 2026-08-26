@@ -11,6 +11,9 @@ export REDIS_PASSWORD="$PASS"
 export COMFY_HOST=127.0.0.1 COMFY_PORT=8999
 export OUTPUT_ROOT="$WORK/output"
 export BOOT_TIMEOUT=30 RECV_TIMEOUT=5 JOB_TIMEOUT=60
+# Shrunk so the SIGKILL test (check3.py) resolves in seconds, not the
+# production-default minutes. TTL must still exceed RECV_TIMEOUT above.
+export HEARTBEAT_TTL=10 REAPER_INTERVAL=2
 
 rm -rf "$WORK/output" "$WORK"/*.log
 mkdir -p "$OUTPUT_ROOT"
@@ -66,16 +69,34 @@ echo "--- assertions"
 timeout 90 python3 check.py && timeout 150 python3 check2.py "$AGENT"
 RC=$?
 
+# check2 ends with the agent exiting; the SIGKILL test needs a live one.
+AGENT2=""
+if [ "$RC" -eq 0 ]; then
+  echo "--- worker agent (restarted for the SIGKILL test)"
+  python3 "$REPO/enterprise/worker/worker_agent.py" > agent2.log 2>&1 &
+  AGENT2=$!
+  for _ in $(seq 1 30); do
+    grep -q "ready, polling" agent2.log 2>/dev/null && break
+    sleep 0.5
+  done
+  grep -q "ready, polling" agent2.log || { echo "agent2 failed"; cat agent2.log; exit 1; }
+  echo "    up (pid $AGENT2)"
+
+  timeout 90 python3 check3.py "$AGENT2"
+  RC=$?
+fi
+
 echo
 echo "--- agent log"
 cat agent.log
+[ -f agent2.log ] && cat agent2.log
 echo "--- gateway log (errors only)"
 grep -iE 'error|traceback' gw.log | head -20
 
 echo "--- cleanup"
-kill "$AGENT" "$GW" "$COMFY" 2>/dev/null
+kill "$AGENT" "$AGENT2" "$GW" "$COMFY" 2>/dev/null
 sleep 1
-kill -9 "$AGENT" "$GW" "$COMFY" 2>/dev/null
+kill -9 "$AGENT" "$AGENT2" "$GW" "$COMFY" 2>/dev/null
 redis-cli -p 6399 -a "$PASS" --no-auth-warning shutdown nosave 2>/dev/null
 
 exit $RC

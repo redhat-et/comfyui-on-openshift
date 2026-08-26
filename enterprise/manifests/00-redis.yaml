@@ -59,6 +59,11 @@ spec:
 
       containers:
         - name: redis
+          # The major version is pinned by the repository name (redis-7), so
+          # :latest floats only across Red Hat's patch rebuilds of Redis 7 —
+          # a deliberate trade for CVE fixes without manifest churn. If you
+          # need bit-for-bit reproducibility, replace with a digest from
+          # `oc image info registry.redhat.io/rhel9/redis-7:latest`.
           image: registry.redhat.io/rhel9/redis-7:latest
 
           ports:
@@ -116,7 +121,9 @@ spec:
 
           readinessProbe:
             exec:
-              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping"]
+              # --no-auth-warning: without it every probe run logs redis-cli's
+              # password-on-command-line warning, ten times a minute, forever.
+              command: ["sh", "-c", "redis-cli --no-auth-warning -a \"$REDIS_PASSWORD\" ping"]
             initialDelaySeconds: 5
             periodSeconds: 10
 

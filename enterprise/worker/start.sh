@@ -54,10 +54,13 @@ echo "[start] launching ComfyUI on ${COMFY_HOST}:${COMFY_PORT}"
 
 cd "$COMFY_ROOT" || exit 1
 
+# --models-directory, NOT --base-directory: --base-directory would relocate
+# custom_nodes lookup to /models/custom_nodes, silently ignoring every node
+# baked into this image, and put checkpoints at /models/models/checkpoints.
 python3 main.py \
     --listen "$COMFY_HOST" \
     --port "$COMFY_PORT" \
-    --base-directory /models \
+    --models-directory /models \
     --output-directory /output \
     --temp-directory /tmp &
 comfy_pid=$!

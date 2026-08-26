@@ -10,6 +10,10 @@
 # app root, so none of the chgrp/chmod gymnastics the GPU image needs applies
 # here.
 
+# :latest floats only across Red Hat's patch rebuilds of the Python 3.12
+# stream (the minor is pinned by the repository name) — deliberate, for CVE
+# fixes without churn. The Python deps themselves are pinned in
+# requirements.txt, which is where reproducibility actually matters here.
 FROM registry.access.redhat.com/ubi9/python-312:latest
 
 ENV PYTHONUNBUFFERED=1 \

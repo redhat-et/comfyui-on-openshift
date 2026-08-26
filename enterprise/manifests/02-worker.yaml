@@ -57,7 +57,11 @@ spec:
       # SIGTERM, stops taking new work, and finishes the current job; this is
       # the window it gets to do that. Anything much shorter and scale-down
       # throws away work.
-      terminationGracePeriodSeconds: 900
+      #
+      # Must exceed JOB_TIMEOUT below, plus margin: a job may legally run for
+      # the full JOB_TIMEOUT, and a drain that is SIGKILLed at second 900 of a
+      # 1500-second render threw the work away anyway. Change them together.
+      terminationGracePeriodSeconds: 1980
 
       securityContext:
         runAsNonRoot: true

@@ -146,6 +146,7 @@ Everything lives in `.env`. The ones you are most likely to change:
 | `GPU_INSTANCE_TYPE` | `g6.xlarge` | L4 24 GB, ~$0.80/hr — fits SDXL comfortably |
 | `STORAGE_MODE` | `rwo` | `rwx` for EFS shared across pods — see docs/03-storage.md |
 | `COMFYUI_IMAGE` | empty | empty means build in-cluster from `app/Containerfile` |
+| `COMFYUI_REF` | `v0.32.0` | ComfyUI tag both images build — pinning is deliberate |
 | `BUDGET_ALERT_EMAIL` | empty | **set this** |
 
 ## Three things that will bite you

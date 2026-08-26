@@ -36,6 +36,10 @@ Everything comes from the repo's `.env`. The variables this configuration adds:
 | `ENABLE_MANAGER` | `false` | bake in ComfyUI-Manager; read the security note first |
 | `COMFYUI_REF` | `v0.32.0` | the ComfyUI tag to build |
 
+Changing `AUTH_MODE` is also just an edit-and-re-run: switching oauth → none,
+`setup.sh` detects the leftover oauth-proxy sidecar and recreates the gateway
+without it.
+
 ### Why `rwx` is not optional here
 
 The gateway serves finished images off the same volume the workers write them

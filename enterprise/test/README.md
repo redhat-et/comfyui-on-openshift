@@ -46,6 +46,14 @@ pool scales to zero, so termination is routine. Without it, every scale-down
 throws away whatever was rendering and leaves a browser on a progress bar that
 never moves.
 
+**SIGKILL still surfaces a terminal event.** SIGTERM is the polite case; an OOM
+kill or node reclaim gives no warning at all. The test SIGKILLs the agent
+mid-job and asserts the gateway's reaper fails the stranded job with a reason
+naming the dead worker (the agent parks each job in a per-worker processing
+list and holds a TTL'd heartbeat — see point 5 in `worker_agent.py`), and that
+the dead worker drops out of `/api/stats` on its own. Deliberately `failed`,
+not requeued: a workflow that OOM-killed one worker would kill the next too.
+
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
 

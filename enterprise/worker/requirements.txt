@@ -1,4 +1,8 @@
 # Agent-only dependencies. ComfyUI's own requirements.txt is installed
 # separately in the Containerfile so the two layers cache independently.
+#
+# The <7 ceiling on redis is load-bearing: redis-py 8 introduced a default
+# socket_timeout of 5 seconds, which breaks the agent's blocking BLMOVE.
+# See the longer note in enterprise/gateway/requirements.txt.
 redis>=5.2,<7
 websocket-client>=1.8,<2

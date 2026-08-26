@@ -4,7 +4,12 @@
 # merged into redis-py as redis.asyncio and archived; the standalone package
 # fails to import on Python 3.11+ (duplicate base class TimeoutError). Any
 # example you find using `import aioredis` predates that merge.
+#
+# The <7 ceiling is load-bearing, not caution: redis-py 8 introduced a default
+# socket_timeout of 5 seconds, which makes every blocking XREAD/BLMOVE longer
+# than 5s raise "Timeout reading from ..." instead of waiting. Raise the
+# ceiling only after re-testing the blocking paths (./enterprise/test/run.sh)
+# and, if needed, passing socket_timeout=None explicitly.
 fastapi>=0.115,<0.117
 uvicorn[standard]>=0.32,<0.36
 redis>=5.2,<7
-python-multipart>=0.0.20,<0.1

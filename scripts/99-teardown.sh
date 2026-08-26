@@ -14,6 +14,11 @@
 #   all       Delete everything: cluster, VPC, NAT gateway, operator roles,
 #             OIDC config. Back to near-zero.
 #
+#             Deliberately left in place even by 'all': the account-wide ROSA
+#             roles (shared by every cluster in the account), the budget alarm
+#             (you want it precisely when nothing should be running), EFS
+#             filesystems, and the support plan. Each is listed on the way out.
+#
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 MODE="${1:-}"
@@ -153,6 +158,12 @@ case "$MODE" in
             info "  rosa list oidc-config"
             info "  rosa delete oidc-config --oidc-config-id <id> --mode auto --yes"
         fi
+
+        log "Kept on purpose"
+        info "Account-wide ROSA roles — shared by every cluster in this account."
+        info "  If this was the only one: rosa delete account-roles --mode auto"
+        info "The ${CLUSTER_NAME}-monthly budget alarm — free, and most useful"
+        info "  exactly when nothing is supposed to be running."
 
         report_stragglers
         ;;
