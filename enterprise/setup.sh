@@ -387,6 +387,83 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Metrics
+#
+# The gateway serves /metrics (queue depth, live workers — two gauges, no job
+# or user data). A ServiceMonitor lets OpenShift's user-workload monitoring
+# scrape it, which turns "queue deeper than N for 30 minutes" into an alert
+# instead of a support ticket. In oauth mode the scrape goes through the
+# proxy's 8443, which skips auth for /metrics only; in none mode, straight to
+# the gateway port.
+# ---------------------------------------------------------------------------
+
+configure_metrics()
+{
+    if ! oc get crd servicemonitors.monitoring.coreos.com >/dev/null 2>&1; then
+        info "no ServiceMonitor CRD on this cluster — skipping metrics wiring"
+        return 0
+    fi
+
+    log "Metrics"
+
+    if [[ "$AUTH_MODE" == "oauth" ]]; then
+        oc apply -n "$APP_NAMESPACE" -f - <<'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: comfy-gateway
+  labels:
+    app: comfy-gateway
+spec:
+  selector:
+    matchLabels:
+      app: comfy-gateway
+  endpoints:
+    - port: public
+      scheme: https
+      path: /metrics
+      interval: 30s
+      tlsConfig:
+        # The serving cert names the Service; the scrape hits the pod IP.
+        # In-namespace scrape of our own pod — skip hostname verification
+        # rather than plumb the serving CA bundle through.
+        insecureSkipVerify: true
+EOF
+    else
+        oc apply -n "$APP_NAMESPACE" -f - <<'EOF'
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: comfy-gateway
+  labels:
+    app: comfy-gateway
+spec:
+  selector:
+    matchLabels:
+      app: comfy-gateway
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+EOF
+    fi
+
+    ok "ServiceMonitor applied — comfy_queue_depth, comfy_workers_registered"
+
+    # ServiceMonitors in user namespaces are scraped only once user-workload
+    # monitoring is switched on, which is a one-time cluster-admin setting.
+    if ! oc get configmap cluster-monitoring-config -n openshift-monitoring \
+        -o jsonpath='{.data.config\.yaml}' 2>/dev/null | grep -q 'enableUserWorkload: *true'; then
+        warn "user-workload monitoring is not enabled — the ServiceMonitor sits idle until it is."
+        info "One-time enable (cluster admin): set 'enableUserWorkload: true' in the"
+        info "cluster-monitoring-config ConfigMap in openshift-monitoring. Docs:"
+        info "  https://docs.redhat.com/en/documentation/openshift_container_platform/latest/html/monitoring/enabling-monitoring-for-user-defined-projects"
+    fi
+}
+
+configure_metrics
+
+# ---------------------------------------------------------------------------
 # Node-level scale to zero
 #
 # The half that actually saves money. KEDA removing a pod from an idle GPU node

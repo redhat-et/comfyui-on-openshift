@@ -23,6 +23,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
 MODE="${1:-}"
 
+# --yes skips the type-the-cluster-name confirmation. It exists for cron
+# (docs/02-cost.md schedules nightly teardown); interactive use should not
+# pass it.
+if [[ "${2:-}" == "--yes" ]]; then
+    export ASSUME_YES=true
+fi
+
 require_rosa_platform()
 {
     [[ "$PLATFORM" == "rosa" ]] || die "PLATFORM is '$PLATFORM'.

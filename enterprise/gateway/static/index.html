@@ -52,8 +52,9 @@
 <main>
   <h1>ComfyUI Gateway</h1>
   <p class="sub">
-    Paste a ComfyUI workflow in <strong>API format</strong> (Workflow &rarr; Export (API) in the
-    ComfyUI editor). The saved-workflow format from the normal Save button will be rejected.
+    Paste a ComfyUI workflow in <strong>API format</strong> &mdash; or drop the exported
+    <code>.json</code> file anywhere on the box below. API format is Workflow &rarr; Export (API)
+    in the ComfyUI editor; the normal Save button produces a different shape that will be rejected.
   </p>
 
   <textarea id="workflow" spellcheck="false" placeholder='{ "3": { "class_type": "KSampler", "inputs": { ... } }, ... }'></textarea>
@@ -73,6 +74,27 @@
 const $ = (id) => document.getElementById(id);
 let socket = null;
 let jobId = null;
+
+// Restore the last submitted workflow. Pure convenience: storage can be
+// unavailable (private window, blocked site data), so every touch is guarded
+// and the page works identically without it.
+try {
+  const last = localStorage.getItem("comfy:last-workflow");
+  if (last && !$("workflow").value) $("workflow").value = last;
+} catch { /* no storage — fine */ }
+
+// Drop the exported .json file straight onto the textarea.
+const box = $("workflow");
+box.addEventListener("dragover", (e) => e.preventDefault());
+box.addEventListener("drop", (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (!file) return;
+  file.text().then((text) => {
+    box.value = text;
+    say("Loaded " + file.name + ".");
+  });
+});
 
 function say(text, cls) {
   const line = document.createElement("div");
@@ -100,6 +122,8 @@ $("submit").onclick = async () => {
     say("Not valid JSON: " + e.message, "bad");
     return;
   }
+
+  try { localStorage.setItem("comfy:last-workflow", $("workflow").value); } catch { /* fine */ }
 
   $("log").textContent = "";
   $("images").textContent = "";

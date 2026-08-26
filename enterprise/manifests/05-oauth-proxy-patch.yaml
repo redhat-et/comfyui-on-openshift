@@ -70,6 +70,11 @@ spec:
             # 'get' this namespace to be let through. Grant access by granting
             # a role in the namespace, and revoke it the same way.
             - --openshift-sar={"namespace":"NAMESPACE_PLACEHOLDER","resource":"namespaces","verb":"get"}
+            # Prometheus cannot do the login dance, so /metrics bypasses it.
+            # Deliberate and bounded: that path exposes exactly two gauges
+            # (queue depth, worker count) — no job data, no user data. Widen
+            # this regex only after thinking about what else it uncovers.
+            - --skip-auth-regex=^/metrics
 
           resources:
             requests:

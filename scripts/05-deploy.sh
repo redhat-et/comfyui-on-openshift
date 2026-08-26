@@ -125,6 +125,51 @@ cp -r "${REPO_ROOT}/manifests/base/." "$WORKDIR/"
     fi
 } >> "${WORKDIR}/kustomization.yaml"
 
+# S3 as the canonical model store: sync the bucket into the volume before
+# ComfyUI starts, so 'make down' stops being a re-download event. The bucket,
+# the read-only IAM role, and the annotated ServiceAccount come from
+# scripts/09-s3-models.sh — this only wires them into the pod.
+if [[ -n "${MODELS_S3_BUCKET:-}" ]]; then
+    log "S3 model sync (s3://${MODELS_S3_BUCKET})"
+
+    oc get sa comfyui -n "$APP_NAMESPACE" >/dev/null 2>&1 \
+        || die "MODELS_S3_BUCKET is set but the comfyui ServiceAccount does not exist.
+          Run scripts/09-s3-models.sh once — it creates the bucket, the IAM
+          role, and the ServiceAccount the init container needs."
+
+    cat >> "${WORKDIR}/kustomization.yaml" <<EOF
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: comfyui
+      spec:
+        template:
+          spec:
+            serviceAccountName: comfyui
+            initContainers:
+              - name: fetch-models
+                image: docker.io/amazon/aws-cli:latest
+                command: ["aws", "s3", "sync", "s3://${MODELS_S3_BUCKET}/", "/models", "--no-progress"]
+                env:
+                  # The arbitrary UID has no writable home; the CLI wants one
+                  # for its credential cache.
+                  - name: HOME
+                    value: /tmp
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  capabilities:
+                    drop: ["ALL"]
+                volumeMounts:
+                  - name: models
+                    mountPath: /models
+EOF
+
+    ok "init container added — models sync on every pod start"
+fi
+
 oc apply -k "$WORKDIR"
 
 # ---------------------------------------------------------------------------
