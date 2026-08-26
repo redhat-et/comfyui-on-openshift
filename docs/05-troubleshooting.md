@@ -2,6 +2,20 @@
 
 Ordered by how likely you are to hit it.
 
+## A dead pod is holding the volume
+
+`Multi-Attach error`, a mount that never completes, or a pod in `Terminating`
+for hours after a node died.
+
+```bash
+./scripts/08-unstick-storage.sh --repair
+```
+
+**Do not reach for `oc delete pod --force --grace-period=0`.** It deletes the
+pod record while the container may still be running, which strands the volume
+permanently instead of releasing it. `docs/08-stuck-volumes.md` has the full
+explanation and the supported fix.
+
 ## GPU pool stuck in Provisioning forever
 
 Two different causes that look identical.

@@ -1,0 +1,4 @@
+# Agent-only dependencies. ComfyUI's own requirements.txt is installed
+# separately in the Containerfile so the two layers cache independently.
+redis>=5.2,<7
+websocket-client>=1.8,<2

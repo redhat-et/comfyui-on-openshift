@@ -46,6 +46,13 @@ load_env()
     : "${APP_NAMESPACE:=comfyui}"
     : "${COMFYUI_IMAGE:=}"
 
+    # Multi-user configuration (enterprise/).
+    : "${AUTH_MODE:=oauth}"
+    : "${MAX_GPU_WORKERS:=3}"
+    : "${SCALE_TO_ZERO:=true}"
+    : "${ENABLE_MANAGER:=false}"
+    : "${COMFYUI_REF:=v0.32.0}"
+
     # Cost guardrails.
     : "${MONTHLY_BUDGET_USD:=600}"
     : "${BUDGET_ALERT_EMAIL:=}"
@@ -58,6 +65,7 @@ load_env()
     export BASE_INSTANCE_TYPE BASE_REPLICAS GPU_INSTANCE_TYPE GPU_REPLICAS
     export STORAGE_MODE MODELS_SIZE OUTPUT_SIZE
     export APP_NAMESPACE COMFYUI_IMAGE
+    export AUTH_MODE MAX_GPU_WORKERS SCALE_TO_ZERO ENABLE_MANAGER COMFYUI_REF
     export MONTHLY_BUDGET_USD BUDGET_ALERT_EMAIL GPU_VCPU_REQUEST
     export NETWORK_STACK_NAME OPERATOR_ROLE_PREFIX
 }

@@ -1,0 +1,164 @@
+---
+# Redis: the queue, and the only thing the gateway and the workers share
+# besides the model volume.
+#
+# Deliberately a single instance with a small persistent volume rather than a
+# clustered deployment. At this scale the failure mode you actually care about
+# is "the pod restarted and in-flight jobs vanished", which AOF persistence
+# handles; the failure mode a Redis cluster protects against costs three nodes
+# and buys you nothing until you have far more traffic than one GPU can serve.
+#
+# It is also namespace-internal only: no Route, no Service type LoadBalancer,
+# and a NetworkPolicy below that admits only the gateway and the workers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: redis
+          image: registry.redhat.io/rhel9/redis-7:latest
+
+          ports:
+            - name: redis
+              containerPort: 6379
+
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: comfy-redis
+                  key: password
+
+          # appendonly gives durability across a pod restart. maxmemory-policy
+          # noeviction is the important one: the default would silently evict
+          # queued jobs under memory pressure, which looks exactly like jobs
+          # being dropped at random.
+          #
+          # --dir is not optional. Overriding args bypasses the image's
+          # run-redis entrypoint and its /etc/redis/redis.conf, so redis-server
+          # falls back to dir "." — which in this image is the inherited
+          # WORKDIR /opt/app-root/src, i.e. ephemeral container storage. The AOF
+          # would land there, the mounted PVC would stay empty, and every queued
+          # job would be lost on restart: exactly the failure appendonly is here
+          # to prevent, with none of the symptoms that would tell you.
+          args:
+            - redis-server
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            - --dir
+            - /var/lib/redis/data
+            - --appendonly
+            - "yes"
+            - --maxmemory
+            - 512mb
+            - --maxmemory-policy
+            - noeviction
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 768Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/redis/data
+
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: redis-data
+---
+# Only the gateway, the workers, and KEDA may reach Redis. Without this, any pod
+# in any namespace that can resolve the Service can pop jobs off the queue.
+#
+# ROSA runs OVN-Kubernetes and enforces NetworkPolicy, so the openshift-keda
+# exception below is load-bearing, not decorative: a bare podSelector means
+# "pods in this namespace", and the KEDA scaler dials from its own operator pod
+# in openshift-keda. Leave it out and the ScaledObject sits in ScalerFailed
+# while the queue grows and nothing scales up.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-allow-app-only
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: comfy-gateway
+        - podSelector:
+            matchLabels:
+              app: comfy-worker
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-keda
+      ports:
+        - protocol: TCP
+          port: 6379

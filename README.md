@@ -1,8 +1,11 @@
 # ComfyUI on OpenShift
 
-A ComfyUI (PyTorch) inference backend on a GPU node, on ROSA or on any
-OpenShift 4.x cluster you already have. Six commands from an empty AWS account
-to a running pod.
+A ComfyUI (PyTorch) inference backend on GPU nodes, on ROSA or on any
+OpenShift 4.x cluster you already have.
+
+Two configurations sharing one cluster, one GPU operator, and one set of volumes.
+
+### Single user — one pod, one GPU
 
 ```bash
 cp .env.example .env && $EDITOR .env
@@ -17,8 +20,26 @@ make deploy       # build and run ComfyUI           (~15 min)
 make forward      # http://localhost:8188
 ```
 
+### Multi user — queue, SSO, GPU pool that scales to zero
+
+Same cluster, different last step:
+
+```bash
+# STORAGE_MODE=rwx in .env — the gateway and the workers share a volume
+make cluster gpu storage
+make enterprise                        # one script does the rest
+```
+
+A FastAPI gateway on cheap CPU nodes, Redis as the queue and progress bus, and
+GPU workers that are unreachable by design and scale between 0 and N on queue
+depth. `enterprise/README.md` to run it, `docs/06-enterprise-architecture.md`
+for why it is shaped that way.
+
+---
+
 Already have an OpenShift cluster? Set `PLATFORM=openshift` in `.env`, `oc login`,
-then just `make gpu storage deploy`. Nothing in those three steps is ROSA-specific.
+then `make gpu storage deploy` (or `make gpu storage enterprise`). Nothing in
+those steps is ROSA-specific.
 
 Stop paying: `make park` (GPU to zero) or `make down` (delete the cluster).
 
@@ -87,17 +108,28 @@ scripts/
   04-storage.sh           gp3 (default) or EFS RWX
   05-deploy.sh            in-cluster build + deploy
   06-status.sh            what is running and the hourly burn
+  07-login.sh             how to reach the cluster
+  08-unstick-storage.sh   repair a volume a dead pod never released
   99-teardown.sh          park | cluster | all
-manifests/base/           the Deployment and Service, kustomize
+manifests/base/           single-user Deployment and Service, kustomize
 app/
   Containerfile           OpenShift-compatible ComfyUI image
   src/                    >>> your code goes here <<<
+enterprise/               the multi-user configuration
+  setup.sh                one script: Redis, images, KEDA, SSO, route
+  teardown.sh
+  gateway/                FastAPI hub — queue jobs, stream progress, serve images
+  worker/                 ComfyUI + Redis agent, bound to loopback
+  manifests/
 docs/
   01-aws-account.md       the browser-only steps
   02-cost.md              the numbers, and how to keep them down
   03-storage.md           gp3 vs EFS vs S3, and why models are the hard part
   04-exposing.md          how to let other people reach it, safely
   05-troubleshooting.md   the failures you will actually hit
+  06-enterprise-architecture.md   hub and spoke, Streams, scale-to-zero economics
+  07-design-review.md     what changed from the original design doc, and why
+  08-stuck-volumes.md     when a dead pod will not release the volume
 ```
 
 Scripts are idempotent. Re-running any of them is safe and skips what is

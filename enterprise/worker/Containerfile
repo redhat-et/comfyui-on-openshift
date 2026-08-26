@@ -1,0 +1,92 @@
+# GPU worker: ComfyUI plus the Redis agent, in one container.
+#
+# Base choice: nvcr.io CUDA on UBI9 rather than pytorch/pytorch. The pytorch
+# images are Debian, assume root, and pin a torch build you then cannot change
+# without changing base images. Starting from CUDA and installing torch
+# ourselves costs one extra layer and makes both the CUDA version and the torch
+# version explicit knobs — which matters the day a custom node needs a
+# different one.
+#
+#   ENABLE_MANAGER=true bakes in ComfyUI-Manager. Read the security note before
+#   you turn it on.
+
+FROM nvcr.io/nvidia/cuda:12.6.2-cudnn-runtime-ubi9
+
+ARG COMFYUI_REF=v0.32.0
+ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+
+# ComfyUI-Manager lets any user with UI access install arbitrary Python from
+# the internet, which then runs in this pod — on a node with an instance role,
+# inside your VPC, with the shared model volume mounted writable. In a
+# single-user sandbox that is a convenience. In the shared multi-user cluster
+# this image is built for, it is a remote code execution feature with a nice
+# button. Off by default; see docs/06-enterprise-architecture.md.
+ARG ENABLE_MANAGER=false
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    COMFY_ROOT=/opt/comfyui
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        python3.11 python3.11-pip python3.11-devel \
+        git mesa-libGL glib2 \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+WORKDIR ${COMFY_ROOT}
+
+# torch first and alone: it is ~2.5 GB, and keeping it in its own layer means a
+# change to any other requirement does not re-pull it.
+RUN python3 -m pip install --upgrade pip setuptools wheel \
+    && python3 -m pip install --index-url ${TORCH_INDEX} torch torchvision torchaudio
+
+RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} . \
+    && python3 -m pip install -r requirements.txt
+
+RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
+        git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
+            custom_nodes/ComfyUI-Manager && \
+        python3 -m pip install -r custom_nodes/ComfyUI-Manager/requirements.txt; \
+    fi
+
+# ---------------------------------------------------------------------------
+# The agent and your own nodes
+# ---------------------------------------------------------------------------
+
+COPY requirements.txt ${COMFY_ROOT}/requirements-agent.txt
+RUN python3 -m pip install -r ${COMFY_ROOT}/requirements-agent.txt
+
+COPY worker_agent.py ${COMFY_ROOT}/worker_agent.py
+COPY start.sh ${COMFY_ROOT}/start.sh
+RUN chmod +x ${COMFY_ROOT}/start.sh
+
+# Custom nodes belong in the image, not installed at runtime: the pool scales to
+# zero, so anything a Manager install writes to the container filesystem is gone
+# the moment the node is reclaimed. Put yours in ../../app/src/custom_nodes and
+# they are picked up here.
+COPY custom_nodes/ ${COMFY_ROOT}/custom_nodes/
+
+# ---------------------------------------------------------------------------
+# OpenShift arbitrary-UID compatibility
+#
+# The restricted-v2 SCC assigns a random high UID with GID 0 supplementary. The
+# UID in this file is ignored. Every path the process writes must therefore be
+# group-root and group-writable, or a volume. Delete any of this and the pod
+# crash-loops on a permission error that reads like a storage problem.
+# ---------------------------------------------------------------------------
+
+RUN mkdir -p /models /output ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
+    && chgrp -R 0 ${COMFY_ROOT} /models /output \
+    && chmod -R g=u ${COMFY_ROOT} /models /output \
+    && find ${COMFY_ROOT} /models /output -type d -exec chmod g+s {} \;
+
+USER 1001
+
+# No EXPOSE and no Service anywhere in the manifests. ComfyUI binds 127.0.0.1
+# and the agent is the only way in or out.
+
+ENTRYPOINT ["/opt/comfyui/start.sh"]

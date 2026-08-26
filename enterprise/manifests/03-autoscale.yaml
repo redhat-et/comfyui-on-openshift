@@ -1,0 +1,102 @@
+---
+# Scale-to-zero, the pod half.
+#
+# Two layers have to agree for this to save any money, and only one of them
+# lives in Kubernetes:
+#
+#   POD layer (this file). KEDA watches the Redis queue and sets the worker
+#   Deployment's replica count, including all the way to 0. On its own this
+#   saves nothing — an idle GPU *node* bills the same whether a pod is on it or
+#   not.
+#
+#   NODE layer (rosa machine pool autoscaling, applied by enterprise/setup.sh).
+#   With min-replicas 0 on the GPU pool, the cluster autoscaler removes the node
+#   once nothing is scheduled on it, and provisions one when a worker pod goes
+#   Pending for want of a GPU. This is where the ~$0.98/hour actually goes away.
+#
+# The cost of that is cold start. Node provision plus a ~10 GB image pull plus
+# CUDA init plus model load is realistically 8-15 minutes for the first job
+# after an idle period. The gateway tells the user this rather than leaving them
+# staring at a bar that has not moved. See docs/06-enterprise-architecture.md
+# for when that trade is worth taking and when it is not.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: comfy-redis-auth
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: comfy-redis
+      key: password
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: comfy-worker
+spec:
+  scaleTargetRef:
+    name: comfy-worker
+
+  minReplicaCount: 0
+  maxReplicaCount: 3
+
+  # How often KEDA checks the queue. 15s is responsive without hammering Redis.
+  pollingInterval: 15
+
+  # How long the queue must stay empty before scaling back to zero. Ten minutes
+  # is chosen against the cold start above: shorter, and a user taking a break
+  # between prompts pays the 10-minute penalty repeatedly; longer, and you are
+  # paying for idle GPU. Tune this one number first if the economics feel wrong.
+  cooldownPeriod: 600
+
+  # No idleReplicaCount here. KEDA's admission webhook enforces
+  # idleReplicaCount < minReplicaCount, so setting it to 0 alongside
+  # minReplicaCount: 0 gets the whole ScaledObject rejected with
+  # "IdleReplicaCount=0 must be less than MinReplicaCount=0". minReplicaCount: 0
+  # already gives scale-to-zero; idleReplicaCount is for the different case of
+  # "park at N while idle, scale to min..max when active".
+
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          # Do not thrash. One pod at a time, and only after the window above.
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300
+
+  triggers:
+    - type: redis
+      metadata:
+        # Fully qualified, and not the short name. The scaler dials from the
+        # keda-operator pod in openshift-keda, not from a pod in this namespace,
+        # so a bare "redis" resolves against openshift-keda's search domains and
+        # fails with "no such host". setup.sh substitutes the real namespace.
+        address: redis.NAMESPACE_PLACEHOLDER.svc.cluster.local:6379
+        listName: comfy:queue
+        # Target queue depth per worker. With listLength 1, two queued jobs ask
+        # for two workers — which is what you want when each job occupies a
+        # whole GPU for its duration.
+        listLength: "1"
+        # Any queue at all activates the scaler from zero. The default (0) means
+        # the same thing, but stating it makes the zero-to-one path explicit.
+        activationListLength: "0"
+        enableTLS: "false"
+        databaseIndex: "0"
+      authenticationRef:
+        name: comfy-redis-auth
+---
+# Keep at least one gateway serving during voluntary disruptions (node drains,
+# cluster upgrades). Without this, a drain can take both replicas at once and
+# every open WebSocket dies together.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: comfy-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: comfy-gateway

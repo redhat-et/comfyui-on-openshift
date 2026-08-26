@@ -1,0 +1,165 @@
+---
+# GPU workers. No Service, no Route, no ingress — on purpose.
+#
+# ComfyUI inside these pods binds 127.0.0.1. The agent process in the same
+# container is the only thing that can reach it, and the agent's only interface
+# is Redis. That is what makes the pool safe to scale between 0 and N: there is
+# no connection state, no load balancer affinity, and nothing for a user to
+# point a browser at.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-worker
+  labels:
+    app: comfy-worker
+spec:
+  # This number is not authoritative — the ScaledObject in 03-autoscale.yaml
+  # owns it from the moment KEDA reconciles. It is 0 here so that applying the
+  # manifests before the autoscaler exists does not start an $0.80/hour node.
+  replicas: 0
+
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: comfy-worker
+
+  template:
+    metadata:
+      labels:
+        app: comfy-worker
+    spec:
+      # This label MUST be one the machine pool declares, not one Node Feature
+      # Discovery applies at runtime — and that distinction silently breaks
+      # scale-from-zero if you get it wrong.
+      #
+      # When the GPU pool is at zero nodes, the cluster autoscaler has no real
+      # node to inspect. It builds a template from the pool's declared labels
+      # and asks "would the pending pod fit?". NFD labels like
+      # feature.node.kubernetes.io/pci-10de.present only exist once a node is
+      # already running, so they are absent from that template, the autoscaler
+      # concludes the pod would not fit, and it never provisions anything. The
+      # pod stays Pending forever with no error that points at the cause.
+      #
+      # nvidia.com/gpu.present comes from `rosa create machinepool --labels` in
+      # scripts/02-cluster.sh, so it IS in the template. setup.sh substitutes
+      # GPU_NODE_LABEL here if your cluster labels its GPU nodes differently.
+      nodeSelector:
+        GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
+
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+
+      # A generation in flight is real money already spent. The agent traps
+      # SIGTERM, stops taking new work, and finishes the current job; this is
+      # the window it gets to do that. Anything much shorter and scale-down
+      # throws away work.
+      terminationGracePeriodSeconds: 900
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: worker
+          image: comfy-worker:latest
+
+          env:
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: comfy-redis
+                  key: password
+            - name: QUEUE_KEY
+              value: comfy:queue
+            - name: JOB_TIMEOUT
+              value: "1800"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: expandable_segments:True
+            - name: HF_HOME
+              value: /models/.cache/huggingface
+            - name: TORCH_HOME
+              value: /models/.cache/torch
+
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "1"
+              memory: 8Gi
+            limits:
+              # GPUs are indivisible: request and limit must be equal, and this
+              # is what makes the pod Pending until a GPU node exists — which is
+              # in turn what makes the cluster autoscaler provision one.
+              nvidia.com/gpu: 1
+              cpu: "3"
+              memory: 24Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          # Flush anything still buffered for the shared filesystem before the
+          # container goes away. Cheap insurance: a pod that exits with dirty
+          # NFS pages can leave the kubelet retrying the unmount, which is one
+          # of the ways a volume ends up looking stuck. Runs before SIGTERM.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sync; sleep 2"]
+
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: output
+              mountPath: /output
+            - name: scratch
+              mountPath: /tmp
+
+          # No HTTP probes: ComfyUI listens on loopback, so the kubelet cannot
+          # reach it. An exec probe runs inside the container's network
+          # namespace and can. The startup budget is deliberately large — a cold
+          # node loads CUDA and scans custom nodes before ComfyUI answers.
+          startupProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import urllib.request, sys
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=5)
+                  except Exception:
+                      sys.exit(1)
+            periodSeconds: 10
+            failureThreshold: 90
+
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - |
+                  import urllib.request, sys
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=10)
+                  except Exception:
+                      sys.exit(1)
+            periodSeconds: 60
+            failureThreshold: 3
+
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: comfyui-models
+        - name: output
+          persistentVolumeClaim:
+            claimName: comfyui-output
+        - name: scratch
+          emptyDir: {}

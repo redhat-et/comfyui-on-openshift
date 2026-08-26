@@ -1,0 +1,65 @@
+---
+# OpenShift SSO in front of the gateway. Applied when AUTH_MODE=oauth.
+#
+# This puts the cluster's own identity provider — whatever ROSA is wired to,
+# including a corporate IdP — in front of the application. Anyone who can log
+# in to the cluster and read this namespace gets in; nobody else does. No
+# passwords to manage, and the access shows up in the cluster audit log.
+#
+# The mechanism: a sidecar in the gateway pod terminates TLS on 8443 and
+# proxies to the gateway on loopback. setup.sh patches the gateway container to
+# bind 127.0.0.1 at the same time, so there is no port on the pod that bypasses
+# the proxy.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: comfy-gateway
+  annotations:
+    # Tells the OpenShift OAuth server which Route is a legitimate redirect
+    # target for this service account. Without it, login fails with an
+    # unhelpful "invalid redirect uri".
+    serviceaccounts.openshift.io/oauth-redirectreference.primary: >-
+      {"kind":"OAuthRedirectReference","apiVersion":"v1","reference":{"kind":"Route","name":"comfy"}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfy-gateway
+  labels:
+    app: comfy-gateway
+  annotations:
+    # The cluster mints and rotates this certificate. The sidecar mounts it;
+    # the Route re-encrypts to it. No cert-manager, no manual renewal.
+    service.beta.openshift.io/serving-cert-secret-name: comfy-gateway-tls
+spec:
+  selector:
+    app: comfy-gateway
+  ports:
+    # Only the proxy port is exposed. The gateway's own 8000 is bound to
+    # loopback inside the pod and is not in this list.
+    - name: public
+      port: 8443
+      targetPort: public
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: comfy
+  labels:
+    app: comfy-gateway
+  annotations:
+    # timeout-tunnel is the one that governs an upgraded WebSocket on an
+    # edge/reencrypt route; plain timeout does not. Without it, long generations
+    # lose their connection at the router's default one-hour tunnel timeout.
+    haproxy.router.openshift.io/timeout: 4h
+    haproxy.router.openshift.io/timeout-tunnel: 4h
+spec:
+  to:
+    kind: Service
+    name: comfy-gateway
+  port:
+    targetPort: public
+  tls:
+    # reencrypt, not edge: traffic stays encrypted from the router to the pod.
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect

@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ComfyUI Gateway</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #16181d; --muted: #6b7280; --line: #e5e7eb;
+    --accent: #2f6feb; --ok: #15803d; --bad: #b91c1c; --panel: #f7f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a; --fg: #e8eaed; --muted: #9aa1ab; --line: #2a2e36;
+      --accent: #6f9dff; --ok: #4ade80; --bad: #f87171; --panel: #1b1e24;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.5rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 60rem; margin: 0 auto; }
+  h1 { font-size: 1.25rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  .sub { color: var(--muted); margin: 0 0 1.5rem; font-size: .9rem; }
+  textarea {
+    width: 100%; min-height: 14rem; padding: .75rem; border: 1px solid var(--line);
+    border-radius: 8px; background: var(--panel); color: var(--fg);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical;
+  }
+  .row { display: flex; gap: .75rem; align-items: center; margin: .75rem 0 1.25rem; flex-wrap: wrap; }
+  button {
+    padding: .5rem 1rem; border: 0; border-radius: 7px; background: var(--accent);
+    color: #fff; font: inherit; font-weight: 500; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  .stat { color: var(--muted); font-size: .85rem; }
+  .bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: .5rem 0 1rem; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #log {
+    border: 1px solid var(--line); border-radius: 8px; background: var(--panel);
+    padding: .75rem; max-height: 16rem; overflow: auto;
+    font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+  }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  #images { display: flex; flex-wrap: wrap; gap: .75rem; margin-top: 1.25rem; }
+  #images img { max-width: 15rem; border: 1px solid var(--line); border-radius: 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ComfyUI Gateway</h1>
+  <p class="sub">
+    Paste a ComfyUI workflow in <strong>API format</strong> (Workflow &rarr; Export (API) in the
+    ComfyUI editor). The saved-workflow format from the normal Save button will be rejected.
+  </p>
+
+  <textarea id="workflow" spellcheck="false" placeholder='{ "3": { "class_type": "KSampler", "inputs": { ... } }, ... }'></textarea>
+
+  <div class="row">
+    <button id="submit">Queue prompt</button>
+    <button id="cancel" class="ghost" disabled>Cancel</button>
+    <span class="stat" id="stat"></span>
+  </div>
+
+  <div class="bar"><i id="progress"></i></div>
+  <div id="log">Idle.</div>
+  <div id="images"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let socket = null;
+let jobId = null;
+
+function say(text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  $("log").appendChild(line);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+async function refreshStats() {
+  try {
+    const r = await fetch("/api/stats");
+    const s = await r.json();
+    $("stat").textContent = `queue ${s.queue_depth} · workers ${s.workers_registered}`;
+  } catch { /* gateway restarting; the next tick will pick it up */ }
+}
+setInterval(refreshStats, 5000);
+refreshStats();
+
+$("submit").onclick = async () => {
+  let workflow;
+  try {
+    workflow = JSON.parse($("workflow").value);
+  } catch (e) {
+    say("Not valid JSON: " + e.message, "bad");
+    return;
+  }
+
+  $("log").textContent = "";
+  $("images").textContent = "";
+  $("progress").style.width = "0";
+  $("submit").disabled = true;
+
+  const res = await fetch("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workflow })
+  });
+
+  if (!res.ok) {
+    say("Rejected: " + (await res.text()), "bad");
+    $("submit").disabled = false;
+    return;
+  }
+
+  const job = await res.json();
+  jobId = job.job_id;
+  $("cancel").disabled = false;
+  say(`Queued as ${jobId} (${job.queue_depth} ahead).`);
+  say("If the GPU pool is scaled to zero, the first job waits on a node — this can take 10+ minutes.");
+
+  watch(jobId);
+};
+
+$("cancel").onclick = async () => {
+  if (!jobId) return;
+  await fetch(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+  say("Cancel requested.");
+};
+
+function watch(id) {
+  // The stream replays from the beginning, so a reconnect loses nothing.
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(`${proto}://${location.host}/ws/${id}`);
+
+  socket.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    const d = msg.data || {};
+
+    switch (msg.type) {
+      case "ping":
+        return;
+
+      case "progress":
+        if (d.max) $("progress").style.width = (100 * d.value / d.max) + "%";
+        return;
+
+      case "executing":
+        if (d.node) say("node " + d.node);
+        return;
+
+      case "completed":
+        $("progress").style.width = "100%";
+        say("Completed.", "ok");
+        (d.images || []).forEach((img) => {
+          const el = document.createElement("img");
+          el.src = img.url;
+          el.alt = img.filename;
+          $("images").appendChild(el);
+        });
+        done();
+        return;
+
+      case "failed":
+        say("Failed: " + (d.error || "unknown"), "bad");
+        done();
+        return;
+
+      case "cancelled":
+        say("Cancelled.");
+        done();
+        return;
+
+      default:
+        say(msg.type + (d.worker ? " on " + d.worker : ""));
+    }
+  };
+
+  socket.onclose = () => { $("submit").disabled = false; };
+  socket.onerror = () => say("WebSocket error — reload to reconnect.", "bad");
+}
+
+function done() {
+  $("submit").disabled = false;
+  $("cancel").disabled = true;
+  if (socket) socket.close();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,118 @@
+---
+# The gateway. Runs on the cheap base worker nodes, never on a GPU node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-gateway
+  labels:
+    app: comfy-gateway
+spec:
+  # Two replicas is safe and worth it. Redis Streams are the source of truth for
+  # progress, so any replica can serve any job's WebSocket — no sticky sessions,
+  # no shared in-memory state, and a rollout does not drop every connection at
+  # once. Clients reconnect and replay from the start of the stream.
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: comfy-gateway
+
+  template:
+    metadata:
+      labels:
+        app: comfy-gateway
+    spec:
+      # Keep this off the GPU nodes. It has no toleration for the
+      # nvidia.com/gpu taint, so this is belt and braces, but an untainted GPU
+      # node in someone's future cluster would otherwise be a valid target for
+      # a pod that has no business there.
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-10de.present
+                    operator: DoesNotExist
+
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: gateway
+          image: comfy-gateway:latest
+
+          ports:
+            - name: http
+              containerPort: 8000
+
+          env:
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: comfy-redis
+                  key: password
+            - name: OUTPUT_ROOT
+              value: /output
+            - name: QUEUE_KEY
+              value: comfy:queue
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            # Read-only: the gateway serves finished images, it never writes.
+            # This is the whole reason the enterprise configuration needs
+            # ReadWriteMany storage — this pod and the worker pods are on
+            # different nodes and need the same filesystem.
+            - name: output
+              mountPath: /output
+              readOnly: true
+
+          # Liveness does not touch Redis on purpose. If Redis blips, readiness
+          # should drop (stop sending traffic) but the pods should not all be
+          # restarted on top of it.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+
+      volumes:
+        - name: output
+          persistentVolumeClaim:
+            claimName: comfyui-output
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfy-gateway
+  labels:
+    app: comfy-gateway
+spec:
+  selector:
+    app: comfy-gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

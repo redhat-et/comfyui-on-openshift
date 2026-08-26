@@ -1,0 +1,35 @@
+---
+# Unauthenticated route. Applied only when AUTH_MODE=none.
+#
+# This publishes the gateway on the public internet with no login. The GPU pods
+# are still unreachable and the gateway only accepts workflow JSON — so this is
+# not the remote-code-execution hole that exposing raw ComfyUI would be — but
+# anyone who finds the URL can spend your GPU budget, and Route hostnames are
+# published in certificate transparency logs within minutes of creation.
+#
+# Use it for a solo test cluster. For anything with more than one user,
+# AUTH_MODE=oauth is one flag away and costs nothing.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: comfy
+  labels:
+    app: comfy-gateway
+  annotations:
+    # Both are needed and they are not the same knob. For edge and reencrypt
+    # routes the router only takes `timeout tunnel` — the one that governs an
+    # upgraded WebSocket — from timeout-tunnel; plain `timeout` applies to
+    # ordinary HTTP and, for passthrough routes, to the tunnel as well. Set only
+    # `timeout` and your WebSocket still dies at the router's default tunnel
+    # timeout of one hour, which looks like an application bug.
+    haproxy.router.openshift.io/timeout: 4h
+    haproxy.router.openshift.io/timeout-tunnel: 4h
+spec:
+  to:
+    kind: Service
+    name: comfy-gateway
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
