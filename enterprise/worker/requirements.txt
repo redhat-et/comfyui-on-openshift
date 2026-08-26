@@ -4,5 +4,5 @@
 # The <7 ceiling on redis is load-bearing: redis-py 8 introduced a default
 # socket_timeout of 5 seconds, which breaks the agent's blocking BLMOVE.
 # See the longer note in enterprise/gateway/requirements.txt.
-redis>=5.2,<7
+redis>=8.1.0,<9
 websocket-client>=1.8,<2
