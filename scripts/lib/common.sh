@@ -41,6 +41,7 @@ load_env()
     : "${STORAGE_MODE:=rwo}"
     : "${MODELS_SIZE:=100Gi}"
     : "${OUTPUT_SIZE:=20Gi}"
+    : "${MODELS_S3_BUCKET:=}"
 
     # Workload.
     : "${APP_NAMESPACE:=comfyui}"
@@ -63,7 +64,7 @@ load_env()
 
     export PLATFORM AWS_PROFILE AWS_REGION CLUSTER_NAME VPC_CIDR
     export BASE_INSTANCE_TYPE BASE_REPLICAS GPU_INSTANCE_TYPE GPU_REPLICAS
-    export STORAGE_MODE MODELS_SIZE OUTPUT_SIZE
+    export STORAGE_MODE MODELS_SIZE OUTPUT_SIZE MODELS_S3_BUCKET
     export APP_NAMESPACE COMFYUI_IMAGE
     export AUTH_MODE MAX_GPU_WORKERS SCALE_TO_ZERO ENABLE_MANAGER COMFYUI_REF
     export MONTHLY_BUDGET_USD BUDGET_ALERT_EMAIL GPU_VCPU_REQUEST
@@ -169,6 +170,15 @@ confirm_destructive()
 {
     local what="$1"
     local reply
+
+    # ASSUME_YES exists for cron — the scheduled nightly teardown in
+    # docs/02-cost.md. It is set only by an explicit --yes argument, never
+    # by an environment default, so an interactive run always asks.
+    if [[ "${ASSUME_YES:-false}" == "true" ]]; then
+        warn "$what"
+        warn "proceeding without confirmation (--yes)"
+        return 0
+    fi
 
     printf '\n\033[1;31m%s\033[0m\n' "$what"
     read -r -p "Type the cluster name ($CLUSTER_NAME) to confirm: " reply

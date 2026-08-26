@@ -1,11 +1,51 @@
 # ComfyUI on OpenShift
 
-A ComfyUI (PyTorch) inference backend on GPU nodes, on ROSA or on any
-OpenShift 4.x cluster you already have.
+[![ci](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml/badge.svg)](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml)
 
-Two configurations sharing one cluster, one GPU operator, and one set of volumes.
+A ComfyUI (PyTorch) inference backend on GPU nodes, built for **ROSA** — Red
+Hat OpenShift Service on AWS — and portable to any OpenShift 4.x cluster you
+already have.
 
-### Single user — one pod, one GPU
+Two configurations sharing one cluster, one GPU operator, and one set of
+volumes: a single-user pod for one person and one GPU, and a multi-user
+configuration with a queue, cluster SSO, and a GPU pool that scales to zero.
+The queue and gateway logic is covered by an end-to-end test suite that runs
+on your laptop in about a minute — no cluster, no GPU, no AWS account
+(`make test`).
+
+## Which path are you on?
+
+| You | Do this |
+|---|---|
+| No AWS account yet | `docs/01-aws-account.md` — ~20 minutes of browser work — then the quickstart below |
+| Your own ComfyUI on a GPU, managed for you | The single-user quickstart below |
+| A team sharing a GPU pool, with SSO and scale-to-zero | The multi-user quickstart below |
+| Already have an OpenShift cluster | `PLATFORM=openshift` in `.env`, `oc login`, then `make gpu storage deploy` (or `make gpu storage enterprise`) — nothing in those steps is ROSA-specific |
+| Just evaluating the code | `make test` runs the gateway and worker against a real Redis and a stub ComfyUI, locally |
+
+## Why ROSA
+
+This repo will run on any OpenShift, but ROSA with hosted control planes is
+where it is designed to feel best:
+
+- **The control plane is Red Hat's problem.** SRE-managed, backed by the
+  joint Red Hat + AWS support model — you operate one namespace, not a
+  cluster. When something goes wrong at 2am, it is somebody's pager and it is
+  not yours.
+- **HCP economics make honest cost control possible.** A flat $0.25/hour
+  control-plane fee and a ~15-minute cluster build mean `make down` every
+  night is a habit, not a heroic act — which is the single biggest lever on
+  what a GPU cluster actually costs. `make cluster` in the morning restores
+  everything; with `STORAGE_MODE=rwx` your models survive the gap.
+- **GPU capacity on demand, inside your own account.** The GPU machine pool
+  scales 0..N against AWS's G-family fleet, with your quotas, your VPC, and
+  your budget alarm — not a shared waitlist.
+- **The multi-user configuration leans on the platform.** SSO is the
+  cluster's own identity provider via oauth-proxy; authorization is an
+  OpenShift role; access shows up in the cluster audit log. No user database
+  to build, secure, or forget to secure.
+
+## Single user — one pod, one GPU
 
 ```bash
 cp .env.example .env && $EDITOR .env
@@ -20,7 +60,7 @@ make deploy       # build and run ComfyUI           (~15 min)
 make forward      # http://localhost:8188
 ```
 
-### Multi user — queue, SSO, GPU pool that scales to zero
+## Multi user — queue, SSO, GPU pool that scales to zero
 
 Same cluster, different last step:
 
@@ -32,67 +72,41 @@ make enterprise                        # one script does the rest
 
 A FastAPI gateway on cheap CPU nodes, Redis as the queue and progress bus, and
 GPU workers that are unreachable by design and scale between 0 and N on queue
-depth. `enterprise/README.md` to run it, `docs/06-enterprise-architecture.md`
-for why it is shaped that way.
+depth:
 
----
+```mermaid
+flowchart LR
+    B[Browsers] --> R["Route<br/>cluster SSO"]
+    R --> G["Gateway<br/>CPU nodes, 2 replicas"]
+    G -- jobs --> Q[("Redis<br/>queue + progress log")]
+    Q -- jobs --> W["Workers 0..N<br/>agent ⇄ ComfyUI on loopback<br/>GPU nodes"]
+    W -- progress --> Q
+    Q -- replayable tail --> G
+    W -- writes --> E[("EFS<br/>models + outputs")]
+    E -. read-only .-> G
+    K{{KEDA}} -. queue depth<br/>scales pods and nodes .-> W
+```
 
-Already have an OpenShift cluster? Set `PLATFORM=openshift` in `.env`, `oc login`,
-then `make gpu storage deploy` (or `make gpu storage enterprise`). Nothing in
-those steps is ROSA-specific.
+![The gateway: paste a workflow, watch progress, collect the images](docs/images/gateway.png)
 
-Stop paying: `make park` (GPU to zero) or `make down` (delete the cluster).
+`enterprise/README.md` to run it, `docs/06-enterprise-architecture.md` for why
+it is shaped that way.
 
----
+## The numbers, briefly
 
-## Before you put a card in: read this
+The smallest useful cluster is **~$2.04/hour running, ~$1.06 parked, ~$0.05
+torn down** — and because HCP rebuilds in ~15 minutes, tearing down nightly is
+the intended rhythm, not an emergency measure. Three things to do about it:
 
-You need an AWS account first, and that part cannot be scripted — signup wants a
-card, an SMS code, and an email code through a browser. `docs/01-aws-account.md`
-walks it, about 20 minutes.
+1. **`make account` first.** A new AWS account has a GPU quota of exactly
+   zero, and the increase is the one step with a lead time measured in days.
+2. **Set `BUDGET_ALERT_EMAIL` in `.env`.** The budget alarm is free and it is
+   the guardrail between you and a four-figure surprise.
+3. **Park at lunch, down overnight.** `make park` and `make down` — and
+   `docs/02-cost.md` has crontab lines that make the habit automatic.
 
-But **ROSA on a personal AWS account is an expensive way to do this**, for three
-reasons that only surface after you have committed:
-
-1. **AWS Business support.** AWS's own ROSA setup page lists a Business /
-   Enterprise On-Ramp / Enterprise plan under prerequisites; Red Hat's
-   prerequisites call it *recommended*. Clusters do generally build on Basic —
-   but Business is the greater of $100/month or 10% of usage (~$150/month here),
-   and without it you have no escalation path on the day Red Hat SRE needs one.
-   Budget for it or accept the risk knowingly; do not discover it later.
-2. **A new account has a GPU vCPU quota of exactly zero.** The increase is a
-   support ticket with a lead time of 30 minutes to several business days, and
-   nothing you can do speeds it up.
-3. **The floor is ~$2.04/hour, ~$1,500/month** if left running. Parking the GPU
-   pool only gets you to ~$1.06/hour, because the control plane fee, the two
-   base workers, and the NAT gateway keep billing.
-
-### Check these first
-
-You work at Red Hat. Before a personal card:
-
-- **Red Hat Demo Platform** (`demo.redhat.com`) — AWS open environments with a
-  budget attached, and ROSA catalog items. This is the intended path for
-  "I need to test something on ROSA."
-- **An OCTO or team AWS sub-account.** Under Red Hat's AWS org it inherits the
-  org support plan, which makes problem #1 disappear entirely, and usually has
-  quotas already raised — which makes problem #2 disappear too.
-- **Internal GPU capacity.** If an existing internal OpenShift cluster with
-  NVIDIA nodes can give you a namespace, your whole problem collapses to
-  `PLATFORM=openshift && make gpu storage deploy`.
-
-### And consider whether you need ROSA at all
-
-If what you are testing is "does our ComfyUI backend behave correctly on
-OpenShift," a self-managed **Single Node OpenShift** on one `g6.2xlarge` gives
-you a real OpenShift API, real SCCs, and the same GPU operator for **~$1.61/hour**
-— no ROSA service fee, no per-cluster control-plane fee, and no support-plan
-question at all. You already have OpenShift entitlements. The `make gpu`,
-`make storage`, and `make deploy` steps here work unchanged against it.
-
-Use ROSA when the managed service itself is the thing under test.
-
----
+The full accounting — every fee, the monthly patterns, and where money leaks
+— is in `docs/02-cost.md`.
 
 ## What is in here
 
@@ -110,7 +124,10 @@ scripts/
   06-status.sh            what is running and the hourly burn
   07-login.sh             how to reach the cluster
   08-unstick-storage.sh   repair a volume a dead pod never released
+  09-s3-models.sh         S3 bucket + IAM role so models outlive everything
+  10-push-models.sh       rsync local models into the cluster
   99-teardown.sh          park | cluster | all
+  lint.sh                 everything CI checks, runnable locally
 manifests/base/           single-user Deployment and Service, kustomize
 app/
   Containerfile           OpenShift-compatible ComfyUI image
@@ -121,6 +138,7 @@ enterprise/               the multi-user configuration
   gateway/                FastAPI hub — queue jobs, stream progress, serve images
   worker/                 ComfyUI + Redis agent, bound to loopback
   manifests/
+  test/                   the e2e suite — real Redis, stub ComfyUI, no cluster
 docs/
   01-aws-account.md       the browser-only steps
   02-cost.md              the numbers, and how to keep them down
@@ -130,6 +148,7 @@ docs/
   06-enterprise-architecture.md   hub and spoke, Streams, scale-to-zero economics
   07-design-review.md     what changed from the original design doc, and why
   08-stuck-volumes.md     when a dead pod will not release the volume
+.github/workflows/ci.yaml lint + the e2e suite, on every PR
 ```
 
 Scripts are idempotent. Re-running any of them is safe and skips what is

@@ -51,9 +51,9 @@ cluster exists.
 
 Console → Support → Support plans → Business.
 
-**This is the strongest argument for a Red Hat-provided AWS account**, where the
-org's plan already covers you. See the top of `README.md` before paying for it
-yourself.
+If your organization already has an AWS org with a support plan, running this
+in a sub-account under it inherits that plan — worth checking before paying
+for Business support on a personal account.
 
 Going the self-managed Single Node OpenShift route instead? Skip this entirely —
 the question is ROSA's, not OpenShift's.
@@ -75,7 +75,7 @@ prerequisite verifier.
 
 <https://console.redhat.com/openshift/token/rosa>
 
-Log in with your Red Hat SSO (your work account). Copy the offline token into
+Log in with your Red Hat account. Copy the offline token into
 `.env` as `ROSA_TOKEN=...`.
 
 ---

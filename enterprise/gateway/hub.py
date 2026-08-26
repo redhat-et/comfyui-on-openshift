@@ -36,7 +36,7 @@ import uuid
 
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -210,10 +210,19 @@ async def generate(request: Request):
 
     job_id = str(uuid.uuid4())
 
-    await conn.hset(
-        state_key(job_id),
-        mapping={"status": "queued", "queue_depth_at_submit": depth},
-    )
+    # Who spent the GPU. oauth-proxy sets X-Forwarded-User for the
+    # authenticated user (its pass-user-headers default); recording it answers
+    # "whose job is this?" without building per-user anything. With
+    # AUTH_MODE=none there is no proxy and the header is client-supplied —
+    # informational at best, so never treat it as authorization.
+    user = request.headers.get("x-forwarded-user", "")
+
+    state = {"status": "queued", "queue_depth_at_submit": depth}
+
+    if user:
+        state["user"] = user
+
+    await conn.hset(state_key(job_id), mapping=state)
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
     # Seed the stream so a browser that opens the WebSocket before any worker
@@ -404,8 +413,7 @@ async def readyz():
     return {"ok": True}
 
 
-@app.get("/api/stats")
-async def stats():
+async def gather_stats() -> dict:
     conn = client()
 
     # Count heartbeat keys, not a set: keys expire on their own, so a worker
@@ -419,6 +427,31 @@ async def stats():
         "queue_depth": await conn.llen(QUEUE_KEY),
         "workers_registered": workers,
     }
+
+
+@app.get("/api/stats")
+async def stats():
+    return await gather_stats()
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics():
+    """
+    Prometheus text format, hand-rolled — two gauges do not justify a client
+    library dependency. OpenShift's user-workload monitoring scrapes this via
+    the ServiceMonitor enterprise/setup.sh applies, which is what makes
+    "queue deeper than N for 30 minutes" an alert instead of a support ticket.
+    """
+    data = await gather_stats()
+
+    return (
+        "# HELP comfy_queue_depth Jobs waiting in the Redis queue.\n"
+        "# TYPE comfy_queue_depth gauge\n"
+        f"comfy_queue_depth {data['queue_depth']}\n"
+        "# HELP comfy_workers_registered Workers with a live heartbeat.\n"
+        "# TYPE comfy_workers_registered gauge\n"
+        f"comfy_workers_registered {data['workers_registered']}\n"
+    )
 
 
 @app.get("/", response_class=HTMLResponse)

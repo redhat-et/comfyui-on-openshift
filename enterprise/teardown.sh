@@ -25,6 +25,7 @@ log "Removing the multi-user stack from $APP_NAMESPACE"
 oc delete scaledobject comfy-worker -n "$APP_NAMESPACE" --ignore-not-found
 oc delete triggerauthentication comfy-redis-auth -n "$APP_NAMESPACE" --ignore-not-found
 
+oc delete servicemonitor comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found 2>/dev/null || true
 oc delete route comfy -n "$APP_NAMESPACE" --ignore-not-found
 oc delete deployment comfy-gateway comfy-worker -n "$APP_NAMESPACE" --ignore-not-found
 oc delete service comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found

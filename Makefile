@@ -10,7 +10,8 @@ SHELL := /bin/bash
 export
 
 .PHONY: help tools preflight account cluster gpu storage deploy logs forward \
-        status park down destroy login up enterprise enterprise-down unstick
+        status park down destroy login up enterprise enterprise-down unstick \
+        test lint push-models
 
 help:
 	@echo ""
@@ -33,11 +34,16 @@ help:
 	@echo "    make enterprise  queue + gateway + GPU pool that scales 0..N"
 	@echo "                     needs STORAGE_MODE=rwx — see enterprise/README.md"
 	@echo ""
+	@echo "  Develop"
+	@echo "    make test        e2e suite: real Redis, stub ComfyUI — no cluster, ~1 min"
+	@echo "    make lint        everything CI checks: shellcheck, syntax, py, manifests"
+	@echo ""
 	@echo "  Use it"
 	@echo "    make login       print the oc login command"
 	@echo "    make status      what is running and what it costs"
 	@echo "    make forward     port-forward ComfyUI to localhost:8188"
 	@echo "    make logs        tail the ComfyUI pod"
+	@echo "    make push-models rsync a local model dir into the cluster (SRC=./models)"
 	@echo "    make unstick     a dead pod is holding a volume — diagnose and repair"
 	@echo ""
 	@echo "  Stop paying"
@@ -85,6 +91,15 @@ status:
 
 unstick:
 	@scripts/08-unstick-storage.sh --repair
+
+test:
+	@enterprise/test/run.sh
+
+lint:
+	@scripts/lint.sh
+
+push-models:
+	@scripts/10-push-models.sh $(SRC)
 
 login:
 	@scripts/07-login.sh
