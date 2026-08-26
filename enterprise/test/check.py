@@ -85,6 +85,21 @@ print("\n== job state")
 state = get(f"/api/jobs/{job['job_id']}")
 check("job state is completed", state.get("status") == "completed", state)
 
+print("\n== attribution and metrics")
+req = urllib.request.Request(
+    GW + "/api/generate",
+    data=json.dumps({"workflow": {"3": {"class_type": "KSampler", "inputs": {}}}}).encode(),
+    headers={"Content-Type": "application/json", "X-Forwarded-User": "alice"})
+job2 = json.loads(urllib.request.urlopen(req, timeout=10).read())
+state2 = get(f"/api/jobs/{job2['job_id']}")
+check("the authenticated user is stamped onto the job",
+      state2.get("user") == "alice", state2)
+
+metrics = urllib.request.urlopen(GW + "/metrics", timeout=10).read().decode()
+check("prometheus metrics are served",
+      "comfy_queue_depth" in metrics and "comfy_workers_registered" in metrics,
+      metrics.splitlines()[:2])
+
 print("\n== reconnect replays the whole stream")
 ws2 = websocket.WebSocket()
 ws2.connect(f"ws://127.0.0.1:8100/ws/{job['job_id']}", timeout=10)

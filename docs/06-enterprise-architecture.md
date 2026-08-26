@@ -216,7 +216,9 @@ format rather than behind a button in a shared UI.
 - **Per-user workspaces.** Every user shares one output directory. Adding
   identity-scoped paths means threading the authenticated user from the
   oauth-proxy headers through the gateway into the output path — worth doing,
-  not done here.
+  not done here. (The gateway does now record that authenticated user on each
+  job's state, so attribution — whose job is this — exists without the
+  workspaces.)
 - **Job priority.** `BRPOP` on one list is FIFO. Priority means multiple lists
   and a worker that checks them in order.
 - **Multi-GPU workers.** One pod, one GPU. A worker with four cards would need

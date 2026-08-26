@@ -9,27 +9,28 @@ or `apt-get install redis-server`) and:
 
 ```bash
 pip install -r enterprise/gateway/requirements.txt websocket-client
-./enterprise/test/run.sh
+make test
 ```
 
 Install from the requirements file rather than a bare `pip install redis` —
 the `redis<7` pin is load-bearing (redis-py 8 breaks blocking reads; the
 requirements file says why).
 
-29 assertions, about a minute. `enterprise/test/README.md` explains what each
+31 assertions, about a minute. `enterprise/test/README.md` explains what each
 one is defending against and why. Run it before sending a change to `hub.py`
 or `worker_agent.py`.
 
 ## Linting
 
 ```bash
-shellcheck -x scripts/*.sh scripts/lib/*.sh enterprise/*.sh \
-    enterprise/worker/start.sh enterprise/test/run.sh
-python3 -m py_compile enterprise/gateway/hub.py enterprise/worker/worker_agent.py
+make lint
 ```
 
-CI (`.github/workflows/ci.yaml`) runs both of the above plus the e2e suite on
-every pull request, so a red check means one of these commands fails.
+That is shellcheck, bash syntax, a macOS-bash-3.2 portability check, Python
+compilation, and manifest parsing — the logic lives in `scripts/lint.sh`.
+CI (`.github/workflows/ci.yaml`) runs exactly `make lint` and `make test` on
+every pull request, so a red check means one of those two commands fails for
+you locally too.
 
 Shell is Allman-braced with blank lines between logical sections; keep it that
 way. Variable names are descriptive except for loop counters and well-known

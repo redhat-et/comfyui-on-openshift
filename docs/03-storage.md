@@ -62,32 +62,27 @@ offers (ODF, an NFS provisioner), and create `comfyui-models` and
 AWS-hosted BYO cluster whose VPC the script cannot discover by name, set
 `VPC_ID` in `.env`.
 
-### S3 + a sync job — the pragmatic middle
+### S3 + a sync job — the pragmatic middle (scripted)
 
 Keep gp3 for speed, keep the canonical models in S3, and sync on startup.
 
 - ~$0.023/GB-month for the S3 copy. 100 GB is ~$2/month.
 - Cluster rebuild pulls from S3 at ~100 MB/s inside the region, so 100 GB is
   ~15 minutes of unattended init container rather than hours over the internet.
-- Needs an init container and an IAM role for the pod. More moving parts in the
-  Deployment, fewer in the cluster.
+- The moving parts — bucket, a read-only IAM role trusted by the cluster's
+  OIDC provider, an annotated ServiceAccount, the init container — are all
+  scripted.
 
-Sketch, if you want it — add to `manifests/base/deployment.yaml`:
-
-```yaml
-      initContainers:
-        - name: fetch-models
-          image: amazon/aws-cli:latest
-          command:
-            - /bin/sh
-            - -c
-            - aws s3 sync s3://your-bucket/models /models --no-progress
-          volumeMounts:
-            - name: models
-              mountPath: /models
+```bash
+scripts/09-s3-models.sh                  # bucket + IAM role + ServiceAccount, once
+# put MODELS_S3_BUCKET=<bucket> in .env
+aws s3 sync ./models "s3://<bucket>/"    # upload with your own credentials
+make deploy                              # pod now syncs the bucket on start
 ```
 
-with an IRSA-style service account bound to a role that can read the bucket.
+The role the pod gets is deliberately read-only: pods pull models, and
+uploading stays on your machine with your own credentials — a compromised pod
+cannot corrupt the canonical store.
 
 ## Choosing
 
@@ -97,7 +92,7 @@ with an IRSA-style service account bound to a role that can read the bucket.
 | Model load speed | best | worst | best |
 | Survives `make down` | no | yes | yes |
 | Multiple pods | no | yes | no |
-| Setup complexity | none | high (scripted) | medium |
+| Setup complexity | none | high (scripted) | medium (scripted) |
 
 **Start with gp3.** Move to EFS if you find yourself rebuilding clusters often
 enough that the re-download hurts, or if you actually grow a second consumer.
@@ -107,7 +102,11 @@ container.
 ## Loading models in the first place
 
 ```bash
-# from your machine into the running pod
+# from your machine — works whether or not a ComfyUI pod is running
+# (SRC mirrors the volume layout: SRC/checkpoints, SRC/loras, ...)
+make push-models SRC=./models
+
+# or by hand, into the running pod
 POD=$(oc get pod -n comfyui -l app=comfyui -o name | head -1)
 oc rsync ./checkpoints "${POD#pod/}":/models/checkpoints -n comfyui
 

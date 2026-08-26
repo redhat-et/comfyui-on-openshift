@@ -82,6 +82,12 @@ oc logs -n comfyui -l app=comfy-gateway -f       # the gateway
 make status                                      # burn rate
 ```
 
+The gateway also serves Prometheus gauges at `/metrics` (`comfy_queue_depth`,
+`comfy_workers_registered`), and `setup.sh` applies a ServiceMonitor so
+OpenShift's user-workload monitoring can graph and alert on them — "queue
+deeper than N for 30 minutes" is the alert that catches a wedged pool before
+a human does.
+
 ## Granting access
 
 With `AUTH_MODE=oauth`, getting in requires being able to `get` the namespace:
@@ -91,7 +97,10 @@ oc adm policy add-role-to-user view alice -n comfyui     # grant
 oc adm policy remove-role-from-user view alice -n comfyui # revoke
 ```
 
-No separate user database, and access shows up in the cluster audit log.
+No separate user database, and access shows up in the cluster audit log. Each
+job also records who submitted it — the gateway stamps the oauth-proxy's
+authenticated username into the job state, so `GET /api/jobs/<id>` answers
+"whose job is this?" when the GPU bill asks.
 
 ## Custom nodes
 

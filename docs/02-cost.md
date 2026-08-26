@@ -54,6 +54,37 @@ nobody tears down and everybody overpays.
 To make `down` painless, put your models somewhere that outlives the cluster —
 `STORAGE_MODE=rwx` (EFS) or an S3 bucket. See `03-storage.md`.
 
+## Make the habit automatic
+
+The advice above only saves money if it happens every day, and human
+discipline is exactly what the budget alarm exists to distrust. Put it in
+cron instead. `make park` is already non-interactive; teardown normally asks
+you to type the cluster name, so the scheduled form takes `--yes`:
+
+```cron
+# park the GPU pool at 19:00 on weeknights          ~$2.04/hr -> ~$1.06/hr
+0 19 * * 1-5  cd /path/to/comfyui-on-openshift && make park            >> cost-cron.log 2>&1
+
+# tear the cluster down Friday night                ~$2.04/hr -> ~$0.05/hr
+0 20 * * 5    cd /path/to/comfyui-on-openshift && scripts/99-teardown.sh cluster --yes >> cost-cron.log 2>&1
+
+# rebuild Monday morning before you sit down (~50 min unattended)
+30 7 * * 1    cd /path/to/comfyui-on-openshift && make up              >> cost-cron.log 2>&1
+```
+
+Three caveats before trusting it:
+
+- **cron runs on the machine it is installed on.** A laptop that is asleep at
+  19:00 parks nothing. Put these lines on any always-on box that has the repo,
+  `aws`, `rosa`, and `oc` configured — or accept that the laptop schedule is
+  best-effort and keep the budget alarm as the backstop.
+- **The Friday teardown destroys gp3 volumes, models included.**
+  `STORAGE_MODE=rwx` or the S3 sync path (`03-storage.md`) is what turns that
+  from a re-download into a non-event.
+- **Monday's `make up` rebuilds the single-user stack.** For the multi-user
+  configuration, use `make cluster gpu storage && enterprise/setup.sh` in that
+  line instead.
+
 ## Where the money actually goes if you are not careful
 
 - **NAT gateway: ~$32/month plus $0.045/GB processed.** It bills while the

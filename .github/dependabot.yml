@@ -1,0 +1,22 @@
+# The pins in this repo are deliberate (several are load-bearing — see the
+# redis<7 note in enterprise/gateway/requirements.txt), so the point of
+# dependabot here is not auto-merge: it is being TOLD when a new major exists
+# instead of discovering it years later. CI's e2e suite is the judge — a bump
+# PR whose checks pass has already proven itself against the blocking-read
+# paths that made the pins load-bearing in the first place.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /enterprise/gateway
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: pip
+    directory: /enterprise/worker
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

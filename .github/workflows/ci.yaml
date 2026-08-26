@@ -1,8 +1,8 @@
 # The checks CONTRIBUTING.md asks for, enforced instead of trusted.
 #
-# Two jobs: lint is static and fast; e2e runs the real gateway and worker
-# against a real Redis and a stub ComfyUI (enterprise/test/run.sh) — no
-# cluster, no GPU, no AWS account.
+# Both jobs delegate to the same make targets a contributor runs locally
+# (`make lint`, `make test`), so the local and CI invocations cannot drift —
+# the logic lives in scripts/lint.sh and enterprise/test/run.sh.
 name: ci
 
 on:
@@ -16,45 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: shellcheck
+      - name: install lint tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          # warning severity: the info-level notes (SC1091 dynamic sourcing,
-          # SC2016 literal $ in printf) are deliberate in this codebase.
-          shellcheck -x --severity=warning scripts/*.sh scripts/lib/common.sh \
-              enterprise/*.sh enterprise/worker/start.sh enterprise/test/run.sh
-
-      - name: bash syntax and macOS-bash-3.2 portability
-        run: |
-          for f in scripts/*.sh scripts/lib/*.sh enterprise/*.sh \
-                   enterprise/worker/start.sh enterprise/test/run.sh; do
-              bash -n "$f"
-          done
-          # The scripts in scripts/ run on the operator's laptop, where the
-          # stock macOS bash is 3.2: no associative arrays, no wait -n.
-          # (enterprise/worker/start.sh runs in a UBI9 container and may use
-          # newer bash features.) The patterns skip comment lines and flags
-          # like `--wait -n`.
-          if grep -rnE '^[^#]*declare -A|^[^#]*[[:space:]]wait -n' scripts/; then
-              echo "bash-4-only construct in scripts/ — breaks stock macOS bash 3.2"
-              exit 1
-          fi
-
-      - name: python compiles
-        run: |
-          python3 -m py_compile enterprise/gateway/hub.py \
-              enterprise/worker/worker_agent.py enterprise/test/*.py
-
-      - name: manifests parse
-        run: |
           python3 -m pip install --quiet pyyaml
-          python3 - <<'EOF'
-          import glob, yaml
-          for f in sorted(glob.glob('manifests/base/*.yaml') + glob.glob('enterprise/manifests/*.yaml')):
-              list(yaml.safe_load_all(open(f)))
-              print('ok', f)
-          EOF
+
+      - name: make lint
+        run: make lint
 
   e2e:
     runs-on: ubuntu-latest
@@ -69,5 +38,5 @@ jobs:
           # worker's other dep and what the checks use to talk to the gateway.
           python3 -m pip install --quiet -r enterprise/gateway/requirements.txt websocket-client
 
-      - name: end-to-end
-        run: ./enterprise/test/run.sh
+      - name: make test
+        run: make test
