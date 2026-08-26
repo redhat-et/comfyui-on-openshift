@@ -40,3 +40,56 @@ jobs:
 
       - name: make test
         run: make test
+
+  # The real ComfyUI — the pinned tag, CPU-only — booted with the images' own
+  # path flags, asserting that models in <models-dir>/checkpoints are visible
+  # and custom nodes in the install tree load. This is the mechanical
+  # regression test for the --models-directory contract: under the old
+  # --base-directory flag this job fails at boot (ComfyUI crashes scanning
+  # <base>/custom_nodes) and the assertions fail besides.
+  comfyui-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: boot ComfyUI on CPU and assert the path contract
+        run: |
+          # The images mount volumes at /models and /output; use the same
+          # absolute paths so the test exercises exactly what ships.
+          sudo mkdir -p /models /output
+          sudo chown -R "$USER" /models /output
+          MODELS_DIR=/models OUTPUT_DIR=/output scripts/ci-smoke-comfyui.sh
+
+  # Build the gateway image and run it the way OpenShift's restricted-v2 SCC
+  # will: as an arbitrary high UID with GID 0 supplementary, ignoring the
+  # image's USER. This is the single most common way an image that works
+  # under `docker run` breaks on OpenShift — tested here without a cluster.
+  # (The GPU images are too large for per-PR builds; their UID hygiene is the
+  # chgrp/chmod section reviewers guard in the Containerfiles.)
+  image-uid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the gateway image
+        run: docker build -t gateway-uid-test -f enterprise/gateway/Containerfile enterprise/gateway
+
+      - name: serve as an arbitrary UID
+        run: |
+          docker run -d --name gw --user 1000670000:0 -p 8000:8000 gateway-uid-test
+
+          ok=""
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/healthz; then
+              ok=1
+              break
+            fi
+            sleep 2
+          done
+          echo
+
+          if [ -z "$ok" ]; then
+            docker logs gw
+            echo "gateway did not serve /healthz as an arbitrary UID with GID 0"
+            exit 1
+          fi

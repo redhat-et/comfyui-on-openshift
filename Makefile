@@ -35,7 +35,7 @@ help:
 	@echo "                     needs STORAGE_MODE=rwx — see enterprise/README.md"
 	@echo ""
 	@echo "  Develop"
-	@echo "    make test        e2e suite: real Redis, stub ComfyUI — no cluster, ~1 min"
+	@echo "    make test        unit + e2e suites: real Redis, stub ComfyUI — no cluster, ~1 min"
 	@echo "    make lint        everything CI checks: shellcheck, syntax, py, manifests"
 	@echo ""
 	@echo "  Use it"
@@ -92,7 +92,10 @@ status:
 unstick:
 	@scripts/08-unstick-storage.sh --repair
 
+# Units first (instant, no dependencies), then the e2e suite (needs
+# redis-server and the pip deps — see CONTRIBUTING.md).
 test:
+	@scripts/unit-tests.sh
 	@enterprise/test/run.sh
 
 lint:
