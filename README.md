@@ -363,9 +363,11 @@ concrete next change, not a wish.
     `setup.sh`. *(Medium, and the right move once more than one person owns
     this.)*
 
-`docs/06-enterprise-architecture.md` has the complementary list — what is
-deliberately *not* here and why, including Redis HA, multi-GPU workers, and
-interrupting a running sampler.
+`docs/10-roadmap.md` turns this list into a work plan — what each item
+touches, what proves it, what order they can safely land in, and which of them
+cannot be finished without a real cluster. `docs/06-enterprise-architecture.md`
+has the complementary list: what is deliberately *not* here and why, including
+Redis HA, multi-GPU workers, and interrupting a running sampler.
 
 ## What is in here
 
@@ -410,6 +412,7 @@ docs/
   07-design-review.md     what changed from the original design doc, and why
   08-stuck-volumes.md     when a dead pod will not release the volume
   09-engineering-handoff.md  taking ownership: invariants, runbook, open items
+  10-roadmap.md           the ideas below, as a work plan with lanes and gates
 .github/workflows/ci.yaml lint + the e2e suite, on every PR
 ```
 

@@ -11,6 +11,58 @@ has to keep it running, which is a different set of facts.
 
 ---
 
+## 0. Where this stands
+
+This is a working system rather than a proof of concept, and it is also not a
+product. Both configurations run end to end: the single-user path puts one
+ComfyUI pod on one GPU behind an authenticated port-forward, and the
+multi-user path puts a queue, cluster SSO and a GPU pool that scales to zero
+in front of the same cluster. The parts that are easy to get wrong and
+miserable to debug — progress streaming, cancellation, worker death, path
+handling — are covered by an end-to-end suite that runs against a real Redis
+and a stub ComfyUI on your laptop in about a minute, and by four CI jobs on
+every pull request. What has *not* happened is scale: nobody has run this past
+a handful of concurrent users or more than three GPU workers, and the numbers
+in [`02-cost.md`](02-cost.md) are on-demand list prices from August 2026 rather
+than a bill you have actually received. Treat the architecture as settled and
+the operating envelope as unmeasured.
+
+The history matters more than it usually would, so it is worth two sentences.
+This repository began as a design document, and roughly half of that
+document's code would not have run — a dead import, a hub that was never in
+its own image, a WebSocket connected after the prompt was submitted — while
+the manifests quietly failed to implement several things the prose claimed,
+including the scale-to-zero it led with. [`07-design-review.md`](07-design-review.md)
+is the written record of every one of those, and it is the single most useful
+hour you can spend here. Read it early, because it tells you the specific
+failure mode this repository is built to defend against: infrastructure code
+that reads plausibly and has never been executed. Almost every defensive-looking
+thing in [`../enterprise/worker/worker_agent.py`](../enterprise/worker/worker_agent.py)
+and [`../enterprise/gateway/hub.py`](../enterprise/gateway/hub.py) — the bounded
+`recv`, the `prompt_id` filter, the SIGTERM drain, the heartbeat — is there
+because its absence produced a real, intermittent, hard-to-reproduce bug. None
+of it is defensive programming for its own sake, and the numbered comment
+blocks at the top of both files tell you which bug each one answers.
+
+Be confident about three things and nervous about three others. Confident:
+the security posture is architectural rather than configured, so it does not
+degrade when someone edits a YAML file — the GPU pods bind loopback and have
+no Service and no Route, and there is no supported path by which raw ComfyUI
+becomes reachable ([`04-exposing.md`](04-exposing.md)). Confident: the cost
+controls are real and are one command each, and `make status` will tell you
+your live burn rather than making you model it. Confident: the code paths
+under test are genuinely under test — break one and `make test` fails in under
+a minute. Nervous: the cold start is a real user-facing weakness and the first
+thing a designer will complain about, which section 8 addresses and
+[`10-roadmap.md`](10-roadmap.md) schedules. Nervous: Redis is a single instance
+with AOF persistence, which survives a pod restart and not a zone outage.
+Nervous: a failed job is failed, not requeued — deliberately, for a reason
+given in [`06-enterprise-architecture.md`](06-enterprise-architecture.md), but
+it means a node reclaim mid-render costs a user their generation and you will
+hear about it before you hear about anything else on this list.
+
+---
+
 ## 1. What you own, and what you do not
 
 You own **one namespace**. You do not own a control plane, a CUDA driver
@@ -252,8 +304,10 @@ idea 1 in the README's "Ideas worth doing next", which is two cron lines.
 
 ## 9. What I would do next, if I were staying
 
-The full list with effort estimates is in the README under **Ideas worth doing
-next**. The short version, in the order I would take them:
+The full list is in the README under **Ideas worth doing next**, and
+[`10-roadmap.md`](10-roadmap.md) turns it into a work plan — what each item
+touches, what proves it, what order they can safely land in, and which of them
+need a real cluster. The short version, in the order I would take them:
 
 1. **Schedule the warm window** (two cron lines). Removes the morning cold
    start without paying overnight. Highest payoff per unit of work on the list.
@@ -288,7 +342,8 @@ add any of it, because in several cases the omission is the decision.
 5. `docs/02-cost.md` — because the bill is part of the design.
 6. `docs/03-storage.md`, `docs/04-exposing.md` — the two decisions that are
    hard to reverse later.
-7. `docs/05-troubleshooting.md`, `docs/08-stuck-volumes.md` — bookmark, do not
+7. `docs/10-roadmap.md` — where the work goes next, with lanes and gates.
+8. `docs/05-troubleshooting.md`, `docs/08-stuck-volumes.md` — bookmark, do not
    read cover to cover.
 
 Then run `make test`, read `hub.py` and `worker_agent.py` top to bottom (they
@@ -312,3 +367,33 @@ obvious implementation gets wrong), and you have the whole system.
   arbitrary-UID image test). They delegate to the same `make` targets you run
   locally, so local and CI cannot drift. If CI is red, the answer is in
   `make lint` or `make test` on your own machine.
+
+---
+
+## 12. Last word
+
+The temptation with a repository like this one is to simplify it. Much of what
+is here looks like ceremony until you know what it is for: a bounded socket
+timeout that appears to guard against nothing, a job parked in a second Redis
+list rather than simply popped, a probe that shells into the container instead
+of doing the obvious HTTP GET, an image that spends a layer on `chgrp 0` and
+`chmod g=u`. Every one of those is load-bearing, section 3 says what breaks
+when it goes, and [`07-design-review.md`](07-design-review.md) says which
+specific bug put it there. If you find yourself removing something on the
+grounds that it looks unnecessary, that is the moment to run `make test` first
+and read the comment block second — the tests were written from the bugs, so
+they will usually tell you before a cluster does.
+
+The other thing worth saying is that the platform is doing more work here than
+the code is. The reason this repository is ~8,700 lines and not a distributed
+system is that cluster SSO, the driver lifecycle, node autoscaling to zero,
+audit logging, arbitrary-UID isolation and TLS rotation are not in it — they
+are underneath it, and they are somebody else's pager. When you are deciding
+whether to add something, the first question is whether OpenShift already does
+it, because in this problem domain it usually does, and the version you would
+write would be the version nobody maintains. The corollary is the one thing
+that would genuinely undermine the design: if you ever find yourself making a
+GPU worker reachable — a Service, a Route, `--listen 0.0.0.0` — to solve a
+problem, stop and solve it at the gateway instead. That single property is
+what the rest of this is built on, and it is the only one that cannot be
+recovered after the fact.
