@@ -591,8 +591,9 @@ that bites first — `make preflight` checks it, and it is a multi-day fix.
 
 Ordered by payoff per unit of work. Three have landed, along with three
 foundation items that were never on this list — worker resource sizing, a
-versioned queue payload, and test-harness discovery. **Shipped items stay here,
-struck through, because a roadmap that never visibly moves is a wish list.**
+versioned queue payload, and test-harness discovery. **Struck items stay here:
+shipped ones because a roadmap that never visibly moves is a wish list, and
+decided-against ones because the reasoning is the useful part.**
 `docs/10-roadmap.md` is the worked version and the record: what landed, what
 each item deferred to a real cluster, and which two of these should not be done
 at all.
@@ -609,7 +610,7 @@ at all.
    so the autoscaler holds one warm node without a real job occupying the card.
    *(Medium — the placeholder/priority-class pattern is standard cluster
    autoscaler practice.)*
-3. **Stage models on the node's local NVMe.** `g6` instances have instance
+3. **Stage models on the node's local NVMe — a spike, not yet a work item.** It cannot be scoped from this repository: ROSA HCP exposes no MachineSet, and the three plausible routes differ enormously in blast radius, with one of them colliding head-on with the arbitrary-UID posture. Answer that before cluster day, not on it. `g6` instances have instance
    store. An init container that copies the active checkpoint from EFS to local
    disk turns every subsequent load from an NFS read into a local read, which
    is the difference EFS costs you today. *(Medium.)*
@@ -624,7 +625,7 @@ at all.
    interruption gives two minutes of notice and the existing SIGTERM drain
    finishes anything that fits in them — its real trade is that longer
    generations are lost. *(Spot remains optional; see `docs/10-roadmap.md`.)*
-5. **NVIDIA time-slicing — listed here, and not recommended.** The device
+5. ~~**NVIDIA time-slicing.**~~ **Not doing this** — the decision is made and the reasoning is worth keeping. The device
    plugin can advertise several replicas of one card, but time-slicing provides
    **no memory isolation**: co-resident workflows share the full 24 GB and their
    peak VRAM sums. ComfyUI exceeds VRAM easily on a single tenant, so this turns
