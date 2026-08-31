@@ -49,13 +49,17 @@ spec:
         - name: worker
           image: comfy-worker:latest
           resources:
+            # cpu is correct and requests equal limits on purpose: the memory
+            # ceiling must be this fixture's ONLY violation. An 8Gi/24Gi split
+            # would also trip the Guaranteed-QoS rule and the assertion would
+            # pass even with the ceiling check deleted.
             requests:
               nvidia.com/gpu: 1
-              cpu: "1"
-              memory: 8Gi
+              cpu: "2"
+              memory: 24Gi
             limits:
               # No GPU instance type this repo supports has 24Gi of system
               # RAM to give a single pod — see the file header.
               nvidia.com/gpu: 1
-              cpu: "3"
+              cpu: "2"
               memory: 24Gi

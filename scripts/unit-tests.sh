@@ -170,9 +170,21 @@ cleanup_manifest_fixture_drops()
 }
 trap cleanup_manifest_fixture_drops EXIT
 
+# Drop a deliberately-broken manifest into the directory lint already scans,
+# and assert lint not only FAILS but fails for the stated reason.
+#
+# The second argument is not optional politeness. Asserting only on the exit
+# code makes every fixture less specific each time lint gains a rule: a fixture
+# written to test one thing eventually violates four, and then the assertion
+# passes with its own rule deleted. That happened here — the toleration fixture
+# was written before the F1 sizing rules existed, still carried the old
+# 8Gi/24Gi block, and kept passing when the toleration check was replaced with
+# `if False:`. Matching the message is what keeps a fixture honest as lint
+# grows around it.
 lint_fails_on_manifest_fixture()
 {
     local fixture="$1"
+    local expect="$2"
     # Declared and assigned separately: `local x="$(...)"` masks the command
     # substitution's exit status, which shellcheck flags (SC2155).
     local target
@@ -183,17 +195,20 @@ lint_fails_on_manifest_fixture()
     "$LINT_SH" > "$LINT_LOG" 2>&1 || rc=$?
     rm -f "$target"
 
-    (( rc != 0 ))
+    (( rc != 0 )) && grep -qF "$expect" "$LINT_LOG"
 }
 
 expect_true "lint fails a worker manifest that lost its nvidia.com/gpu toleration" \
-    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-no-gpu-toleration.yaml"
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-no-gpu-toleration.yaml" \
+    "tolerates no nvidia.com/gpu taint"
 
 expect_true "lint fails a Route that lost timeout-tunnel" \
-    lint_fails_on_manifest_fixture "$LINT_FIXTURES/route-missing-timeout-tunnel.yaml"
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/route-missing-timeout-tunnel.yaml" \
+    "has no haproxy.router.openshift.io/timeout-tunnel"
 
 expect_true "lint fails a gateway Service that regained the gateway's own container port" \
-    lint_fails_on_manifest_fixture "$LINT_FIXTURES/gateway-svc-exposes-container-port.yaml"
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/gateway-svc-exposes-container-port.yaml" \
+    "bypasses the login"
 
 cleanup_manifest_fixture_drops
 trap - EXIT
@@ -230,7 +245,8 @@ log "scripts/lint.sh — worker memory limit vs. smallest supported GPU instance
 trap cleanup_manifest_fixture_drops EXIT
 
 expect_true "lint fails a worker manifest whose memory limit does not fit the smallest supported GPU instance type" \
-    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-memory-exceeds-smallest-instance.yaml"
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-memory-exceeds-smallest-instance.yaml" \
+    "limits memory to '24Gi'"
 
 cleanup_manifest_fixture_drops
 trap - EXIT
