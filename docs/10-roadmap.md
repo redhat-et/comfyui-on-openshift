@@ -322,8 +322,11 @@ four-hour sitting is about $8 of cluster time and answers every open question
 at once.
 
 Two cluster-only halves that are easy to miss: Q1's KEDA trigger names a single
-list, so nothing on a laptop proves the pool still scales from zero once the
-pop changes shape; and Q3's real failure mode is arbitrary-UID, unprovable
+list, and nothing on a laptop proves the pool still scales 0 → 1 → 0 against it
+with fair-queueing reordering live (the pop itself is unchanged, and the insert
+only ever adds one entry, so `LLEN` is monotonic across a submit — but a
+cluster-only claim is verified here, not assumed); and Q3's real failure mode is
+arbitrary-UID, unprovable
 anywhere but a cluster. Precisely what Q3 still owes, since the code is
 otherwise landed: run a job as some user, note the mode and group of the
 `/output/<workspace>` directory the worker created (expect `2775` and GID 0),

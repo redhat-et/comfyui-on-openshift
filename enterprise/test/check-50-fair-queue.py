@@ -46,6 +46,17 @@ simply stays queued too and is just the first thing served; either way the
 batch behind it is intact. The sacrificial job is a real submission and runs
 to completion once the agent resumes, which is why it is not cleaned up.
 
+One section here is not of that vintage. Q1's insert has to read every job
+already queued to place a new one, and Redis is single-threaded, so the size
+of what it reads is a stall on every other client — a 26 KB workflow at a
+depth of 499 measured ~118 ms of exclusive Redis time per submit. The
+workflow therefore lives at comfy:job:<id>:payload and only the ordering
+record goes on comfy:queue. The last section asserts the housekeeping half of
+that split: the payload is deleted with the job rather than left to its
+backstop TTL. It would pass vacuously against pre-Q1 HEAD, where no such key
+exists; it is a regression guard on the mechanism, not a demonstration of the
+gap Q1 closed.
+
 Ordering is read back from each job's own event stream rather than from
 polling /api/jobs — worker_agent.py's run_job() emits a "started" event the
 moment it picks a job up, and Redis Streams IDs are a server-assigned
@@ -147,6 +158,30 @@ check("both userA's last job and userB's job actually started",
 check(f"userB's job is served before userA's {N}th (last) job",
       b_started is not None and a_last_started is not None and b_started < a_last_started,
       f"userB started at {b_started}, userA[{N}] started at {a_last_started}")
+
+
+print("\n== and the workflows stored beside the queue are reclaimed, not left to a TTL")
+
+# Placing a job fairly means looking at every job already queued, so what the
+# insert has to walk must not be the client's workflow — hub.py keeps the
+# ordering record on comfy:queue and the workflow at comfy:job:<id>:payload.
+# That key has a TTL, but the TTL is a backstop: the reclaim path is the
+# explicit delete on every terminal outcome. The distinction is invisible
+# until Redis, which is deliberately `maxmemory-policy noeviction`, fills up
+# with a day's worth of finished jobs' workflows — so it is asserted here
+# rather than assumed.
+#
+# Bounded wait rather than a bare read: poll_status returns on the status the
+# worker writes, and the delete is the next thing it does.
+deadline = time.time() + 10
+leaked = list(a_ids + [b_id])
+while time.time() < deadline and leaked:
+    leaked = [jid for jid in leaked if r.exists(f"comfy:job:{jid}:payload")]
+    if leaked:
+        time.sleep(0.2)
+
+check("every finished job's stored workflow was deleted with the job",
+      not leaked, leaked)
 
 print()
 if failures:

@@ -135,6 +135,27 @@ PROCESSING_KEY = f"comfy:processing:{WORKER_ID}"
 #      "user":          "",                               # reserved for Q4
 #      "submitted_at":  1756400000.0}                     # reserved for Q6
 #
+# — except that `workflow`, alone among those fields, is stored BESIDE the
+# queue rather than on it, at payload_key(job_id), and the entry on the list
+# carries the other six. The split is not about the envelope; it is about what
+# a submit costs. Q1's fair-queueing insert has to look at every entry already
+# queued to decide where the new one goes, Redis is single-threaded, and the
+# workflow is the only field whose size is the client's to choose — tens of KB
+# typically and MAX_BODY_BYTES at worst. With it in the list, a submit against
+# a full queue walked megabytes and stalled every other client, workers parked
+# in BLMOVE included, for as long as that took. With it out, the walk is over
+# a few hundred bytes an entry whatever the workflow weighs. See BEGIN FAIR
+# QUEUEING in hub.py for the insert itself.
+#
+# CONSUMERS MUST TAKE BOTH SHAPES, and this is a third direction of the same
+# tolerance the rest of this block is about. An entry that carries its own
+# `workflow` is complete and is used as it stands — that is the pre-F2 two-key
+# shape, it is what a not-yet-upgraded gateway writes through a rolling
+# deploy, and it is what anything hand-pushing onto the queue writes. An entry
+# without one is a pointer: the workflow is read from payload_key(job_id) and
+# rejoined. Absence is the discriminator rather than a flag, because a flag is
+# a field an older peer does not write.
+#
 # This block is MIRRORED VERBATIM in enterprise/gateway/hub.py and
 # enterprise/worker/worker_agent.py — change both or neither, the same rule the
 # processing-list key shape already follows. There is no third file to import
@@ -303,6 +324,52 @@ def parse_envelope(payload: dict) -> dict:
         "user": envelope_text(payload.get("user")),
         "submitted_at": payload.get("submitted_at"),
     }
+
+
+# Where the workflow half of an entry lives when the entry does not carry it.
+# Namespaced under the job like its state hash and its event stream, so one
+# job is still one `comfy:job:<id>:*` prefix to an operator holding an id.
+PAYLOAD_KEY_PREFIX = "comfy:job:"
+PAYLOAD_KEY_SUFFIX = ":payload"
+
+
+def payload_key(job_id: str) -> str:
+    """The key holding the workflow for an entry that does not carry one."""
+    return f"{PAYLOAD_KEY_PREFIX}{job_id}{PAYLOAD_KEY_SUFFIX}"
+
+
+def queue_record(envelope: dict) -> dict:
+    """
+    The producer side of the split: what actually goes on the list.
+
+    Every field except the workflow, so the entry on the queue is still a
+    readable envelope rather than a bare id — an operator, and
+    check-40-envelope.py, reads the version, the lane, the attempt breadcrumb,
+    the submitter and the submit time straight off an LRANGE exactly as
+    before. Those six are scalars by contract (see above: nothing unbounded
+    goes in here), which is what makes the entry small enough for the insert
+    to walk cheaply.
+    """
+    return {key: value for key, value in envelope.items() if key != "workflow"}
+
+
+def needs_payload(record) -> bool:
+    """The consumer side: is this entry a pointer rather than a whole
+    envelope? Anything carrying a workflow is complete, whatever else it
+    says."""
+    return isinstance(record, dict) and "workflow" not in record
+
+
+def with_workflow(record: dict, stored: str) -> dict:
+    """
+    Rejoin a pointer entry with the workflow stored beside the queue.
+
+    The result is an ordinary envelope of the shape at the top of this block,
+    for parse_envelope() to read as usual — the tolerance rules do not get a
+    second implementation for pointer entries. Raises on a payload that is not
+    JSON, which the caller treats as it treats any malformed entry.
+    """
+    return dict(record, workflow=json.loads(stored))
 
 # END SHARED ENVELOPE
 # ---------------------------------------------------------------------------
@@ -965,13 +1032,39 @@ def main() -> int:
             if raw is None:
                 continue
 
+            job_id = None
+
             try:
                 try:
+                    record = json.loads(raw)
+
+                    # A pointer entry names its workflow instead of carrying
+                    # it; fetch it back and rejoin before parsing. An entry
+                    # that carries its own workflow — a pre-F2 payload, an
+                    # older gateway's, a hand-pushed one — skips this and is
+                    # parsed exactly as it always was.
+                    if needs_payload(record):
+                        stored = conn.get(payload_key(record["job_id"]))
+
+                        if stored is None:
+                            # The one failure this split adds, and it is
+                            # reported rather than dropped: the job exists, its
+                            # owner is waiting on the stream, and silence here
+                            # would be a bar that never moves.
+                            log(f"job {record['job_id']}: workflow missing from Redis")
+                            finish(conn, record["job_id"], "failed",
+                                   {"error": "the workflow for this job is no longer in "
+                                             "Redis — it expired or was removed before a "
+                                             "worker could run it. Resubmit."})
+                            continue
+
+                        record = with_workflow(record, stored)
+
                     # Tolerant by contract: a pre-F2 {"job_id", "workflow"}
                     # entry parses as version 1 with every reserved field
                     # defaulted, and a key from a newer gateway is carried and
                     # not read. Only a missing job_id or workflow is malformed.
-                    job = parse_envelope(json.loads(raw))
+                    job = parse_envelope(record)
                     job_id = job["job_id"]
 
                 except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -996,10 +1089,26 @@ def main() -> int:
             finally:
                 # The job reached a terminal state (or was malformed); take it
                 # out of the processing list so the reaper never touches it.
+                removed = 0
+
                 try:
-                    conn.lrem(PROCESSING_KEY, 1, raw)
+                    removed = conn.lrem(PROCESSING_KEY, 1, raw)
                 except Exception:  # noqa: BLE001
                     pass
+
+                # And drop the workflow stored beside the queue with it, which
+                # is what keeps live payloads proportional to the queue rather
+                # than to a day of throughput (PAYLOAD_TTL is only the
+                # backstop). Conditional on the LREM having actually removed
+                # something: a zero means this worker's heartbeat lapsed and
+                # the reaper took the entry first, in which case it may already
+                # have requeued the job and rewritten this exact key, and
+                # deleting it here would strand the retry.
+                if removed and job_id is not None:
+                    try:
+                        conn.delete(payload_key(job_id))
+                    except Exception:  # noqa: BLE001
+                        pass
 
     finally:
         try:

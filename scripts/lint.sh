@@ -554,6 +554,86 @@ fi
 
 # ---------------------------------------------------------------------------
 
+log "the fair-queueing insert splices, and carries no workflow (docs/10-roadmap.md, Q1)"
+
+# Two properties of hub.py's FAIR_ENQUEUE_LUA that nothing else can see.
+#
+# The suite cannot see either one: it runs a queue three jobs deep with a
+# two-node workflow, where a script that walks megabytes and a script that
+# walks kilobytes both finish instantly and both produce the same order.
+#
+#   1. It never unmakes the queue. This script runs on every submit and Redis
+#      does not roll back a script's partial effects, so a version that DELs
+#      comfy:queue and pushes it back has a window in which an error loses
+#      every queued job at once — the "work vanishing at random" that
+#      `maxmemory-policy noeviction` exists to prevent, arriving by a door
+#      that policy does not cover. Injecting an error after the DEL in the
+#      version this replaced emptied a 10-deep queue; injecting one anywhere
+#      in this version leaves it untouched. LINSERT is what makes that true:
+#      it splices one entry against a pivot and touches nothing else.
+#
+#   2. The list entry carries no workflow. Placing a job fairly means reading
+#      every job already queued, Redis is single-threaded, and a workflow is
+#      the one field whose size the client chooses (up to MAX_BODY_BYTES). In
+#      the list, one submit against a 499-deep queue of 26 KB workflows cost
+#      ~118 ms of exclusive Redis time — a stall on every other client,
+#      including every worker parked in BLMOVE — and ~1.2 s at 103 KB. Beside
+#      the list, both are ~2 ms. queue_record() is what keeps the workflow out
+#      of the entry; a "simplification" back to json.dumps(envelope) restores
+#      the whole cost.
+
+if python3 - <<'EOF'
+import re, sys
+
+PATH = "enterprise/gateway/hub.py"
+source = open(PATH).read()
+
+problems = []
+
+match = re.search(r'FAIR_ENQUEUE_LUA = """(.*?)"""', source, re.S)
+
+if match is None:
+    print(f"  {PATH}: no FAIR_ENQUEUE_LUA script to check")
+    sys.exit(1)
+
+script = "\n".join(line for line in match.group(1).splitlines()
+                   if not line.lstrip().startswith("--"))
+
+if "LINSERT" not in script:
+    problems.append("the insert no longer uses LINSERT. Placing an entry any "
+                    "other way means rewriting the list around it")
+
+for destructive in ("DEL", "LTRIM", "LSET", "LREM", "LPOP", "RPOP"):
+    if re.search(r"'%s'" % destructive, script):
+        problems.append(f"the insert calls {destructive} on the queue. This "
+                        "script must only ever ADD one entry: Redis does not "
+                        "roll back a partial script, so anything that unmakes "
+                        "the list can lose every queued job at once")
+
+call = re.search(r"def fair_enqueue_call\(.*?\n\n\n", source, re.S)
+
+if call is None:
+    problems.append("fair_enqueue_call() is gone — the queue entry and the "
+                    "workflow beside it are built in one place on purpose")
+elif "queue_record(" not in call.group(0):
+    problems.append("fair_enqueue_call() no longer builds the list entry with "
+                    "queue_record(). The entry on comfy:queue must not carry "
+                    "the workflow: this script reads every queued entry on "
+                    "every submit, and Redis is single-threaded")
+
+for problem in problems:
+    print(f"  {PATH}: {problem}")
+
+sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then

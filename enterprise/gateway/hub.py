@@ -50,6 +50,17 @@ QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 EVENT_STREAM_TTL = int(os.environ.get("EVENT_STREAM_TTL", "3600"))
 MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "500"))
 
+# The queue carries an ordering record and the workflow itself sits beside it
+# at payload_key(job_id) — see BEGIN SHARED ENVELOPE. This is the backstop on
+# that key, not the reclaim path: the reclaim path is the explicit delete every
+# terminal outcome does (the worker's finally, the reaper's fail_orphaned_job),
+# and the backstop exists because this Redis is `noeviction`, where a key
+# nothing deletes is a key forever. A full day rather than EVENT_STREAM_TTL
+# because the thing it must not do is expire out from under a job that is
+# still QUEUED, and a 500-deep queue on a pool of three cards is hours of work,
+# not an hour.
+PAYLOAD_TTL = int(os.environ.get("PAYLOAD_TTL", str(24 * 3600)))
+
 # Real API-format workflows are tens of KB. The cap exists because uvicorn
 # imposes no body limit of its own, the whole body is buffered in memory and
 # then stored in Redis, and with AUTH_MODE=none this endpoint is public.
@@ -95,6 +106,27 @@ STATIC_ROOT = pathlib.Path(__file__).parent / "static"
 #      "attempt":       {"count": 0, "phase": "queued"},   # Q2: retry + phase
 #      "user":          "",                               # reserved for Q4
 #      "submitted_at":  1756400000.0}                     # reserved for Q6
+#
+# — except that `workflow`, alone among those fields, is stored BESIDE the
+# queue rather than on it, at payload_key(job_id), and the entry on the list
+# carries the other six. The split is not about the envelope; it is about what
+# a submit costs. Q1's fair-queueing insert has to look at every entry already
+# queued to decide where the new one goes, Redis is single-threaded, and the
+# workflow is the only field whose size is the client's to choose — tens of KB
+# typically and MAX_BODY_BYTES at worst. With it in the list, a submit against
+# a full queue walked megabytes and stalled every other client, workers parked
+# in BLMOVE included, for as long as that took. With it out, the walk is over
+# a few hundred bytes an entry whatever the workflow weighs. See BEGIN FAIR
+# QUEUEING in hub.py for the insert itself.
+#
+# CONSUMERS MUST TAKE BOTH SHAPES, and this is a third direction of the same
+# tolerance the rest of this block is about. An entry that carries its own
+# `workflow` is complete and is used as it stands — that is the pre-F2 two-key
+# shape, it is what a not-yet-upgraded gateway writes through a rolling
+# deploy, and it is what anything hand-pushing onto the queue writes. An entry
+# without one is a pointer: the workflow is read from payload_key(job_id) and
+# rejoined. Absence is the discriminator rather than a flag, because a flag is
+# a field an older peer does not write.
 #
 # This block is MIRRORED VERBATIM in enterprise/gateway/hub.py and
 # enterprise/worker/worker_agent.py — change both or neither, the same rule the
@@ -265,6 +297,52 @@ def parse_envelope(payload: dict) -> dict:
         "submitted_at": payload.get("submitted_at"),
     }
 
+
+# Where the workflow half of an entry lives when the entry does not carry it.
+# Namespaced under the job like its state hash and its event stream, so one
+# job is still one `comfy:job:<id>:*` prefix to an operator holding an id.
+PAYLOAD_KEY_PREFIX = "comfy:job:"
+PAYLOAD_KEY_SUFFIX = ":payload"
+
+
+def payload_key(job_id: str) -> str:
+    """The key holding the workflow for an entry that does not carry one."""
+    return f"{PAYLOAD_KEY_PREFIX}{job_id}{PAYLOAD_KEY_SUFFIX}"
+
+
+def queue_record(envelope: dict) -> dict:
+    """
+    The producer side of the split: what actually goes on the list.
+
+    Every field except the workflow, so the entry on the queue is still a
+    readable envelope rather than a bare id — an operator, and
+    check-40-envelope.py, reads the version, the lane, the attempt breadcrumb,
+    the submitter and the submit time straight off an LRANGE exactly as
+    before. Those six are scalars by contract (see above: nothing unbounded
+    goes in here), which is what makes the entry small enough for the insert
+    to walk cheaply.
+    """
+    return {key: value for key, value in envelope.items() if key != "workflow"}
+
+
+def needs_payload(record) -> bool:
+    """The consumer side: is this entry a pointer rather than a whole
+    envelope? Anything carrying a workflow is complete, whatever else it
+    says."""
+    return isinstance(record, dict) and "workflow" not in record
+
+
+def with_workflow(record: dict, stored: str) -> dict:
+    """
+    Rejoin a pointer entry with the workflow stored beside the queue.
+
+    The result is an ordinary envelope of the shape at the top of this block,
+    for parse_envelope() to read as usual — the tolerance rules do not get a
+    second implementation for pointer entries. Raises on a payload that is not
+    JSON, which the caller treats as it treats any malformed entry.
+    """
+    return dict(record, workflow=json.loads(stored))
+
 # END SHARED ENVELOPE
 # ---------------------------------------------------------------------------
 
@@ -311,12 +389,55 @@ def parse_envelope(payload: dict) -> dict:
 # kept in a persistent per-lane counter: a persistent counter would keep
 # counting a lane's already-*served* jobs too, so a submitter whose earlier
 # jobs already ran would wrongly look deep into round N for everything after.
+#
+# THE COST OF THAT RECOMPUTE is the thing to understand before editing this,
+# because it is paid by every client rather than by the submitter. Redis runs
+# one command at a time, so whatever an EVAL does, every other connection
+# waits — including every worker parked in BLMOVE, which is to say the pool
+# stops being handed work for the duration. Two things therefore have to stay
+# true of the script below, and the first version of it had neither:
+#
+#   1. What it reads per entry is SMALL and fixed. It walks the whole queue,
+#      which is bounded by MAX_QUEUE_DEPTH; what it must never also scale with
+#      is the size of a workflow, which the client chooses and which reaches
+#      MAX_BODY_BYTES. That is why the queue carries the ordering record and
+#      the workflow lives at payload_key(job_id) (see the shared envelope
+#      block above), and it is worth a number: with 26 KB workflows in the
+#      list, one submit against a 499-deep queue measured ~86 ms of exclusive
+#      Redis time; over an ordering record it is under a millisecond, and it
+#      no longer moves at all when the workflows get bigger.
+#
+#   2. It NEVER unmakes the queue to remake it. Redis does not roll back a
+#      script's partial effects, so a script that DELs the list and RPUSHes it
+#      back has a window whose failure mode is losing every queued job at once
+#      — the same "work vanishing at random" that `maxmemory-policy
+#      noeviction` exists to prevent, arriving by a door the policy does not
+#      cover. LINSERT places the new entry against a pivot already in the list
+#      and touches nothing else, so there is no state in which the queue is
+#      empty, short, or half-written, and no error path that could leave one.
+#      Anything that reintroduces a read-modify-rewrite of the whole list —
+#      including a "tidy" refactor — reintroduces that window.
 # ---------------------------------------------------------------------------
 
 FAIR_ENQUEUE_LUA = """
 local key = KEYS[1]
+local payload = KEYS[2]
 local new_entry = ARGV[1]
 local new_lane = ARGV[2] or ""
+local workflow = ARGV[3]
+local payload_ttl = tonumber(ARGV[4])
+
+-- The workflow lands beside the queue BEFORE the entry pointing at it lands on
+-- the queue, so there is no ordering in which a worker pops a pointer whose
+-- payload has not been written. KEEPTTL, then EXPIRE NX: a requeue rewrites
+-- the workflow (its attempt count moved) without buying the job another full
+-- lifetime, which is the same rule hub.py's arm_state_ttl() follows and for
+-- the same reason. A plain SET would clear the TTL and the EXPIRE would then
+-- re-arm it in full.
+redis.call('SET', payload, workflow, 'KEEPTTL')
+if payload_ttl and payload_ttl > 0 then
+  redis.call('EXPIRE', payload, payload_ttl, 'NX')
+end
 
 local raw = redis.call('LRANGE', key, 0, -1)
 local n = #raw
@@ -356,32 +477,60 @@ for i = 1, n do
   end
 end
 
-local result = {}
-for i = 1, insert_at - 1 do result[#result + 1] = front[i] end
-result[#result + 1] = new_entry
-for i = insert_at, n do result[#result + 1] = front[i] end
+-- Service position to physical index. `insert_at - 1` jobs are to be served
+-- before this one and the list runs newest-first, so the new entry belongs at
+-- physical index n - insert_at + 1, counting from the head.
+local at = n - insert_at + 1
 
-redis.call('DEL', key)
-
--- Write back in physical order (head first, i.e. `result` reversed), in
--- batches so a very deep queue never approaches Lua's per-call argument
--- limit.
-local batch = {}
-for i = #result, 1, -1 do
-  batch[#batch + 1] = result[i]
-  if #batch == 200 then
-    redis.call('RPUSH', key, unpack(batch))
-    batch = {}
+if at <= 0 then
+  -- Served last: the back of the line is the physical head, the plain LPUSH
+  -- this queue did before Q1 existed. Also the whole of the empty-queue case.
+  redis.call('LPUSH', key, new_entry)
+elseif at >= n then
+  -- Served first. Unreachable: front[1] has nothing of its own lane ahead of
+  -- it, so its round is 0, so no existing job's round can be strictly greater
+  -- than a new job's and insert_at is never 1 for a non-empty queue. Written
+  -- out anyway rather than left to fall into the branch below, so the index
+  -- arithmetic does not silently depend on that argument staying true.
+  redis.call('RPUSH', key, new_entry)
+else
+  -- The ordinary case, and the reason nothing here rewrites the list: LINSERT
+  -- splices one element in against a pivot and leaves every other element
+  -- alone. raw[at + 1] is the entry currently at physical index `at`, which is
+  -- the one the new entry must push back by one place.
+  local placed = redis.call('LINSERT', key, 'BEFORE', raw[at + 1], new_entry)
+  if placed < 0 then
+    -- LINSERT reports -1 for a pivot it cannot find, which cannot happen here
+    -- -- the list cannot change under an EVAL and entries are unique by
+    -- job_id. If it somehow does, the job joins the back of the queue. Losing
+    -- a place in line is a bad outcome; losing the job is not an outcome.
+    redis.call('LPUSH', key, new_entry)
   end
-end
-if #batch > 0 then
-  redis.call('RPUSH', key, unpack(batch))
 end
 
 -- {jobs queued before this one (any lane), jobs that will be served before
 -- this one under fair-queueing order}
 return {n, insert_at - 1}
 """
+
+
+def fair_enqueue_call(envelope: dict) -> tuple[list, list]:
+    """
+    The keys and args for one fair-queueing insert.
+
+    In one place because there are two call sites — a first submission and the
+    reaper's requeue — and an argument order remembered in two places is an
+    argument order that is wrong in one of them. It is also what a benchmark
+    or a future third caller should use rather than re-deriving the split.
+    """
+    return (
+        [QUEUE_KEY, payload_key(envelope["job_id"])],
+        [json.dumps(queue_record(envelope)),
+         envelope["queue_key"],
+         json.dumps(envelope["workflow"]),
+         PAYLOAD_TTL],
+    )
+
 
 _fair_enqueue_script = None
 
@@ -533,6 +682,12 @@ async def fail_orphaned_job(conn: redis.Redis, job_id: str, error: str) -> None:
     await conn.hset(state_key(job_id), mapping={"status": "failed"})
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
+    # Nothing will run this workflow now, so the copy beside the queue goes
+    # with the job. PAYLOAD_TTL would collect it eventually; this is what keeps
+    # the steady state proportional to the queue rather than to a day's
+    # throughput, in a Redis that is deliberately `noeviction`.
+    await conn.delete(payload_key(job_id))
+
     await conn.xadd(
         stream_key(job_id),
         {"data": json.dumps({"type": "failed", "data": {"error": error}})},
@@ -561,9 +716,8 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> 
     # let a submitter whose worker keeps dying take slots from lanes that did
     # nothing wrong, which is the starvation Q1 exists to prevent, arriving by
     # a new door. It rejoins at the back of its own lane's round.
-    _queued_before, position = await fair_enqueue_script()(
-        keys=[QUEUE_KEY], args=[json.dumps(envelope), envelope["queue_key"]]
-    )
+    keys, args = fair_enqueue_call(envelope)
+    _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
 
     await conn.hset(
         state_key(job_id),
@@ -615,9 +769,25 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
         await fail_orphaned_job(conn, job_id, f"{DEAD_WORKER}: {got_there}. {DESCRIBE_HINT}.")
         return
 
+    # A pointer entry names its workflow rather than carrying it, so fetch it
+    # back before parsing. Nothing about the retry decision changes: this is
+    # only where the bytes live. An entry that carries its own workflow (an
+    # older gateway's, or a hand-pushed one) skips this entirely.
+    stored = None
+
+    if needs_payload(payload):
+        stored = await conn.get(payload_key(job_id))
+
+        if stored is None:
+            await fail_orphaned_job(
+                conn, job_id,
+                f"{DEAD_WORKER}, and the workflow it was running is no longer "
+                f"in Redis to requeue. {DESCRIBE_HINT}.")
+            return
+
     try:
-        entry = parse_envelope(payload)
-    except (KeyError, TypeError):
+        entry = parse_envelope(payload if stored is None else with_workflow(payload, stored))
+    except (json.JSONDecodeError, KeyError, TypeError):
         await fail_orphaned_job(
             conn, job_id,
             f"{DEAD_WORKER}, and its queue entry carries no workflow to requeue. {DESCRIBE_HINT}.")
@@ -757,9 +927,8 @@ async def generate(request: Request):
     # raw list-length snapshot once more than one lane is active, which is the
     # whole point. The overall backlog size (unaffected by fairness — it is
     # still one list) stays available from gather_stats()'s queue_depth.
-    _queued_before, position = await fair_enqueue_script()(
-        keys=[QUEUE_KEY], args=[json.dumps(envelope), envelope["queue_key"]]
-    )
+    keys, args = fair_enqueue_call(envelope)
+    _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
 
     # phase is seeded here rather than left for the worker to create, so the
     # breadcrumb is never absent on a job that exists. The reaper reads a

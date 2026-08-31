@@ -10,6 +10,23 @@ stub ComfyUI, on your laptop. No cluster, no GPU, no AWS.
 Needs `redis-server` on PATH and `pip install redis websocket-client fastapi
 'uvicorn[standard]'`.
 
+## What it measures, separately
+
+`bench-fair-enqueue.py` is not a check and `run.sh` does not run it — it is a
+measurement, of what one `/api/generate` costs Redis at a realistic queue depth
+with a realistic workflow. The suite cannot answer that: it runs a queue three
+jobs deep with a two-node workflow, where every version of the fair-queueing
+insert is instant and correct. Redis is single-threaded, so that cost is time
+no other client gets, workers parked in `BLMOVE` included. Point it at any
+Redis; it uses its own key namespace and drains nothing:
+
+```bash
+REDIS_URL=redis://127.0.0.1:6399/0 REDIS_PASSWORD=testpass123 \
+    python3 enterprise/test/bench-fair-enqueue.py
+```
+
+Its docstring carries the recorded numbers and what a bad one means.
+
 ## What it actually asserts
 
 The point is not coverage for its own sake — it is the handful of behaviours
