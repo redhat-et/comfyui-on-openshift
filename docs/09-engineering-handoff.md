@@ -166,6 +166,18 @@ miserable to reproduce.
 | The `chgrp 0` / `chmod g=u` block in both Containerfiles | `app/Containerfile`, `enterprise/worker/Containerfile` | OpenShift runs the container as an arbitrary high UID with GID 0. Without it, ComfyUI cannot write `temp/`, `input/`, `user/` and the pod crash-loops. This is the single most common OpenShift containerisation failure. |
 | `STORAGE_MODE=rwx` for the multi-user configuration | `enterprise/setup.sh` refuses otherwise | The gateway serves images off the volume the workers write to, and they are on different nodes by construction. gp3 is `ReadWriteOnce`. |
 
+The file-level half of this table is now mechanical. `make lint` fails on a
+pod that requests a GPU without tolerating the GPU taint, a Route missing
+either timeout annotation, a Service that regained the gateway's own 8000
+beside the proxy port, a Service or Route pointed at the workers, an oauth
+patch that no longer rebinds the gateway to loopback, a Redis without
+`noeviction`, a drain window shorter than `JOB_TIMEOUT`, a `start.sh` that
+stopped defaulting ComfyUI to loopback, and either Containerfile losing its
+`chgrp 0` / `chmod g=u` block. The e2e suite can see none of those — it runs
+no cluster and reads no manifest — so if you are about to argue with a lint
+failure naming one of them, read its row above first. The check exists
+precisely because the edit looks harmless.
+
 `docs/07-design-review.md` is the long form: every one of these traces back to
 a specific bug in the design this was built from. Read it once, early. It is
 the fastest way to understand why the code looks the way it does, and it is

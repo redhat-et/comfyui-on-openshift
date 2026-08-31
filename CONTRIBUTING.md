@@ -24,6 +24,13 @@ requirements file says why).
 one is defending against and why. Run it before sending a change to `hub.py`
 or `worker_agent.py`.
 
+Adding an assertion means adding a file: `run.sh` discovers every
+`enterprise/test/check*.py`, so a new check needs no second edit anywhere. The
+naming convention — and the two things a check may assume — are in
+`enterprise/test/README.md`. One of the shell unit tests proves that discovery
+by running the e2e suite with a deliberately broken check dropped into it, so
+`make test` costs about two e2e runs rather than one.
+
 ## Linting
 
 ```bash
@@ -31,7 +38,13 @@ make lint
 ```
 
 That is shellcheck, bash syntax, a macOS-bash-3.2 portability check, Python
-compilation, and manifest parsing — the logic lives in `scripts/lint.sh`.
+compilation, and the manifest and file shape checks — the logic lives in
+`scripts/lint.sh`. The shape checks are where the file-level half of the
+load-bearing invariants in `docs/09-engineering-handoff.md` section 3 is held:
+a worker that lost its GPU toleration, a Route that lost `timeout-tunnel`, a
+Service that regained the gateway's own port, a Containerfile that lost its
+`chgrp 0` block. The e2e suite runs no cluster and reads no manifest, so it
+cannot see any of them.
 CI (`.github/workflows/ci.yaml`) runs exactly `make lint` and `make test` on
 every pull request — a red check on those means the same command fails for
 you locally — plus two jobs that need more than a laptop usually has lying
