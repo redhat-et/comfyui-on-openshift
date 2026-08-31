@@ -1,0 +1,25 @@
+---
+# Fixture: the oauth-proxied gateway Service listing the gateway's own
+# container port (8000) alongside the proxy port (8443). Otherwise shaped
+# like the Service in enterprise/manifests/05-oauth-proxy.yaml. Per
+# docs/09-engineering-handoff.md section 3, leaving 8000 on this list reaches
+# the gateway without logging in, whatever the pod binds. Valid YAML, so
+# yaml.safe_load_all accepts it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: comfy-gateway
+  labels:
+    app: comfy-gateway
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: comfy-gateway-tls
+spec:
+  selector:
+    app: comfy-gateway
+  ports:
+    - name: public
+      port: 8443
+      targetPort: public
+    - name: http
+      port: 8000
+      targetPort: http

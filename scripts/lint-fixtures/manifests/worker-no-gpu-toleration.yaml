@@ -1,0 +1,37 @@
+---
+# Fixture: a GPU worker Deployment that lost its nvidia.com/gpu toleration.
+# Otherwise shaped like enterprise/manifests/02-worker.yaml. Valid YAML, so
+# yaml.safe_load_all accepts it happily — the bug scripts/unit-tests.sh
+# proves scripts/lint.sh does not catch this.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-worker
+  labels:
+    app: comfy-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: comfy-worker
+  template:
+    metadata:
+      labels:
+        app: comfy-worker
+    spec:
+      nodeSelector:
+        GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
+      # tolerations intentionally omitted — without nvidia.com/gpu:Exists the
+      # pod can never schedule onto the tainted GPU node.
+      containers:
+        - name: worker
+          image: comfy-worker:latest
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "1"
+              memory: 8Gi
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "3"
+              memory: 24Gi
