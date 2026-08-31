@@ -154,7 +154,7 @@ miserable to reproduce.
 | ComfyUI binds `127.0.0.1` in the worker | `enterprise/worker/start.sh` | You have published unauthenticated arbitrary code execution on a node with an instance role and a writable model volume. This is the security model, not a network preference. |
 | Workers have no Service and no Route | `enterprise/manifests/02-worker.yaml` | Same as above, by a different door. |
 | The gateway is rebound to loopback under `AUTH_MODE=oauth` | `05-oauth-proxy-patch.yaml` | Anything in the cluster reaches the gateway without logging in. The proxy stops being a control. |
-| The Service exposes only the proxy port | `05-oauth-proxy.yaml` | A listed 8188 is a bypass regardless of what the pod binds. |
+| The Service exposes only the proxy port | `05-oauth-proxy.yaml` | The gateway's own port is **8000**, not 8188 — leave 8000 on the Service list and anything in the cluster reaches the gateway without logging in, whatever the pod binds. (8188 is ComfyUI's port and never appears on this Service.) |
 | Connect the ComfyUI WebSocket **before** submitting the prompt | `worker_agent.py`, note 1 | Every event in the gap is lost. Short jobs show no progress; long ones start at 30%. |
 | Filter every event by `prompt_id` | `worker_agent.py`, note 2 | One ComfyUI multiplexes all prompts onto one socket. Another job's terminal event ends yours and reports success on work still running. |
 | Bounded `recv()` timeout and a job deadline | `worker_agent.py`, note 3 | A wedged ComfyUI parks the agent forever. The pod stays `Running` and `Ready`, stops consuming the queue, reports nothing — and KEDA, seeing a growing queue, adds *more* workers beside the dead one. |
@@ -162,7 +162,7 @@ miserable to reproduce.
 | `BLMOVE` into a per-worker processing list + TTL'd heartbeat | `worker_agent.py`, note 5 | SIGKILL (OOM, node reclaim) strands the job with no terminal event. The gateway's reaper depends on the heartbeat lapsing. |
 | Redis Streams, not pub/sub | `hub.py` | Pub/sub delivers only to subscribers connected at publish time. The POST and the WebSocket open are two round trips — the gap is the common case. |
 | `maxmemory-policy noeviction` + `MAX_QUEUE_DEPTH` | `00-redis.yaml`, `hub.py` | The default evicts queued jobs, which presents as work vanishing at random. |
-| `haproxy.router.openshift.io/timeout: 4h` on every Route | `enterprise/manifests/` | HAProxy's 30-second default kills long generations mid-render and reads exactly like an application bug. |
+| `haproxy.router.openshift.io/timeout: 4h` **and `timeout-tunnel`** on every Route | `enterprise/manifests/` | HAProxy's 30-second default kills long generations mid-render and reads exactly like an application bug. On edge and reencrypt Routes only `timeout-tunnel` governs the upgraded WebSocket, against a one-hour router default — setting `timeout` alone still drops long jobs. Both annotations, or neither works. |
 | The `chgrp 0` / `chmod g=u` block in both Containerfiles | `app/Containerfile`, `enterprise/worker/Containerfile` | OpenShift runs the container as an arbitrary high UID with GID 0. Without it, ComfyUI cannot write `temp/`, `input/`, `user/` and the pod crash-loops. This is the single most common OpenShift containerisation failure. |
 | `STORAGE_MODE=rwx` for the multi-user configuration | `enterprise/setup.sh` refuses otherwise | The gateway serves images off the volume the workers write to, and they are on different nodes by construction. gp3 is `ReadWriteOnce`. |
 
@@ -311,9 +311,10 @@ need a real cluster. The short version, in the order I would take them:
 
 1. **Schedule the warm window** (two cron lines). Removes the morning cold
    start without paying overnight. Highest payoff per unit of work on the list.
-2. **Priority queues.** `BRPOP` on one list is FIFO, so one overnight batch of
-   200 jobs starves every interactive user. Two lists checked in order is a
-   small change to the agent and a large change to how the system feels.
+2. **Fair queueing.** The pop is a single-list `BLMOVE` (`worker_agent.py:374`),
+   so one overnight batch of 200 jobs starves every interactive user.
+   Round-robin the pop across submitters rather than ranking them — it solves
+   the starvation without introducing a priority claim a caller could forge.
 3. **Retry-once-then-fail, then spot instances.** Retry is deliberately absent
    today because a workflow that OOM-killed one worker will kill the next. A
    bounded retry on a *different* node fixes the node-death case without the

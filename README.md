@@ -208,6 +208,63 @@ flowchart LR
 `enterprise/README.md` to run it, `docs/06-enterprise-architecture.md` for why
 it is shaped that way.
 
+<details>
+<summary><b>What happens when things fail</b> — every failure mode, what the system does, and what the user sees</summary>
+
+<br>
+
+Most of this repository's design is failure handling, so it is worth being able
+to read it in one place. Nothing below is aspirational: each row is a code path
+you can find, and most are covered by an assertion in `enterprise/test/`.
+
+#### Out of memory — three different failures that people call one thing
+
+ComfyUI makes it easy to exceed memory, and the three ways it happens are not
+handled alike. Knowing which one you hit is most of the diagnosis.
+
+| | What actually happens | What the user sees |
+|---|---|---|
+| **VRAM / CUDA OOM** — the common one: a resolution, batch size or model stack that does not fit the card | ComfyUI catches it and emits `execution_error`. The agent (`worker_agent.py:279`) turns that into a terminal `failed` carrying ComfyUI's own exception message. The worker stays healthy and takes the next job. | `failed: Allocation on device ...` — the real message, not a generic error. Nothing is retried, because the same workflow would fail the same way on any card. |
+| **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The kernel kills the ComfyUI process. `start.sh` waits on both children, so the pod exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses. This is the case that looks like infrastructure death, because at the queue level it is indistinguishable from one. |
+| **Node-level pressure** — eviction rather than a container kill | The kubelet evicts with a grace period, so SIGTERM arrives first and the drain below applies. | Usually nothing: the job finishes before the pod goes. |
+
+#### Worker death
+
+| Failure | Handling | User-visible result |
+|---|---|---|
+| **Graceful termination** — scale-to-zero, a node drain, a rolling deploy, a spot interruption notice | The agent traps SIGTERM, stops accepting new work, and **finishes the job in flight** before exiting (`worker_agent.py`, note 4). Termination is routine on a pool that scales to zero, so this is the common path, not the exceptional one. | The generation completes normally. Asserted by the e2e suite. |
+| **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5). When the heartbeat lapses, the gateway's reaper fails the stranded job **naming the dead worker**. | `failed: worker comfy-worker-xxxx died` — loudly, rather than a progress bar that never moves. Deliberately failed and not requeued: a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices. Asserted by the e2e suite. |
+| **ComfyUI wedges or dies mid-job** | The agent's `recv()` is bounded and each job carries a deadline (`JOB_TIMEOUT`, 1800s). On every timeout it re-checks `/history` in case a completion event was simply missed. | The job fails with a reason instead of the pod sitting `Running` and `Ready` while silently consuming nothing — which is worse than a crash, because KEDA sees a growing queue and adds more workers beside the dead one. |
+
+#### The job itself
+
+| Failure | Handling | User-visible result |
+|---|---|---|
+| **Invalid workflow** — wrong format, missing input, unknown node | ComfyUI rejects it at submit and the agent propagates the rejection verbatim. | `failed: required input is missing: ckpt_name` rather than `failed`. The difference is most of the support burden. |
+| **Job runs too long** | The per-job deadline fires. | `failed: job exceeded 1800s`. Raise `JOB_TIMEOUT` if your workflows legitimately run longer. |
+| **Cancel** | Cooperative: a queued job is removed, a running one is asked to stop between events. Truly interrupting a running sampler would need ComfyUI's `/interrupt`, and the workers are not reachable from the gateway by design. | Queued jobs stop immediately; running ones stop at the next event boundary. |
+
+#### The connection
+
+| Failure | Handling | User-visible result |
+|---|---|---|
+| **The browser opens its WebSocket after the job already started** | Progress lives in a Redis Stream, not pub/sub. `XREAD` from `0-0` replays the whole history and then tails live in one call. | Nothing is lost. This is the common case — the POST and the socket open are two separate round trips — not an edge case. |
+| **Laptop sleeps, network drops, gateway pod rolls** | Same mechanism: reconnecting replays identically from the beginning. A PodDisruptionBudget keeps one gateway serving through drains and upgrades so both replicas cannot go at once. | The progress bar picks up where it was. |
+| **A long generation outlives the router's idle timeout** | Every Route carries both `haproxy.router.openshift.io/timeout: 4h` and `timeout-tunnel` — on edge and reencrypt Routes only the tunnel timeout governs the upgraded WebSocket. | Long jobs keep their connection. Without both annotations they drop at a fixed point every time, which reads exactly like an application bug. |
+
+#### The system
+
+| Failure | Handling | User-visible result |
+|---|---|---|
+| **Queue grows faster than the pool drains** | The gateway refuses submissions past `MAX_QUEUE_DEPTH`, and Redis runs `maxmemory-policy noeviction`. | An explicit rejection. The default eviction policy would silently drop queued jobs instead, which presents as work disappearing at random. |
+| **Redis restarts** | AOF persistence. | Queued and in-flight state survives a pod restart. It does not survive a zone outage — Redis is a single instance, deliberately, at one-GPU scale. |
+| **A dead pod will not release its volume** | `scripts/08-unstick-storage.sh --repair`, which confirms the EC2 instance is genuinely terminated before force-detaching. | Repairable. Do **not** reach for `oc delete pod --force --grace-period=0`: it strands the volume permanently instead of freeing it. `docs/08-stuck-volumes.md`. |
+| **No GPU capacity, or no quota** | The worker pod stays `Pending`. `make preflight` distinguishes the two — quota is a multi-day fix, capacity is a region or instance-family change. | `docs/05-troubleshooting.md`. |
+| **First job after an idle period** | Not a failure, but it looks like one: a node has to be provisioned and a ~10 GB image pulled. | 8–17 minutes, and the gateway says so rather than leaving a bar that has not moved. Removed entirely by one warm worker — see "Where this loses". |
+| **Someone requests a path outside the output directory** | Resolved and compared against the output root before anything is served. | `/outputs/../../etc/passwd` does not resolve. Asserted by the e2e suite. |
+
+</details>
+
 ## One GPU, ten people
 
 The sharpest number here, using this repo's own rates.
@@ -305,7 +362,11 @@ says so itself, with a comparison table.
 ## Ideas worth doing next
 
 Ordered by payoff per unit of work. Nothing here is implemented; each is a
-concrete next change, not a wish.
+concrete next change, not a wish. `docs/10-roadmap.md` is the worked version —
+it adds three foundation items this list does not have (worker resource
+sizing, a versioned queue payload, and test-harness discovery), corrects the
+effort tags below where a full read of the source disagreed with them, and
+says which two of these should not be done at all.
 
 1. **Schedule the warm window instead of pinning it.** A pair of cron lines —
    `rosa edit machinepool gpu --min-replicas 1` at 08:30 and `--min-replicas 0`
@@ -323,18 +384,22 @@ concrete next change, not a wish.
    store. An init container that copies the active checkpoint from EFS to local
    disk turns every subsequent load from an NFS read into a local read, which
    is the difference EFS costs you today. *(Medium.)*
-4. **Spot instances for the GPU pool, once retry exists.** `g6` spot is
-   routinely 60–70% off. The design already tolerates a worker vanishing; what
-   it lacks is a retry that survives the interruption. Do them together: retry
-   once on a different node, then fail — which also answers the "a workflow
-   that OOM-killed one worker will kill the next" objection that keeps retry
-   out today. *(Medium, and the biggest remaining cost lever.)*
-5. **NVIDIA time-slicing on the GPU Operator.** An L4 running SD1.5-class
-   workflows does not use 24 GB. The device plugin can advertise two to four
-   replicas of one card, multiplying the pool without buying hardware. Measure
-   peak VRAM per workflow first — this trades isolation for density, and MIG
-   (the hard-partition alternative) is not available on L4. *(Medium, large
-   utilization win.)*
+4. **Narrow retry, and spot separately.** These looked like one item and are
+   not. Blanket retry re-runs the poison pill: a host-RAM OOM kills the pod and
+   is indistinguishable at the queue level from a node reclaim, so "retry on
+   worker death" retries the workflow that will kill the next worker too. Retry
+   only jobs that died *before* ComfyUI ever saw the workflow, and add phase
+   breadcrumbs so the rest are at least diagnosable. Spot does not need retry at
+   all: an interruption gives two minutes of notice and the existing SIGTERM
+   drain finishes anything that fits in them — its real trade is that longer
+   generations are lost. *(Medium; see `docs/10-roadmap.md` before starting.)*
+5. **NVIDIA time-slicing — listed here, and not recommended.** The device
+   plugin can advertise several replicas of one card, but time-slicing provides
+   **no memory isolation**: co-resident workflows share the full 24 GB and their
+   peak VRAM sums. ComfyUI exceeds VRAM easily on a single tenant, so this turns
+   a deterministic per-workflow failure into a non-deterministic one where the
+   victim is whichever job allocates second. MIG partitions memory properly and
+   is not available on L4. *(Revisit only on MIG-capable hardware.)*
 6. **Per-user output workspaces.** The gateway already records the
    authenticated user on each job; threading that into the output path is the
    remaining half. Gets you per-user galleries and makes the next item trivial.
@@ -342,10 +407,12 @@ concrete next change, not a wish.
 7. **Showback from the data you already collect.** Job attribution plus GPU
    seconds is a monthly "who spent the card" report. In most organisations this
    changes behaviour faster than any technical control. *(Small.)*
-8. **Priority queues.** `BRPOP` on one list is FIFO, so one person's overnight
-   batch of two hundred jobs starves the interactive users. Two lists checked
-   in order — interactive first, batch second — is a small change to
-   `worker_agent.py` and a large change to how the system feels. *(Small.)*
+8. **Fair queueing.** The pop is a single-list `BLMOVE`, so one person's
+   overnight batch of two hundred jobs starves the interactive users.
+   Round-robin the pop across submitters instead of ranking them: it fixes the
+   starvation without inventing a priority claim that a caller could simply
+   assert about itself. *(Medium — it moves the pop, the depth gate and the
+   KEDA trigger together, not just `worker_agent.py`.)*
 9. **Scale on queue *wait*, not queue depth.** Depth is a proxy; what a user
    feels is time-to-first-pixel. Export an estimated wait from the gateway and
    point KEDA's Prometheus scaler at it. *(Medium.)*

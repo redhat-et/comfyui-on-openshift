@@ -49,7 +49,7 @@ flowchart TB
 
     U1 & U2 & U3 --> R --> P --> G
     G -- LPUSH --> Q
-    Q -- BRPOP --> W1 & W2
+    Q -- BLMOVE --> W1 & W2
     W1 & W2 -- XADD --> S
     S -- "XREAD BLOCK" --> G
     W1 & W2 -- write --> E
@@ -223,8 +223,12 @@ format rather than behind a button in a shared UI.
   not done here. (The gateway does now record that authenticated user on each
   job's state, so attribution — whose job is this — exists without the
   workspaces.)
-- **Job priority.** `BRPOP` on one list is FIFO. Priority means multiple lists
-  and a worker that checks them in order.
+- **Job priority.** The pop is `BLMOVE` from one list into a per-worker
+  processing list — FIFO, and deliberately not a plain `BRPOP`, because the
+  processing list is what the reaper needs. Priority therefore means more than
+  a second list: it means a multi-lane pop that still parks the job somewhere
+  the reaper can find it. `docs/10-roadmap.md` (Q1) takes the fair-queueing
+  route instead, which needs no priority claim from the caller.
 - **Multi-GPU workers.** One pod, one GPU. A worker with four cards would need
   ComfyUI's own batching or four ComfyUI processes.
 - **Redis HA.** One instance with AOF persistence. It survives a pod restart; it

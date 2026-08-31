@@ -1,121 +1,281 @@
 # Roadmap
 
-The twelve improvements listed at the end of `README.md`, turned into a work
-plan: what each one actually touches, what proves it, what order they can
-safely land in, and which of them cannot be finished without spending money on
-a real cluster.
+The improvements listed at the end of `README.md`, turned into a work plan:
+what each one actually touches, what proves it, what order they can safely land
+in, and which of them cannot be finished without spending money on a real
+cluster.
 
 Nothing here is implemented. This document exists so that the next person to
 pick up a line item does not have to re-derive its blast radius, and so that
 several of them can be worked in parallel without three people editing
 `hub.py` at once.
 
+The first version of this file was written from the documentation rather than
+from the source, and was wrong in seventeen places. This version was built from
+a full read of the code; where it corrects the README's framing, it says so.
+
 ## What decides the order
 
-Three facts about this repository, and every scheduling decision below falls
-out of them.
+**Seven items contend on `hub.py`, five on `worker_agent.py`.** Not the same
+five: Q5's entire contact with the queue path is one precondition in
+`generate()`, and it never touches the worker. The collisions are also finer
+than "the same file" — three regions are hot, `generate()`, the reaper pair,
+and `gather_stats()`/`metrics()` — which is why worktrees do not help. The
+queue work is a sequence.
 
-**Five of the twelve contend on the same 886 lines of Python.** Priority
-queues, retry, per-user workspaces, showback and the cost breaker all edit
-`enterprise/gateway/hub.py` (464 lines) and `enterprise/worker/worker_agent.py`
-(422). Worked in parallel, they conflict in the same functions. They are a
-sequence, not a fan-out.
+**The most contended file in the plan does not exist yet.** All six queue items
+propose creating `enterprise/test/check4.py`, and all six must edit
+`enterprise/test/run.sh`, which has **no check discovery**: `run.sh` copies
+`*.py` into the work directory by glob but invokes checks by hardcoded name, and
+threads their exit codes by hand. A botched merge there **fails open** — the new
+check is copied, never run, and the suite is green. That is why F3 below comes
+before any queue work.
 
-**There is a hard verification boundary.** `make test` and `make lint` prove
-the queue, the gateway, path handling, signal handling and image UID hygiene
-with no cluster, no GPU and no AWS account, in about a minute. KEDA actually
-scaling, a machine pool provisioning a node, EFS, oauth-proxy and the GPU
-itself prove nothing until there is a cluster at ~$2.04/hour. Nine of the
-fourteen items below land on the cheap side of that line. Sort by it first.
+**There is a hard verification boundary.** `make test` and `make lint` prove the
+queue, the gateway, path handling, signal handling and image UID hygiene with no
+cluster, no GPU and no AWS account, in about a minute. KEDA actually scaling, a
+machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
+nothing until there is a cluster at ~$2.04/hour. Only five items are
+cluster-only for a failing assertion; ten have a laptop half.
 
-**Thirteen invariants are load-bearing.** `docs/09-engineering-handoff.md` §3
-lists the lines whose removal produces an intermittent, timing-dependent bug.
-Four items touch one directly. Those need a stronger review than the rest, and
-they need it before merge rather than after.
+**Fourteen invariants are load-bearing** — `docs/09-engineering-handoff.md` §3.
+Thirteen of the items touch at least one, so "the risky ones get a second
+reviewer" is not a useful filter. The filter that *is* useful: an item is
+high-risk if it **changes** an invariant rather than merely working near one.
+Three do — Q2, Q3 and F1.
 
-## Why twelve became fourteen
+## Decisions already made
 
-Two of the README's items are compound, and splitting them separates work of
-genuinely different risk:
+These were open questions. They are settled here so that nobody relitigates
+them mid-implementation.
 
-- **"Shrink the cold start"** is an image split — low risk, provable in CI —
-  plus a placeholder pod and PriorityClass that hold a warm node, which is
-  autoscaler semantics and cannot be verified without a cluster.
-- **"Spot instances"** is blocked on retry existing. Retry is scheduled as its
-  own item; spot follows it.
+**Retry is narrow, not general.** Out-of-memory is common in ComfyUI workflows
+and it arrives three different ways, only one of which is ambiguous. A VRAM
+OOM is caught by ComfyUI, arrives as `execution_error`, and already becomes a
+terminal `failed` carrying the real message — retrying it would burn a second
+GPU-hour on a workflow that cannot fit. A host-RAM OOM kills the ComfyUI
+process, takes the pod with it, and is **indistinguishable at the queue level**
+from a node reclaim. So blanket "retry on reaper failure" retries the poison
+pill by construction. Q2 therefore retries **only jobs that died before ComfyUI
+ever saw the workflow**, and adds phase breadcrumbs so every other death is at
+least diagnosable. The rest of the original non-goal in
+`docs/06-enterprise-architecture.md` stands.
+
+**Spot does not depend on retry.** The README implied it did. A spot
+interruption gives two minutes of notice, the node is cordoned and drained, and
+the existing SIGTERM drain finishes the job — for jobs that fit in two minutes.
+I7's real trade is that longer generations are lost, which is a product
+decision, not something retry fixes.
+
+**Priority becomes fair queueing.** A priority lane has to be claimed by the
+caller, and `hub.py` states that under `AUTH_MODE=none` the user header is
+client-supplied and must never be treated as authorization — so everyone
+declares themselves interactive and the starvation returns in a new form.
+Round-robin across submitters solves the stated problem ("one person's batch of
+200 starves everyone") with no trust decision at all, degrades to FIFO when
+there is one submitter, and cannot be gamed, because claiming to be someone
+else only shares your own slot.
+
+**The cost breaker is a local quota, and it fails open.** Giving the
+internet-facing gateway an AWS SDK and an IAM identity to enforce a budget puts
+cloud credentials on the one pod `docs/09` calls the entire public attack
+surface — and AWS Budgets lags real spend by hours anyway. A GPU-second quota
+computed from the attribution Q4 already collects needs no credentials and caps
+the thing you control. It fails **open**: a breaker that trips on an unreachable
+dependency halts a cluster you are already paying for, while the risk it guards
+against is slow. The budget alarm remains the backstop. It must not be wired
+into `readyz()` — that drives the readiness probe, so tripping it would pull the
+gateway out of service and kill the WebSockets reporting in-flight jobs.
+
+**The assertion gate permits intentional replacement.** See Gates below.
+
+## Foundations — these land first
+
+Three items that are not in the README's list, that several later items
+silently assume, and that are each worth doing on their own merits.
+
+| ID | Change | Effort | Risk | Proven by |
+|---|---|---|---|---|
+| F1 | Worker resource sizing | Small | **High** | A unit assertion that requests and limits are internally consistent and fit the target instance type |
+| F2 | Versioned queue payload envelope | Small | Low | Existing e2e suite must pass unchanged; old-shape payloads still parse |
+| F3 | Test harness convention + manifest shape assertions | Small | Low | A deliberately broken manifest fails `make lint`; a new check is discovered without editing two places |
+
+**F1 — worker resource sizing.** `enterprise/manifests/02-worker.yaml` requests
+`memory: 8Gi` and limits `memory: 24Gi`, but the default GPU instance
+(`g6.xlarge`) has 16 GiB of system RAM. The limit is therefore unreachable: the
+container can never hit its own cgroup ceiling, so the real ceiling is node
+pressure, which produces an eviction or a kernel OOM kill rather than a clean
+container-level `OOMKilled`. A burstable pod whose limit exceeds node capacity
+is also a prime eviction candidate. **If host-RAM OOM is a problem in your
+workflows, this line is the cause and retry is a workaround for it.** Fix the
+sizing before building anything that compensates for it. Sizing is also I6's
+binding constraint and part of I3's admission arithmetic.
+
+**F2 — the queue payload envelope.** Today the queue carries `{job_id,
+workflow}` and exactly two files parse it. Q1 wants a lane key, Q2 an attempt
+count and phase, Q4 attribution, Q6 a submit timestamp — four items each
+independently rewriting a contract two files must agree on, in the two most
+contended files in the repository. Define it once, with a version field and
+tolerant parsing, so an unbuilt field is simply absent. The workflow is already
+tens of kilobytes in that payload, so four scalars cost nothing.
+
+**F3 — the harness.** Add check discovery to `enterprise/test/run.sh` so a new
+check is a file and not also an edit in two hardcoded places, and settle the
+naming convention before six items each create their own `check4.py`. Then
+extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
+assertions. Nine of the fourteen §3 invariants are properties of files rather
+than of a running system — a missing toleration, a Service that regained a
+port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
+— and the e2e suite structurally cannot see any of them. This is also what
+turns the infra gate below from a request for vigilance into a check.
 
 ## The work items
 
-Effort tags are the README's. Risk is assigned here by contact with the
-invariants in `docs/09` §3.
+Effort and risk are assigned here from the source, not inherited from the
+README. Where they differ from the README's tags, the README is the one that
+was wrong.
 
 | ID | Change | Effort | Risk | Lane | Proven by |
 |---|---|---|---|---|---|
-| Q1 | Priority queues | Small | Medium | Queue | New e2e assertion: a batch does not starve interactive users |
-| Q2 | Bounded retry, then fail | Medium | **High** | Queue | e2e: node death retries once; a poison workflow does not loop |
-| Q3 | Per-user output workspaces | Small | Medium | Queue | e2e, and the existing path-traversal assertion must still pass |
-| Q4 | Showback report | Small | Low | Queue | e2e: GPU seconds attributed to the right user |
-| Q5 | Cost circuit breaker | Medium | Medium | Queue | e2e including an unreachable Budgets API — fail-open vs fail-closed is a decision, not an accident |
-| Q6 | Estimated-wait metric | Medium | Low | Queue | e2e on the gauge; the scaler half is I4 |
-| I1 | Schedule the warm window | Small | Low | Infra | shellcheck + the bash 3.2 portability check; behaviour on cluster day |
-| I2 | Split the worker image | Medium | Low | Infra | CI image build + the arbitrary-UID job |
+| Q1 | Fair queueing across submitters | Medium | Medium | Queue | e2e: a 5-job batch from one user does not delay a second user's single job |
+| Q2 | Phase breadcrumbs + retry only pre-execution deaths | Medium | **High** | Queue | e2e: a death before submit is retried once; a poison workflow fails once and is not requeued |
+| Q3 | Per-user output workspaces | Medium | **High** | Queue + cluster | e2e on scoping and on a hostile username; arbitrary-UID behaviour needs a cluster |
+| Q6 | Estimated-wait metric | Small | Low | Queue | e2e on the gauge; the scaler half is I4 |
+| Q4 | Showback report | Small | Low | Queue | e2e: GPU seconds attributed to the right user, with a bounded key set |
+| Q5 | GPU-second quota breaker | Medium | Medium | Queue | e2e including quota exhausted and quota data missing (must fail open) |
+| I1 | Schedule the warm window | Small | Low | Infra | New unit test on a pure helper; behaviour on cluster day |
+| I2 | Split the worker image | Medium | Low | Infra | A new CI job — the existing one builds only the gateway image |
 | I3 | Placeholder pod + PriorityClass | Medium | Medium | Infra | Cluster day: node held warm, real job still preempts |
 | I4 | Scale on wait, not depth | Medium | Medium | Infra | Cluster day; depends on Q6 |
-| I5 | Local NVMe model staging | Medium | **High** | Infra | Cluster day; instance store is not mounted by default on RHCOS |
-| I6 | NVIDIA time-slicing | Medium | Medium | Infra | Cluster day, after measuring peak VRAM per workflow |
-| I7 | Spot GPU pool | Small | Medium | Infra | Cluster day; blocked on Q2 |
-| S1 | Model lockfile + `.safetensors` gate | Medium | Low | Supply | Unit tests on the sync job; it rejects a `.ckpt` |
+| I7 | Spot GPU pool *(optional)* | Medium | Medium | Infra | Cluster day; requires a hand-rebuilt pool |
+| S1 | Model provenance gate | Medium | Low | Supply | Unit tests; it rejects a `.ckpt` |
 | S2 | OpenShift Pipelines build | Medium | Low | Supply | Manifests parse; a pipeline dry-run |
+
+### Corrections to the README's framing
+
+- **Q1 is not Small.** The README says the pop is `BRPOP` on one list, so
+  priority is "a small change to `worker_agent.py`". The source uses `BLMOVE`
+  into a per-worker processing list — a §3 invariant the reaper depends on — so
+  the change moves the pop, the depth gate, the KEDA trigger's single
+  `listName`, and the client-visible `queue_depth`/`position` shape together.
+- **I2's proof does not exist yet.** CI has no GPU image build at all, by
+  design, and the arbitrary-UID job covers only the gateway image — whose
+  Containerfile deliberately has no `chgrp 0` block. I2 must **build** its own
+  proof, not inherit one.
+- **S1 has no home yet.** The only `aws s3 sync` in the repo is in the
+  single-user overlay; the multi-user worker mounts the models PVC directly and
+  has no sync path, and `oc rsync` from a laptop filters nothing. A gate written
+  against "the sync job" would leave the shared writable model volume — the
+  exact case `docs/06` worries about — completely ungated. Deciding which path
+  is gated is the first half of the item.
+- **I4 and I7 are not parallel infra work.** Both are blocked behind queue
+  items (I4 on Q6, I7 on Q2's phase data), which the first version of this file
+  acknowledged in one column and contradicted in another.
+- **I1 and I3 contradict each other.** Both want to own the GPU pool's
+  min-replicas — I1 by cron during working hours, I3 by a placeholder pod
+  holding a node — and any `setup.sh` re-run resets whatever cron did. Pick one
+  mechanism before either branches. This is a design conflict, not a merge
+  conflict.
+
+### Deferred, with reasons
+
+**I6 — NVIDIA time-slicing: do not do this.** Time-slicing gives **no memory
+isolation**; co-resident processes share the full 24 GB with nothing
+partitioning it, so two workflows' peak VRAM simply sum. Given how easily
+ComfyUI exceeds VRAM on a single tenant, this converts a deterministic
+per-workflow failure into a non-deterministic one that depends on what the
+neighbouring job is doing, and the victim is whichever process allocates
+second — not the greedy one. MIG partitions memory properly but is not
+available on L4. Independently, the density win is zero until F1: at the
+current requests two workers do not fit on a `g6.xlarge` by host memory alone,
+whatever the device plugin advertises. Revisit only on MIG-capable hardware.
+
+**I5 — local NVMe model staging: a spike, not a work item.** It cannot be
+scoped from this repository. ROSA HCP exposes no MachineSet to edit, and the
+three plausible routes — Ignition/MachineConfig, a privileged DaemonSet with
+`hostPath`, or the Local Storage Operator — differ enormously in blast radius,
+with the middle one colliding head-on with the arbitrary-UID and
+`restricted-v2` posture both Containerfiles treat as architectural. Which is
+permitted on ROSA HCP is an external-documentation question that must be
+answered **before** cluster day, not on it.
+
+**I7 — spot: optional, and it compounds.** ROSA accepts spot only at pool
+creation, and `scripts/02-cluster.sh` skips a pool that already exists, so an
+existing on-demand pool cannot be converted by re-running anything — it must be
+deleted and recreated by a person, which the rules below forbid the lane from
+doing. It also silently invalidates three quota checks, which all test the
+on-demand G/VT code that spot does not draw on, so preflight passes while the
+spot request is denied; and it invalidates the cost model in
+`scripts/06-status.sh`. `docs/08-stuck-volumes.md` already argues against spot
+for GPU workers because reclaim strands the volume. Worth it only if losing
+long generations is acceptable to you.
+
+## Landing order
+
+```
+F1 → F2 → F3 → I1 → S1 → I2 → S2 → Q1 → Q2 → Q3 → Q6 → Q4 → Q5 → I4 → I3 → [I7]
+```
+
+Foundations first, then the infra items that touch neither Python file, then
+the queue lane in sequence, then the cluster-only work. `I5` is a spike run
+alongside; `I6` is not scheduled.
 
 ## Three lanes
 
-**Queue lane — sequential.** `Q1 → Q2 → Q3 → Q4 → Q5 → Q6`. All six are
-laptop-verifiable, so the loop is fast: write the assertion that fails on HEAD
-into `enterprise/test/`, implement until it passes, run `make test && make
-lint`, hand the merged tree to the next item. The order puts priority queues
-first deliberately — it reshapes the pop, and retry then builds on the
-reshaped pop instead of fighting it.
+**Queue lane — sequential.** All six items edit `hub.py` and five of them also
+edit `worker_agent.py`, whose key shapes must change together or not at all.
+All are laptop-verifiable except Q3's arbitrary-UID half. The loop: write the
+assertion that fails on HEAD, implement until it passes, run `make test && make
+lint`, hand the merged tree on.
 
-**Infra lane — parallel.** `I1`, `I2`, `I3`, `S1`, `S2` touch mostly disjoint
-files and can be worked concurrently, then integrated at a single barrier. Use
-separate branches or worktrees: three of them want to edit
-`enterprise/setup.sh`, which is 559 lines and the most contended file outside
-the Python. The cluster-only halves of `I3`–`I7` wait for the cluster day.
+**Infra lane — parallel, with three exceptions.** Seven items touch
+`enterprise/setup.sh` (559 lines), but they hit mostly disjoint regions and can
+be worked in branches or worktrees. The exceptions must be sequenced: I2 before
+S2 (both rewrite the image build and its call sites), I2 before its CI job, and
+I1 with I3 only after the min-replicas ownership conflict above is settled.
 
 **Prose lane — after each merge.** Every merged change owes three edits: the
-README section it changes, the invariant table in `docs/09` if it adds or
-moves one, and a short rationale in the style of `docs/07-design-review.md` —
-what the obvious implementation would have got wrong. Doing this per merge
-rather than at the end is what keeps the documentation in one register.
+README section it changes, the §3 invariant table in `docs/09` if it adds or
+moves a row, and a short rationale in the style of `docs/07-design-review.md` —
+what the obvious implementation would have got wrong. Two items *delete*
+entries from the "deliberately not here" list in `docs/06`; land those
+adjacently so one review settles whether that list should shrink.
 
 ## Gates
 
 | Stage | Must be true before it lands |
 |---|---|
 | Every item | `make lint` and `make test` green |
-| Queue lane | No existing assertion changed — especially path traversal and SIGKILL reaping |
-| Infra lane | No manifest lost a GPU toleration or the 4h router timeout |
-| High-risk items (Q2, Q3, Q5, I3, I5) | A second reviewer who has read `docs/09` §3, specifically checking that the change survives SIGKILL mid-job, two workers racing, and its dependency being unreachable |
+| Every item | The new check is **actually invoked** and its status reaches the suite's exit code — a check that is copied but never run leaves the suite green |
+| Queue lane | An existing assertion may be **replaced** only by one that is strictly stronger, in the same commit, with old and new both shown in review. Two items require this: Q2 must rewrite the assertion that a hard-killed job ends `failed`, which is the behaviour it changes, and Q3 must rewrite the pinned flat output URL. Neither touches the path-traversal assertion, which must survive untouched. |
+| Infra lane | No manifest lost a GPU toleration, a Route timeout annotation, or a Service port restriction — enforced by F3, not by hoping |
+| Invariant-changing items (F1, Q2, Q3) | A second reviewer who has read `docs/09` §3, checking specifically that the change survives a hard kill mid-job, two gateway replicas racing, and its dependency being unreachable |
 | Cluster items | Verified on a real cluster, in one batched session |
 
 ## The cluster day
 
-Everything that needs real hardware — `I3`, `I4`, `I5`, `I6`, `I7`, plus an
-end-to-end pass over the merged queue and infra work — is batched into one
-supervised session rather than a rebuild per item. At ~$2.04/hour a four-hour
-sitting is about $8 of cluster time and answers every open question at once;
-five separate cluster builds cost more in wall-clock time than in dollars, and
-the wall-clock is the part that stops it happening.
+Everything needing real hardware — I3, I4, the cluster halves of Q1 and Q3,
+optionally I7, plus an end-to-end pass over the merged work — is batched into
+one supervised session rather than a rebuild per item. At ~$2.04/hour a
+four-hour sitting is about $8 of cluster time and answers every open question
+at once.
+
+Two cluster-only halves that are easy to miss: Q1's KEDA trigger names a single
+list, so nothing on a laptop proves the pool still scales from zero once the
+pop changes shape; and Q3's real failure mode is arbitrary-UID, since
+per-user directories created by one worker pod must be group-writable for a
+second pod running as a different UID, on EFS, with two pods — unprovable
+anywhere but a cluster.
 
 Last step of the session is `make park` or `make down`, confirmed with
 `make status`.
 
 ## Rules for this work, whoever or whatever is doing it
 
-This repository can spend real money and publish real endpoints. Some of these
-line items are good candidates for AI-assisted or parallel execution — the
-queue lane in particular is test-first by construction — which makes it worth
-stating the boundaries explicitly rather than assuming them.
+This repository can spend real money and publish real endpoints. Several line
+items are good candidates for AI-assisted or parallel execution — the queue
+lane is test-first by construction — which makes it worth stating the
+boundaries explicitly rather than assuming them.
 
 - **IAM, quotas, machine pool edits and spot bids are proposed, not executed.**
   A person runs them.
@@ -124,16 +284,16 @@ stating the boundaries explicitly rather than assuming them.
 - **No `--force`, ever** — and specifically never
   `oc delete pod --force --grace-period=0`, which strands the volume it claims
   to free. `docs/08-stuck-volumes.md` exists because of this one.
-- **An invariant is never relaxed to make a test pass.** If `--listen
-  127.0.0.1`, the gateway's loopback rebind, the `prompt_id` filter or the 4h
-  router timeout appears in a diff, that diff is wrong regardless of whether
-  CI is green.
+- **An invariant is never relaxed to make a test pass.** If the worker's
+  loopback bind, the gateway's loopback rebind, the `prompt_id` filter or a
+  Route timeout annotation appears in a diff, that diff is wrong regardless of
+  whether CI is green.
 - **No cluster is left running.**
 
 ## Not on this list
 
 `docs/06-enterprise-architecture.md` ends with the things that are deliberately
-*not* here — Redis HA, multi-GPU workers, interrupting a running sampler, and
-the reasoning for each omission. Read it before adding any of them: in several
-cases the omission is the decision, and the roadmap above is not an argument
-for reversing it.
+*not* here — Redis HA, multi-GPU workers, interrupting a running sampler — and
+the reasoning for each. Read it before adding any of them: in several cases the
+omission is the decision. Two items here (Q2 and Q3) do reverse entries on that
+list, and both say why.
