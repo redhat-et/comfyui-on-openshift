@@ -238,6 +238,25 @@ was wrong.
   mechanism before either branches. This is a design conflict, not a merge
   conflict.
 
+### Found while writing the OOM checks
+
+**A closed ComfyUI socket does not shortcut the job deadline.** `check-70`
+kills the stub's connection mid-job; the agent does not treat the dropped
+connection as terminal, waits out `JOB_TIMEOUT`, and fails with the deadline as
+the reason. That is the bounded-deadline invariant working, and it is the only
+assertion in the suite that exercises it.
+
+In production this is mostly hidden: if the ComfyUI *process* dies, `start.sh`
+waits on both children, so the pod ends and the gateway's reaper handles the
+stranded job in seconds. The exposure is the narrower case — a socket that
+closes while ComfyUI is still alive — where a worker holds a GPU for the full
+`JOB_TIMEOUT`, **1800 seconds by default**, doing nothing.
+
+Worth fixing, cheaply: treat a closed socket as a reason to re-check `/history`
+immediately and fail if the prompt is unknown, rather than waiting for the
+deadline. *(Small. The deadline stays as the backstop it was always meant to
+be.)*
+
 ### Deferred, with reasons
 
 **I6 — NVIDIA time-slicing: do not do this.** Time-slicing gives **no memory

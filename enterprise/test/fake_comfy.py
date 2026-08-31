@@ -111,7 +111,8 @@ async def prompt(body: dict):
     if "__slow_prompt__" in wf:
         await asyncio.sleep(SLOW_PROMPT_DELAY_S)
     pid = str(uuid.uuid4())
-    asyncio.create_task(run(body.get("client_id"), pid, slow="__slow__" in wf))
+    asyncio.create_task(run(body.get("client_id"), pid, slow="__slow__" in wf,
+                            vram_oom="__vram_oom__" in wf, die="__die__" in wf))
     return {"prompt_id": pid, "number": 1, "node_errors": {}}
 
 @app.get("/history/{pid}")
@@ -122,7 +123,7 @@ async def hist(pid: str):
 async def interrupt():
     return {}
 
-async def run(client_id, pid, slow=False):
+async def run(client_id, pid, slow=False, vram_oom=False, die=False):
     global next_output_override
     ws = clients.get(client_id)
     await asyncio.sleep(0.1)
@@ -131,6 +132,35 @@ async def run(client_id, pid, slow=False):
         await send(ws, {"type": "progress", "data": {"value": i, "max": 3, "prompt_id": "other-prompt"}})
         await send(ws, {"type": "progress", "data": {"value": i, "max": 3, "prompt_id": pid}})
         await asyncio.sleep(2.0 if slow else 0.05)
+
+        if vram_oom and i == 2:
+            # A VRAM exhaustion, as the real ComfyUI reports it: caught inside
+            # the sampler, surfaced as execution_error on the socket, and the
+            # server stays up and takes the next prompt. Nothing dies here.
+            await send(ws, {"type": "execution_error", "data": {
+                "prompt_id": pid,
+                "node_id": "3",
+                "node_type": "KSampler",
+                "exception_type": "torch.OutOfMemoryError",
+                "exception_message": (
+                    "Allocation on device 0 would exceed allowed memory. "
+                    "Tried to allocate 2.44 GiB. GPU 0 has a total capacity of "
+                    "22.16 GiB of which 1.02 GiB is free."
+                ),
+            }})
+            return
+
+        if die and i == 2:
+            # The host-RAM case, as far as this harness can carry it: the
+            # ComfyUI PROCESS is gone, so its socket closes mid-job and its
+            # /history never learns about this prompt. See check-70's docstring
+            # for the half that is not reproducible here.
+            clients.pop(client_id, None)
+            try:
+                await ws.close(code=1006)
+            except Exception:
+                pass
+            return
 
     filename, subfolder = "out_0001.png", ""
     if next_output_override is not None:
