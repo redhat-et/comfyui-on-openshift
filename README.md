@@ -260,6 +260,47 @@ stops being a problem rather than becoming one.
   installers are off by default — so the image that passed review is the image
   that renders.
 
+## GPU machines scale up automatically with demand
+
+Nobody provisions anything. Queue depth is the only input, and it drives both
+layers — the pods, and then the machines underneath them:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant D as Designers
+    participant Q as Redis queue
+    participant K as KEDA
+    participant M as Machine pool
+    participant W as GPU workers
+
+    Note over W: idle — 0 pods, 0 nodes, $0/hr for GPU
+
+    D->>Q: three workflows submitted
+    Note over Q: LLEN = 3
+    K->>Q: polls depth every 15s
+    K->>W: replicas 0 to 3<br/>(one worker per queued job)
+    Note over W: 3 pods Pending —<br/>no GPU exists to schedule onto
+    W->>M: Pending GPU pods
+    M->>M: provision nodes · 3–5 min
+    M->>W: nodes join, image pulls · 3–8 min
+    W->>Q: BLMOVE, drain the queue
+    Note over Q: LLEN = 0
+    K->>W: after 10 min cooldown,<br/>replicas back to 0
+    W->>M: nothing scheduled
+    M->>M: nodes reclaimed — billing stops
+```
+
+**`Pending` is the mechanism, not a symptom.** A GPU pod with nowhere to run is
+exactly what makes the machine pool provision a node — the thing that looks like
+a failure is the signal. The ceiling is `MAX_GPU_WORKERS`, so a burst cannot
+quietly become a four-figure afternoon.
+
+The timings are the honest part. The second worker pays the same cold start as
+the first, so autoscaling out serves a sustained batch well and often arrives
+after a short spike has already been drained by the worker that was already
+warm.
+
 ## Single user — one pod, one GPU
 
 ```bash
@@ -498,6 +539,49 @@ where a ten-minute wait for a job nobody is watching costs nothing.
 semantics and there is no team to serve, a plain EC2 instance with podman is
 $0.81/hour and this is a heavier answer than the question. `docs/02-cost.md`
 says so itself, with a comparison table.
+
+## Running alongside model-serving workloads
+
+This is not a model server and is not trying to be one. The difference is the
+unit of work, not the quality of either.
+
+A serving engine like vLLM holds one model resident and multiplexes many
+requests against it — continuous batching, a shared KV cache, throughput from
+packing concurrent sequences into a single forward pass. That is the right
+shape when the model is fixed and the requests are many.
+
+ComfyUI's unit of work is a graph, not a prompt: a DAG of dozens of nodes whose
+composition changes per job, over a model set the user keeps changing.
+Diffusion is not autoregressive, so there is no KV cache to share and no
+token-level interleaving to exploit — batching means batching identical
+configurations, which ComfyUI already does inside a single workflow. And the
+custom-node ecosystem, arbitrary Python per node, is both why designers use it
+and exactly what does not fit behind a fixed serving API.
+
+The economics follow from that, and they are what decides it. A serving engine
+earns its throughput by keeping a model resident, so serving N models means N
+deployments, each pinning a GPU — and a server that has scaled to zero is not
+serving. Adapters can be multiplexed onto a shared base model; different base
+checkpoints cannot. A design team's library is many base models — SD1.5, SDXL,
+FLUX, a video model, and whatever last week's template pulled in — so residency
+would mean close to a machine per model, held warm whether or not anyone
+touches it that afternoon.
+
+This workload inverts both sides of that. Many models, few requests each,
+loaded per job from a shared volume onto a card that turns off in between. It
+is the same observation as the loop at the top of this README: the models are
+many and the requests are few, so residency optimises the wrong thing.
+
+None of which makes them competitors. They are layers, and **everything this
+README argues applies to both** — the GPU operator, the machine pool that
+scales to zero, cluster SSO, the audit log, quota and the cost controls are
+properties of the platform, not of ComfyUI. A cluster built this way hosts a
+serving deployment as readily as it hosts this one.
+
+If you run both, give them separate machine pools. A serving deployment wants a
+warm resident GPU and suffers under scale-to-zero; this workload is bursty and
+depends on it. They also draw on the same GPU quota, which is the constraint
+that bites first — `make preflight` checks it, and it is a multi-day fix.
 
 ## Ideas worth doing next
 
