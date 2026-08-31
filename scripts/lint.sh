@@ -77,7 +77,7 @@ if python3 -c "import yaml" 2>/dev/null; then
     if python3 - <<'EOF'
 # Parse, then assert shape.
 #
-# Nine of the fourteen load-bearing invariants in
+# Ten of the fifteen load-bearing invariants in
 # docs/09-engineering-handoff.md section 3 are properties of a FILE rather than
 # of a running system — a missing toleration, a Service that regained a port, a
 # dropped Route annotation. The e2e suite structurally cannot see any of them:
@@ -86,7 +86,33 @@ if python3 -c "import yaml" 2>/dev/null; then
 #
 # Each check below names the invariant it enforces and what breaks without it,
 # because the failure this guards against is a well-meaning edit, not a typo.
-import glob, os, sys, yaml
+import glob, os, re, sys, yaml
+
+# The smallest GPU instance type this repo supports. scripts/06-status.sh's
+# price table is the only enumeration of instance types in the repository:
+# g4dn.xlarge, g5.xlarge, g6.xlarge, g6.2xlarge and g6e.xlarge. The first
+# three carry 16 GiB of system RAM on 4 vCPU and are the floor; g6.xlarge is
+# also .env.example's GPU_INSTANCE_TYPE default, so the floor is the default.
+# Every number here is HOST RAM. It is unrelated to the 24 GB of VRAM on the
+# L4 or A10G, and confusing the two is how the 24Gi limit got written.
+GPU_NODE_MEMORY_GI = 16
+GPU_NODE_VCPU = 4
+
+# What one pod may actually claim on that node. Of the 16 GiB, the kubelet
+# never offers all of it: OpenShift's automatic node sizing reserves roughly
+# 2.8 GiB on a 16 GiB machine plus a 100 MiB eviction threshold, and a GPU
+# node additionally runs the DaemonSets a GPU node runs — ovn-kubernetes,
+# machine-config, node-exporter, the GPU operator's driver, container
+# toolkit, device plugin and DCGM exporter, and NFD — whose own requests are
+# on the order of 1.5-2 GiB and several hundred millicores. ~10Gi and 2 cores
+# is the largest round figure that provably leaves that room.
+#
+# A request ABOVE this does not get you more memory; it gets you a pod that
+# is Pending on a node that already exists, which reads exactly like the
+# scale-from-zero failure 02-worker.yaml's nodeSelector comment describes and
+# is not fixable by provisioning more nodes.
+GPU_POD_MEMORY_CEILING_GI = 10
+GPU_POD_CPU_CEILING = 2
 
 problems = []
 
@@ -113,6 +139,29 @@ def wants_gpu(container):
     resources = container.get('resources') or {}
     return any('nvidia.com/gpu' in (resources.get(k) or {})
                for k in ('requests', 'limits'))
+
+_MEMORY_SCALE = {None: 1, 'k': 10 ** 3, 'M': 10 ** 6, 'G': 10 ** 9,
+                 'T': 10 ** 12, 'Ki': 2 ** 10, 'Mi': 2 ** 20,
+                 'Gi': 2 ** 30, 'Ti': 2 ** 40}
+
+def memory_bytes(value):
+    """A Kubernetes memory quantity in bytes, or None if it is not one."""
+    if value is None:
+        return None
+    match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(Ki|Mi|Gi|Ti|k|M|G|T)?',
+                         str(value).strip())
+    return float(match.group(1)) * _MEMORY_SCALE[match.group(2)] if match else None
+
+def cpu_cores(value):
+    """A Kubernetes cpu quantity in whole cores, or None if it is not one."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)(m?)', text)
+    if not match:
+        return None
+    cores = float(match.group(1))
+    return cores / 1000.0 if match.group(2) else cores
 
 # ---------------------------------------------------------------------------
 # Load. A document may be a bare strategic-merge patch with no kind
@@ -147,6 +196,75 @@ for f, doc in docs:
         if not any(t.get('key') == 'nvidia.com/gpu' for t in tolerations):
             bad(f, f"{kind}/{name} requests nvidia.com/gpu but tolerates no "
                    "nvidia.com/gpu taint — it can never schedule onto a GPU node")
+
+    # A GPU pod must be sized to the node it lands on, and it must be
+    # Guaranteed QoS (docs/09-engineering-handoff.md section 3).
+    #
+    # Two different failures, both silent. A memory LIMIT above what the node
+    # can give one pod is unreachable, so the container never hits its own
+    # cgroup ceiling and the real ceiling becomes node memory pressure: an
+    # eviction, or a kernel OOM kill of ComfyUI, instead of a clean
+    # container-level OOMKilled you can read off `oc describe`. And a pod
+    # whose requests differ from its limits is Burstable, not Guaranteed:
+    # the kubelet evicts it ahead of Guaranteed pods the moment it is above
+    # its request, and gives it an oom_score_adj derived from that request
+    # (~500 at 8Gi of 16 GiB) instead of Guaranteed's -997 — so the process
+    # holding an $0.80/hour card mid-generation is a better kernel OOM victim
+    # than most of the node's own daemons. Equal requests and limits cost the
+    # burst headroom; on a node with one GPU and therefore one GPU pod, that
+    # headroom was only ever borrowed from the kubelet and the DaemonSets
+    # whose starvation is what turns this into a node-level event.
+    for c in containers:
+        if not wants_gpu(c):
+            continue
+
+        resources = c.get('resources') or {}
+        requests = resources.get('requests') or {}
+        limits = resources.get('limits') or {}
+        where = f"{kind}/{name} container {c.get('name')}"
+
+        # Memory and cpu overrun differently, so they get different reasons:
+        # memory is incompressible and the kernel kills for it, cpu is
+        # compressible and merely throttles — what an over-large cpu number
+        # actually costs you, once requests must equal limits, is a pod the
+        # scheduler cannot place.
+        for kind_of, request, limit, ceiling, readable, overrun in (
+                ('memory', memory_bytes(requests.get('memory')),
+                 memory_bytes(limits.get('memory')),
+                 GPU_POD_MEMORY_CEILING_GI * 2 ** 30,
+                 f"{GPU_POD_MEMORY_CEILING_GI}Gi",
+                 "the limit is unreachable, so the container never hits its "
+                 "own cgroup ceiling and the real ceiling is node memory "
+                 "pressure — an eviction, or a kernel OOM kill of ComfyUI, "
+                 "instead of a clean container-level OOMKilled"),
+                ('cpu', cpu_cores(requests.get('cpu')),
+                 cpu_cores(limits.get('cpu')), GPU_POD_CPU_CEILING,
+                 f"{GPU_POD_CPU_CEILING} cores",
+                 "with requests equal to limits the scheduler has to find "
+                 "that many cores — the pod stays Pending on a node that "
+                 "already exists, which reads like the scale-from-zero failure "
+                 "and is not fixable by provisioning more nodes")):
+
+            if request is None or limit is None:
+                bad(f, f"{where} requests a GPU without a readable {kind_of} "
+                       f"request and limit — an unsized pod holding a GPU is "
+                       "BestEffort or Burstable and is evicted first")
+                continue
+
+            if limit > ceiling:
+                bad(f, f"{where} limits {kind_of} to "
+                       f"{limits.get(kind_of)!r}, above the {readable} one pod "
+                       f"can hold on the smallest GPU instance type this repo "
+                       f"supports ({GPU_NODE_MEMORY_GI} GiB of system RAM and "
+                       f"{GPU_NODE_VCPU} vCPU, less the kubelet's reserve and "
+                       f"the GPU node's DaemonSets) — {overrun}")
+
+            if request != limit:
+                bad(f, f"{where} requests {kind_of} {requests.get(kind_of)!r} "
+                       f"but limits it to {limits.get(kind_of)!r} — a pod "
+                       "holding a GPU must be Guaranteed QoS (requests equal "
+                       "to limits, cpu and memory both) so that node pressure "
+                       "evicts and OOM-kills everything else first")
 
     # The SIGTERM drain needs a window longer than the job it is draining.
     # The pool scales to zero, so termination is routine; a grace period

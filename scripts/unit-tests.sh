@@ -199,8 +199,9 @@ trap - EXIT
 
 log "scripts/lint.sh — worker memory limit vs. smallest supported GPU instance (F1, docs/10-roadmap.md)"
 
-# F1 (docs/10-roadmap.md): enterprise/manifests/02-worker.yaml requests
-# memory: 8Gi and limits memory: 24Gi. The smallest GPU instance type this
+# F1 (docs/10-roadmap.md): enterprise/manifests/02-worker.yaml requested
+# memory: 8Gi and limited memory: 24Gi, and manifests/base/deployment.yaml
+# carried the identical block. The smallest GPU instance type this
 # repo supports is a tie between g5.xlarge and g6.xlarge (scripts/06-status.sh
 # lists m5.xlarge, m5.2xlarge, g5.xlarge, g6.xlarge, g6.2xlarge, g6e.xlarge and
 # g4dn.xlarge; among the GPU families, g5.xlarge/g6.xlarge/g4dn.xlarge each
@@ -215,11 +216,13 @@ log "scripts/lint.sh — worker memory limit vs. smallest supported GPU instance
 # 24Gi) whose limit exceeds node capacity is a prime eviction candidate to
 # begin with.
 #
-# Unlike the three fixtures above, this is not a hypothetical regression —
-# the real, unmodified enterprise/manifests/02-worker.yaml already has this
-# shape, which the fixture mirrors byte-for-byte for the fields that matter.
-# scripts/lint.sh has no check for it yet, so this assertion is written
-# failing on purpose: F1 is the manifest/lint fix, not this commit.
+# Unlike the three fixtures above, this is not a hypothetical regression:
+# the fixture mirrors byte-for-byte, for the fields that matter, the shape
+# both manifests shipped with until F1 fixed them. They are now 10Gi/10Gi
+# and 2/2 — sized to what a 16 GiB node can actually give one pod, with
+# requests equal to limits so the pod is Guaranteed QoS rather than the
+# first thing evicted. scripts/lint.sh holds both halves; this assertion is
+# what proves it still does.
 
 trap cleanup_manifest_fixture_drops EXIT
 

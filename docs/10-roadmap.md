@@ -5,7 +5,8 @@ what each one actually touches, what proves it, what order they can safely land
 in, and which of them cannot be finished without spending money on a real
 cluster.
 
-Nothing here is implemented. This document exists so that the next person to
+Two of the foundations have landed — F3 and F1, in that order. Nothing else
+here is implemented. This document exists so that the next person to
 pick up a line item does not have to re-derive its blast radius, and so that
 several of them can be worked in parallel without three people editing
 `hub.py` at once.
@@ -38,7 +39,9 @@ machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
 nothing until there is a cluster at ~$2.04/hour. Only five items are
 cluster-only for a failing assertion; ten have a laptop half.
 
-**Fourteen invariants are load-bearing** — `docs/09-engineering-handoff.md` §3.
+**Fifteen invariants are load-bearing** — `docs/09-engineering-handoff.md` §3.
+(Fourteen when this was written; F1 added the fifteenth, which is what "changes
+an invariant" looks like in practice.)
 Thirteen of the items touch at least one, so "the risky ones get a second
 reviewer" is not a useful filter. The filter that *is* useful: an item is
 high-risk if it **changes** an invariant rather than merely working near one.
@@ -96,20 +99,43 @@ silently assume, and that are each worth doing on their own merits.
 
 | ID | Change | Effort | Risk | Proven by |
 |---|---|---|---|---|
-| F1 | Worker resource sizing | Small | **High** | A unit assertion that requests and limits are internally consistent and fit the target instance type |
+| F1 | Worker resource sizing — **landed** | Small | **High** | A unit assertion that requests and limits are internally consistent and fit the target instance type — `scripts/unit-tests.sh` runs the real `scripts/lint.sh` against a fixture with the old shape |
 | F2 | Versioned queue payload envelope | Small | Low | Existing e2e suite must pass unchanged; old-shape payloads still parse |
 | F3 | Test harness convention + manifest shape assertions | Small | Low | A deliberately broken manifest fails `make lint`; a new check is discovered without editing two places |
 
-**F1 — worker resource sizing.** `enterprise/manifests/02-worker.yaml` requests
-`memory: 8Gi` and limits `memory: 24Gi`, but the default GPU instance
-(`g6.xlarge`) has 16 GiB of system RAM. The limit is therefore unreachable: the
-container can never hit its own cgroup ceiling, so the real ceiling is node
-pressure, which produces an eviction or a kernel OOM kill rather than a clean
-container-level `OOMKilled`. A burstable pod whose limit exceeds node capacity
-is also a prime eviction candidate. **If host-RAM OOM is a problem in your
-workflows, this line is the cause and retry is a workaround for it.** Fix the
-sizing before building anything that compensates for it. Sizing is also I6's
-binding constraint and part of I3's admission arithmetic.
+**F1 — worker resource sizing.** The diagnosis above held on inspection and
+the item has landed; four things about it were narrower in this file than they
+turned out to be in the source.
+
+`enterprise/manifests/02-worker.yaml` requested `memory: 8Gi` and limited
+`memory: 24Gi`, and the limit was unreachable: the container could never hit
+its own cgroup ceiling, so the real ceiling was node pressure, which produces
+an eviction or a kernel OOM kill rather than a clean container-level
+`OOMKilled`. A burstable pod whose limit exceeds node capacity is also a prime
+eviction candidate. **If host-RAM OOM is a problem in your workflows, this line
+was the cause and retry is a workaround for it.**
+
+- **It was not only the default instance.** 16 GiB of system RAM is the
+  *floor* across every GPU type this repo prices in `scripts/06-status.sh` —
+  `g6.xlarge`, `g5.xlarge` and `g4dn.xlarge` all have it; only `g6.2xlarge`
+  and `g6e.xlarge` have 32 GiB. So the bug was not "the default is small", it
+  was "no supported instance could ever satisfy that limit".
+- **It was two manifests, not one.** `manifests/base/deployment.yaml` — the
+  single-user path — carried the identical `8Gi`/`24Gi`/`1`/`3` block on the
+  same instance type. An F1 that fixed only the enterprise worker would have
+  left the bug in the configuration most people run first.
+- **cpu had to move with memory.** Guaranteed QoS requires requests to equal
+  limits on *every* resource, so `cpu: 1`/`cpu: 3` could not stay. Both
+  manifests are now `10Gi`/`10Gi` and `2`/`2`: 10Gi is the largest round
+  figure that provably fits after OpenShift's node reserve (~2.8 GiB on a
+  16 GiB machine) and a GPU node's DaemonSets (~1.5-2 GiB), and it covers the
+  ~7 GB SDXL-class checkpoint of `docs/03-storage.md` staged in host RAM plus
+  the torch and CUDA host runtime. The full arithmetic is in the comment at
+  the resources block; `scripts/lint.sh` holds the numbers.
+- **The fix raised the requests, so it does not buy density.** See I6.
+
+Sizing is still part of I3's admission arithmetic, and the resources comment in
+`02-worker.yaml` is where that arithmetic is written down.
 
 **F2 — the queue payload envelope.** Today the queue carries `{job_id,
 workflow}` and exactly two files parse it. Q1 wants a lane key, Q2 an attempt
@@ -123,7 +149,7 @@ tens of kilobytes in that payload, so four scalars cost nothing.
 check is a file and not also an edit in two hardcoded places, and settle the
 naming convention before six items each create their own `check4.py`. Then
 extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
-assertions. Nine of the fourteen §3 invariants are properties of files rather
+assertions. Ten of the fifteen §3 invariants are properties of files rather
 than of a running system — a missing toleration, a Service that regained a
 port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
 — and the e2e suite structurally cannot see any of them. This is also what
@@ -186,9 +212,12 @@ ComfyUI exceeds VRAM on a single tenant, this converts a deterministic
 per-workflow failure into a non-deterministic one that depends on what the
 neighbouring job is doing, and the victim is whichever process allocates
 second — not the greedy one. MIG partitions memory properly but is not
-available on L4. Independently, the density win is zero until F1: at the
-current requests two workers do not fit on a `g6.xlarge` by host memory alone,
-whatever the device plugin advertises. Revisit only on MIG-capable hardware.
+available on L4. Independently, the density win is zero, and F1 did not change
+that in the direction this paragraph originally implied: F1 raised the worker's
+memory request from 8Gi to 10Gi, so two workers fit on a `g6.xlarge` even less
+well than before — a 16 GiB node offers one pod about 10.5 GiB, and one worker
+takes it. Density on this hardware is not a sizing problem to be solved; it is
+the node. Revisit only on MIG-capable hardware with more host RAM.
 
 **I5 — local NVMe model staging: a spike, not a work item.** It cannot be
 scoped from this repository. ROSA HCP exposes no MachineSet to edit, and the

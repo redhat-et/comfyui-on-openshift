@@ -5,8 +5,9 @@
 # thing this fixture isolates is the sizing.
 #
 # Unlike the other fixtures in this directory, this is not a hypothetical
-# regression: enterprise/manifests/02-worker.yaml on HEAD has exactly this
-# shape today (F1, docs/10-roadmap.md). g5.xlarge and g6.xlarge — tied for
+# regression: it is the shape enterprise/manifests/02-worker.yaml and
+# manifests/base/deployment.yaml both shipped with until F1
+# (docs/10-roadmap.md) fixed them. g5.xlarge and g6.xlarge — tied for
 # the smallest system RAM among the GPU instance types this repo supports
 # (scripts/06-status.sh's cost table; g6.xlarge is also .env.example's
 # GPU_INSTANCE_TYPE default; g6e.xlarge and g6.2xlarge are larger) — have
@@ -19,8 +20,9 @@
 # pod (requests 8Gi < limits 24Gi) whose limit exceeds node capacity is a
 # prime eviction candidate to begin with.
 #
-# Valid YAML, so yaml.safe_load_all accepts it happily — the bug
-# scripts/unit-tests.sh proves scripts/lint.sh does not catch this.
+# Valid YAML, so yaml.safe_load_all accepts it happily. scripts/lint.sh's
+# shape checks are what reject it, and scripts/unit-tests.sh runs the real,
+# unmodified lint.sh against this file to prove they still do.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

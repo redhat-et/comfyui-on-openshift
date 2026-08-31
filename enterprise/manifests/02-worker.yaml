@@ -91,18 +91,75 @@ spec:
             - name: TORCH_HOME
               value: /models/.cache/torch
 
+          # Requests equal limits on every resource, which is not a style
+          # choice — it is the QoS class. Read the numbers first, then why
+          # they are equal.
+          #
+          # THE NUMBERS. All host RAM; none of it is the 24 GB of VRAM on the
+          # card, and conflating the two is how this block previously asked
+          # for a 24Gi limit. The smallest GPU instance type this repo
+          # supports — g6.xlarge (the .env.example default), g5.xlarge,
+          # g4dn.xlarge, all of them in scripts/06-status.sh's price table —
+          # is 4 vCPU and 16 GiB. Of that 16 GiB the scheduler offers roughly
+          # 12.4 GiB: OpenShift's automatic node sizing reserves about 2.8 GiB
+          # on a 16 GiB machine, plus a 100 MiB eviction threshold. A GPU node
+          # then runs more DaemonSets than a plain one — ovn-kubernetes,
+          # machine-config, node-exporter, the GPU operator's driver,
+          # container toolkit, device plugin and DCGM exporter, and NFD —
+          # holding on the order of 1.5-2 GiB and several hundred millicores.
+          # That leaves ~10.5 GiB and ~3 cores for this pod, so 10Gi and 2
+          # cores is the largest round figure that provably fits.
+          #
+          # It is also enough for the documented workload: a single SDXL-class
+          # checkpoint is ~7 GB (docs/03-storage.md) and is staged in host RAM
+          # on its way to VRAM, torch plus the CUDA host runtime and its pinned
+          # staging buffers are another 1.5-2 GiB, and the agent is noise —
+          # roughly 9 GiB at peak, with about a gigabyte spare. What 10Gi does
+          # NOT cover is a workflow holding two large checkpoints in host RAM
+          # at once (ComfyUI offloads to CPU RAM under VRAM pressure). The
+          # answer to that is a larger instance type — g6.2xlarge or
+          # g6e.xlarge, 32 GiB — because a limit above what the node can give
+          # is not more memory, it is just a number that never binds.
+          #
+          # WHY EQUAL. Equal requests and limits on cpu AND memory is what
+          # makes this pod Guaranteed QoS, and both halves of that matter to a
+          # pod holding an $0.80/hour card mid-generation:
+          #   - The kubelet evicts pods that are over their request before it
+          #     touches a Guaranteed pod. The old 8Gi request with a 24Gi limit
+          #     was Burstable and went over its request on the first checkpoint
+          #     load, i.e. during every job.
+          #   - oom_score_adj follows the same class. Burstable gets
+          #     1000 - 1000 x request/capacity (~500 at 8Gi of 16 GiB);
+          #     Guaranteed gets -997. That is the difference between the kernel
+          #     picking ComfyUI and the kernel picking almost anything else.
+          # The cost is no bursting. On a node with one GPU, and therefore one
+          # GPU pod, the burst headroom was only ever borrowed from the kubelet
+          # and those DaemonSets — the processes whose starvation is exactly
+          # what turns a container problem into a node-level one.
+          #
+          # A reachable limit is also the point: at 10Gi the container hits its
+          # own cgroup ceiling and dies as a clean OOMKilled you can read off
+          # `oc describe`, instead of the node deciding for it. scripts/lint.sh
+          # holds these numbers; it fails a GPU pod that is Burstable or that
+          # asks for more than the smallest supported instance can give.
           resources:
             requests:
               nvidia.com/gpu: 1
-              cpu: "1"
-              memory: 8Gi
+              cpu: "2"
+              memory: 10Gi
             limits:
-              # GPUs are indivisible: request and limit must be equal, and this
-              # is what makes the pod Pending until a GPU node exists — which is
-              # in turn what makes the cluster autoscaler provision one.
+              # GPUs are indivisible: request and limit must be equal — as
+              # they now are for cpu and memory too, for the reasons above.
+              # This block is also what makes the pod Pending until a GPU node
+              # exists, which is in turn what makes the cluster autoscaler
+              # provision one. That still holds, and it is why the requests
+              # must stay inside one node's allocatable: a request no node can
+              # satisfy leaves the pod Pending forever with a node already
+              # running, which looks identical and is not fixable by adding
+              # nodes.
               nvidia.com/gpu: 1
-              cpu: "3"
-              memory: 24Gi
+              cpu: "2"
+              memory: 10Gi
 
           securityContext:
             allowPrivilegeEscalation: false

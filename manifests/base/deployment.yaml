@@ -82,16 +82,32 @@ spec:
             - name: PYTORCH_CUDA_ALLOC_CONF
               value: expandable_segments:True
 
+          # Sized to the node, and Guaranteed QoS. Same arithmetic as
+          # enterprise/manifests/02-worker.yaml, which carries the long form,
+          # because it is the same instance type: the smallest GPU type this
+          # repo supports (g6.xlarge, the .env.example default, and g5.xlarge
+          # and g4dn.xlarge beside it) is 4 vCPU and 16 GiB of HOST RAM — not
+          # the 24 GB of VRAM on the card, which is the confusion that used to
+          # put a 24Gi limit here. After OpenShift's node reserve and the GPU
+          # node's DaemonSets, ~10.5 GiB and ~3 cores are actually on offer.
+          #
+          # 10Gi covers the documented workload: a ~7 GB SDXL-class checkpoint
+          # (docs/03-storage.md) staged in host RAM on its way to VRAM, plus
+          # torch and the CUDA host runtime. Equal requests and limits make the
+          # pod Guaranteed, so node pressure evicts and OOM-kills everything
+          # else first, and the limit is now reachable — a container-level
+          # OOMKilled instead of a kernel OOM kill nobody can attribute.
           resources:
             requests:
               nvidia.com/gpu: 1
-              memory: 8Gi
-              cpu: "1"
+              memory: 10Gi
+              cpu: "2"
             limits:
-              # GPUs are not divisible — request and limit must match.
+              # GPUs are not divisible — request and limit must match. For cpu
+              # and memory they now match on purpose rather than by necessity.
               nvidia.com/gpu: 1
-              memory: 24Gi
-              cpu: "3"
+              memory: 10Gi
+              cpu: "2"
 
           securityContext:
             allowPrivilegeEscalation: false
