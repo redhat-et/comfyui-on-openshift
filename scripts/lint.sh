@@ -71,6 +71,66 @@ fi
 
 # ---------------------------------------------------------------------------
 
+log "the queue payload envelope is mirrored, not diverged (docs/10-roadmap.md F2)"
+
+# hub.py produces the queue payload and worker_agent.py consumes it, and the
+# two files ship in two different images built from two different contexts, so
+# there is nowhere for them to import a shared definition from. The envelope is
+# therefore duplicated verbatim between the BEGIN/END SHARED ENVELOPE markers —
+# the same "change both or neither" rule the processing-list key shape already
+# follows, and the same rule that is impossible to keep by memory alone once
+# four roadmap items each want to add a field. This makes it a check.
+#
+# Divergence here is silent in exactly the way section 3's other entries are:
+# both files still compile, the suite still passes on whichever half of the
+# contract the test happens to exercise, and the failure appears only when a
+# gateway and a worker of different vintages meet on the queue.
+
+if python3 - <<'EOF'
+import sys
+
+BEGIN = "# BEGIN SHARED ENVELOPE"
+END = "# END SHARED ENVELOPE"
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+
+def block(path):
+    lines = open(path).read().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(BEGIN)]
+    ends = [i for i, line in enumerate(lines) if line.startswith(END)]
+
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        print(f"  {path}: expected exactly one {BEGIN} ... {END} block, found "
+              f"{len(starts)} begin and {len(ends)} end marker(s) — the queue "
+              "payload envelope must be present in both files, delimited, and "
+              "identical")
+        return None
+
+    return lines[starts[0]:ends[0] + 1]
+
+blocks = [block(path) for path in FILES]
+
+if any(b is None for b in blocks):
+    sys.exit(1)
+
+if blocks[0] != blocks[1]:
+    import difflib
+    print(f"  the shared envelope block differs between {FILES[0]} and "
+          f"{FILES[1]} — change both or neither:")
+    for line in difflib.unified_diff(blocks[0], blocks[1], FILES[0], FILES[1],
+                                     lineterm="", n=1):
+        print(f"    {line}")
+    sys.exit(1)
+
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
 log "manifests parse and hold their shape"
 
 if python3 -c "import yaml" 2>/dev/null; then

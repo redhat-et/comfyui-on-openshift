@@ -108,9 +108,32 @@ print("\n== a queued job carries a schema version and the four reserved fields, 
 # Freeze the live agent so the entry generate() pushes is still sitting on
 # comfy:queue, unmodified, when we inspect it directly — otherwise the same
 # worker that is already blocked on BLMOVE would dequeue it out from under us.
+#
+# SIGSTOP alone does not achieve that, which is worth spelling out because it
+# looks like it should. BLMOVE blocks SERVER-side: while the agent's connection
+# sits in Redis's blocked-clients list, Redis performs the move itself the
+# instant anything pushes, and hands the result to that connection whether or
+# not the process behind it is scheduled. Stopping the process freezes the
+# consumer, not the consumption — the first entry pushed after a SIGSTOP is
+# gone from comfy:queue before this check can read it.
+#
+# So push a sacrificial job first. It absorbs the BLMOVE the agent is already
+# blocked in; the stopped process cannot issue another one, so from then on
+# nothing is blocked on comfy:queue and the next entry stays put. If the agent
+# happened NOT to be blocked when it was stopped (it was between passes), the
+# sacrificial job simply stays on the queue too and the search below skips it —
+# either way the entry under inspection is there. Waiting out the agent's
+# 5-second BLMOVE timeout instead would also free the queue, but a process
+# frozen that long misses its own client-side socket deadline and dies on
+# resume, taking the rest of this check with it.
+#
+# The sacrificial job is a real submission and runs to completion once the
+# agent is resumed, which is why it is not cleaned up.
 os.kill(agent_pid, signal.SIGSTOP)
 job_id = None
 try:
+    post("/api/generate", {"workflow": WORKFLOW})   # sacrificial; see above
+
     job = post("/api/generate", {"workflow": WORKFLOW})
     job_id = job["job_id"]
 

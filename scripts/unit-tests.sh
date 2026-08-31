@@ -173,7 +173,10 @@ trap cleanup_manifest_fixture_drops EXIT
 lint_fails_on_manifest_fixture()
 {
     local fixture="$1"
-    local target="$REPO_ROOT/enterprise/manifests/zz-fixture-$(basename "$fixture")"
+    # Declared and assigned separately: `local x="$(...)"` masks the command
+    # substitution's exit status, which shellcheck flags (SC2155).
+    local target
+    target="$REPO_ROOT/enterprise/manifests/zz-fixture-$(basename "$fixture")"
     local rc=0
 
     cp "$fixture" "$target"
@@ -282,6 +285,63 @@ expect_true "lint fails a Containerfile that lost its chgrp 0 / chmod g=u block"
 restore_containerfile
 trap - EXIT
 rm -f "$CONTAINERFILE_BACKUP" "$LINT_LOG"
+
+# ---------------------------------------------------------------------------
+
+log "scripts/lint.sh — the queue payload envelope is mirrored (F2, docs/10-roadmap.md)"
+
+# F2 defines the queue payload envelope once and duplicates it verbatim between
+# the BEGIN/END SHARED ENVELOPE markers in enterprise/gateway/hub.py and
+# enterprise/worker/worker_agent.py: the two files ship in two images built from
+# two different contexts, so there is nowhere to import a shared definition
+# from. "Change both or neither" is the rule the processing-list key shape
+# already followed, and it is exactly the kind of rule that survives review and
+# dies six months later — so scripts/lint.sh diffs the two copies.
+#
+# Like the Containerfile case above, this has no fixture file: a copy of hub.py
+# dropped somewhere else would not be one of the two files lint compares, so it
+# would test nothing. The only faithful test drifts the real hub.py the way a
+# later item plausibly would — one side gains a reserved field the other has
+# never heard of, which is precisely the rolling-deploy hazard F2 exists to
+# prevent — runs lint, and restores the file immediately after, whatever the
+# assertion's outcome.
+
+HUB_PY="$REPO_ROOT/enterprise/gateway/hub.py"
+HUB_PY_BACKUP="$(mktemp -t comfy-hub-backup.XXXXXX)"
+ENVELOPE_LOG="$(mktemp -t comfy-envelope-lint.XXXXXX)"
+cp "$HUB_PY" "$HUB_PY_BACKUP"
+
+restore_hub_py()
+{
+    # Idempotent, for the same reason restore_containerfile is.
+    [[ -f "$HUB_PY_BACKUP" ]] && cp "$HUB_PY_BACKUP" "$HUB_PY"
+}
+trap restore_hub_py EXIT
+
+python3 - "$HUB_PY" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+line = '        "submitted_at": time.time() if submitted_at is None else submitted_at,\n'
+assert content.count(line) == 1, "the envelope's producer side moved — update this test"
+with open(path, "w") as f:
+    f.write(content.replace(line, line + '        "lane_priority": 0,\n', 1))
+PYEOF
+
+lint_fails_on_diverged_envelope()
+{
+    local rc=0
+    "$LINT_SH" > "$ENVELOPE_LOG" 2>&1 || rc=$?
+    (( rc != 0 ))
+}
+
+expect_true "lint fails when one copy of the shared envelope block gains a field the other lacks" \
+    lint_fails_on_diverged_envelope
+
+restore_hub_py
+trap - EXIT
+rm -f "$HUB_PY_BACKUP" "$ENVELOPE_LOG"
 
 # ---------------------------------------------------------------------------
 

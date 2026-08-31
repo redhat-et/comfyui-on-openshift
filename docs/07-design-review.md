@@ -233,6 +233,58 @@ replay and live tail in one call.
 
 ---
 
+## Later decisions, in the same spirit
+
+Everything above reviews the document this repository was built from. The items
+in [`10-roadmap.md`](10-roadmap.md) get the same treatment as they land, and for
+the same reason: the version that looks obvious on the page is usually the one
+that reads fine, passes its own test, and fails intermittently in a cluster.
+
+### F2 — four items each extending the queue payload
+
+The obvious way to give the queue payload a lane key, an attempt count, a
+submitter and a timestamp is to let the four items that want them each add
+theirs. Every one of those changes is two lines and reviews cleanly on its own,
+which is exactly the problem: the payload is a contract between a gateway
+running on the CPU nodes and a worker running on a GPU node that scales to zero,
+and the two are deployed as separate images. **Both halves of a rollout are live
+at once, always.** So each independent extension opens its own window in which a
+gateway writes a key the worker beside it has never heard of, or a worker demands
+one the gateway did not write — four windows, four different failure shapes, and
+nothing on the wire that says which vintage a queue entry came from. The one that
+bites is the second kind: `payload["attempt"]` on a leftover entry raises
+`KeyError`, the entry is discarded as malformed, and the user's job disappears
+with no terminal event at all.
+
+So the envelope is defined once, ahead of the items that need it, and the four
+fields are **reserved rather than implemented** — each has a default, round-trips
+through Redis, and is read by nothing. An item then changes what reads its field,
+not what is on the wire, and needs no version bump to do it. Parsing is tolerant
+in both directions: a payload with no `schema_version` is the pre-F2 shape and is
+version 1 by definition, and a key this side does not recognise is carried rather
+than rejected, because refusing it would strand exactly the work versioning
+exists to protect.
+
+Two smaller things that were not obvious until the code was written:
+
+- **"The old shape still works" is unfalsifiable if you only assert that the job
+  completes.** Before the change the old shape is the *only* shape, so that
+  assertion passes for a reason that has nothing to do with tolerance, and keeps
+  passing if tolerance is later removed. The worker therefore writes the version
+  it actually parsed onto the job's state hash. That is what turns "it did not
+  crash" into something a test — or an operator watching a rollout — can read.
+- **There is nowhere to put a shared module.** The two files ship in two images
+  built from two different contexts, so the envelope is duplicated verbatim, the
+  same "change both or neither" rule the processing-list key shape already
+  carried. That rule is exactly the kind that survives review and dies six months
+  later, so `make lint` now diffs the two copies. Divergence there is silent in
+  the way this document's other entries are silent: both files still compile,
+  the suite still passes against whichever half it happens to exercise, and the
+  failure appears only when a gateway and a worker of different vintages meet on
+  the queue.
+
+---
+
 ## What was right and worth keeping
 
 - Hub and spoke with a queue between them. Correct, and the reasoning given for

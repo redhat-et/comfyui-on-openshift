@@ -57,6 +57,18 @@ not requeued: a workflow that OOM-killed one worker would kill the next too.
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
 
+**The queue payload envelope round-trips, and tolerates both vintages.** A
+submitted job carries `schema_version` plus the four fields reserved for later
+roadmap items, each with its default, and the test reads them off the raw Redis
+list rather than trusting the gateway's response. It then pushes two payloads
+the gateway would never write — the pre-F2 `{job_id, workflow}` shape, and one
+carrying a field neither file defines — and asserts both run to completion with
+the version the worker actually parsed recorded on the job's state hash. This is
+the rolling-deploy case: the gateway and the workers are separate images, so a
+queue entry written by one vintage is always read by the other at some point
+during a rollout, and `docs/07-design-review.md` explains why the failure that
+matters there is a discarded entry rather than a crash.
+
 ## What it does not cover
 
 Anything requiring a real cluster: KEDA actually scaling, the machine pool
