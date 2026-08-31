@@ -75,6 +75,24 @@ spec:
         # so a bare "redis" resolves against openshift-keda's search domains and
         # fails with "no such host". setup.sh substitutes the real namespace.
         address: redis.NAMESPACE_PLACEHOLDER.svc.cluster.local:6379
+        # Q1 (docs/10-roadmap.md) gave the queue fair-queueing across
+        # submitters WITHOUT giving each submitter their own Redis list: a job
+        # is inserted at a fairness-computed position within this ONE list
+        # rather than always at the back, so comfy:queue stays the single
+        # physical list it always was, popped by the same single BLMOVE in
+        # worker_agent.py's main loop. This trigger is therefore unchanged —
+        # `listName: comfy:queue` still names the entire, only, queue, and its
+        # length still means "total jobs waiting", fair-queued or not.
+        # Nothing here was a candidate for becoming N per-submitter triggers.
+        # Cluster day must still confirm the thing a laptop cannot: that KEDA
+        # scales from 0 exactly as before once fair-queueing reordering is
+        # live, i.e. that reordering entries within comfy:queue via the Lua
+        # script in hub.py's fair_enqueue_script (DEL + batched RPUSH under
+        # one EVAL) does not produce a length-0 blip the scaler could read as
+        # "queue drained" between the DEL and the RPUSH — it should not, EVAL
+        # is atomic and KEDA polls LLEN out-of-band on its own interval, but
+        # this repo's rule is that a cluster-only claim is verified, not
+        # assumed. See docs/10-roadmap.md's cluster day section.
         listName: comfy:queue
         # Target queue depth per worker. With listLength 1, two queued jobs ask
         # for two workers — which is what you want when each job occupies a

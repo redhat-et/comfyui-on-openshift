@@ -205,6 +205,139 @@ def parse_envelope(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# BEGIN FAIR QUEUEING (docs/10-roadmap.md, Q1)
+#
+# The problem: comfy:queue is one Redis list, and one submitter's batch of 200
+# jobs is served start to finish before anything behind it, so a second
+# submitter's single job waits out the whole batch. docs/06's roadmap
+# deliberately rejected a priority lane for this — a priority claim has to
+# come from the caller, and the same X-Forwarded-User header this endpoint
+# already reads is client-supplied and unauthenticated whenever AUTH_MODE=none,
+# so "I'm interactive" would just be a header everyone sets on themselves.
+#
+# Round-robin needs no such claim: every submitter identity hub.py already
+# records (queue_key, mirroring the same value as the reserved `user` field —
+# see build_envelope() below) is a lane, each lane's Nth queued job is served
+# in round N-1, and rounds are served lowest-first. Impersonating a real
+# submitter only shares that submitter's slots, not a new one, and a caller
+# who sends no identity at all (the common AUTH_MODE=none case, no proxy, no
+# header) shares the single lane "" with every other anonymous caller — which
+# makes every job its own round in arrival order, i.e. today's plain FIFO.
+# That is fairness degrading to FIFO exactly where there is nothing to be
+# fair about, not a special case in the code.
+#
+# What does NOT change: the physical queue is still the one Redis list
+# comfy:queue, still bounded by MAX_QUEUE_DEPTH, still popped by the same
+# BLMOVE src=RIGHT in worker_agent.py's main loop into the same per-worker
+# processing list the reaper depends on. Fairness is entirely a question of
+# WHERE in that one list a new job is inserted, computed by the Lua script
+# below and run atomically (one EVAL) so a job push can never interleave with
+# another push or with the worker's blocking pop mid-reorder. Because it is
+# still one list of the same shape, KEDA's `listName: comfy:queue` trigger in
+# enterprise/manifests/03-autoscale.yaml needs no change — see the comment
+# there for what cluster day must still confirm.
+#
+# Physical layout is unchanged from before Q1: index 0 is the most recently
+# queued job, the tail (index -1) is served next. A plain LPUSH always landed
+# a new job at index 0 — "join the back of the line" — which is a special
+# case of the general rule below (every lane empty, at the same identical
+# round 0, breaks ties by arrival, so it appends). Round numbers are
+# recomputed from the queue's own current contents on every insert rather than
+# kept in a persistent per-lane counter: a persistent counter would keep
+# counting a lane's already-*served* jobs too, so a submitter whose earlier
+# jobs already ran would wrongly look deep into round N for everything after.
+# ---------------------------------------------------------------------------
+
+FAIR_ENQUEUE_LUA = """
+local key = KEYS[1]
+local new_entry = ARGV[1]
+local new_lane = ARGV[2] or ""
+
+local raw = redis.call('LRANGE', key, 0, -1)
+local n = #raw
+
+-- front[1] is served soonest (the physical tail), front[n] is served last
+-- (the physical head) -- i.e. front is `raw` reversed into service order.
+local front = {}
+for i = n, 1, -1 do
+  front[#front + 1] = raw[i]
+end
+
+-- Round of each existing job: the count of that job's own lane already seen
+-- earlier in service order. Non-decreasing front-to-back by construction,
+-- since every prior insert placed things the same way.
+local round_of, lane_count = {}, {}
+for i = 1, n do
+  local lane = ""
+  local ok, obj = pcall(cjson.decode, front[i])
+  if ok and type(obj) == 'table' and type(obj.queue_key) == 'string' then
+    lane = obj.queue_key
+  end
+  local c = lane_count[lane] or 0
+  round_of[i] = c
+  lane_count[lane] = c + 1
+end
+
+local new_round = lane_count[new_lane] or 0
+
+-- The new job goes immediately ahead of the first existing job whose round is
+-- strictly later than its own -- i.e. at the back of its own round's group,
+-- ahead of every later round. No later round exists: it joins the very back.
+local insert_at = n + 1
+for i = 1, n do
+  if round_of[i] > new_round then
+    insert_at = i
+    break
+  end
+end
+
+local result = {}
+for i = 1, insert_at - 1 do result[#result + 1] = front[i] end
+result[#result + 1] = new_entry
+for i = insert_at, n do result[#result + 1] = front[i] end
+
+redis.call('DEL', key)
+
+-- Write back in physical order (head first, i.e. `result` reversed), in
+-- batches so a very deep queue never approaches Lua's per-call argument
+-- limit.
+local batch = {}
+for i = #result, 1, -1 do
+  batch[#batch + 1] = result[i]
+  if #batch == 200 then
+    redis.call('RPUSH', key, unpack(batch))
+    batch = {}
+  end
+end
+if #batch > 0 then
+  redis.call('RPUSH', key, unpack(batch))
+end
+
+-- {jobs queued before this one (any lane), jobs that will be served before
+-- this one under fair-queueing order}
+return {n, insert_at - 1}
+"""
+
+_fair_enqueue_script = None
+
+
+def fair_enqueue_script():
+    """Lazily registered against the shared connection. register_script()
+    only computes a SHA1 client-side — no I/O — so this is cheap to call on
+    every request; it is cached anyway so there is exactly one Script object
+    per process."""
+    global _fair_enqueue_script
+
+    if _fair_enqueue_script is None:
+        _fair_enqueue_script = client().register_script(FAIR_ENQUEUE_LUA)
+
+    return _fair_enqueue_script
+
+# END FAIR QUEUEING
+# ---------------------------------------------------------------------------
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
     # One reaper per gateway replica is fine: RPOP is atomic, so two reapers
@@ -345,14 +478,35 @@ async def generate(request: Request):
 
     job_id = str(uuid.uuid4())
 
-    # Who spent the GPU. oauth-proxy sets X-Forwarded-User for the
-    # authenticated user (its pass-user-headers default); recording it answers
-    # "whose job is this?" without building per-user anything. With
-    # AUTH_MODE=none there is no proxy and the header is client-supplied —
-    # informational at best, so never treat it as authorization.
+    # Who spent the GPU, and — since Q1 — whose fair-queueing lane this job
+    # belongs to. oauth-proxy sets X-Forwarded-User for the authenticated user
+    # (its pass-user-headers default); recording it answers "whose job is
+    # this?" without building per-user anything. With AUTH_MODE=none there is
+    # no proxy and the header is client-supplied — informational at best, so
+    # never treat it as authorization. Fairness does not need it to be one:
+    # the queue_key lane below only decides serving ORDER among jobs that are
+    # all going to run regardless, and claiming someone else's identity only
+    # shares their slots. See BEGIN FAIR QUEUEING above.
     user = request.headers.get("x-forwarded-user", "")
 
-    state = {"status": "queued", "queue_depth_at_submit": depth}
+    # The envelope, not a hand-rolled dict: every reserved field is written
+    # here with its default, so the worker never has to ask whether a key is
+    # present. queue_key is the fair-queueing lane (Q1) — the same value as
+    # the reserved `user` field, not a second identity concept.
+    envelope = build_envelope(job_id, workflow, user=user, queue_key=user)
+
+    # Atomically place the job in the single physical queue at its
+    # fair-queueing position, rather than always at the back. `position` is
+    # how many jobs will be served before this one under that ordering, which
+    # is what index.html shows the caller as "N ahead" — it can differ from a
+    # raw list-length snapshot once more than one lane is active, which is the
+    # whole point. The overall backlog size (unaffected by fairness — it is
+    # still one list) stays available from gather_stats()'s queue_depth.
+    _queued_before, position = await fair_enqueue_script()(
+        keys=[QUEUE_KEY], args=[json.dumps(envelope), envelope["queue_key"]]
+    )
+
+    state = {"status": "queued", "queue_depth_at_submit": position}
 
     if user:
         state["user"] = user
@@ -362,16 +516,10 @@ async def generate(request: Request):
 
     # Seed the stream so a browser that opens the WebSocket before any worker
     # picks the job up sees "queued" instead of an empty blocking read.
-    await conn.xadd(stream_key(job_id), {"data": json.dumps({"type": "queued", "data": {"position": depth}})})
+    await conn.xadd(stream_key(job_id), {"data": json.dumps({"type": "queued", "data": {"position": position}})})
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
 
-    # The envelope, not a hand-rolled dict: every reserved field is written
-    # here with its default, so the worker never has to ask whether a key is
-    # present. queue_key stays empty until Q1 decides what a lane is — the
-    # field is reserved, not implemented.
-    await conn.lpush(QUEUE_KEY, json.dumps(build_envelope(job_id, workflow, user=user)))
-
-    return {"job_id": job_id, "status": "queued", "queue_depth": depth}
+    return {"job_id": job_id, "status": "queued", "queue_depth": position}
 
 
 @app.get("/api/jobs/{job_id}")

@@ -223,12 +223,21 @@ format rather than behind a button in a shared UI.
   not done here. (The gateway does now record that authenticated user on each
   job's state, so attribution — whose job is this — exists without the
   workspaces.)
-- **Job priority.** The pop is `BLMOVE` from one list into a per-worker
-  processing list — FIFO, and deliberately not a plain `BRPOP`, because the
-  processing list is what the reaper needs. Priority therefore means more than
-  a second list: it means a multi-lane pop that still parks the job somewhere
-  the reaper can find it. `docs/10-roadmap.md` (Q1) takes the fair-queueing
-  route instead, which needs no priority claim from the caller.
+- **Job priority.** Still not here, on purpose, and the reasoning changed once
+  `docs/10-roadmap.md` (Q1) landed fair queueing. A priority lane needs a claim
+  from the caller — "I'm interactive" — and the only identity this gateway can
+  read, `X-Forwarded-User`, is exactly that self-declared and unauthenticated
+  under `AUTH_MODE=none`; a priority lane would just be a header everyone sets
+  on themselves. Round-robin sidesteps the trust decision entirely instead of
+  solving it: each submitter identity hub.py already records is a lane, lanes
+  take turns, and impersonating someone else only shares their turns, not a
+  faster one. It also did not need the second list this bullet used to say
+  priority would require — the pop is still one `BLMOVE` from one list into a
+  per-worker processing list the reaper depends on; a new job is inserted at
+  its fairness-computed position within that *same* list (`hub.py`'s
+  `fair_enqueue_script`, one atomic Lua `EVAL`) rather than always at the
+  back. What is still deliberately absent is an actual priority claim — no
+  caller, authenticated or not, can ask to go first.
 - **Multi-GPU workers.** One pod, one GPU. A worker with four cards would need
   ComfyUI's own batching or four ComfyUI processes.
 - **Redis HA.** One instance with AOF persistence. It survives a pod restart; it
