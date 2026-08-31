@@ -589,12 +589,13 @@ that bites first — `make preflight` checks it, and it is a multi-day fix.
 
 ## Ideas worth doing next
 
-Ordered by payoff per unit of work. Nothing here is implemented; each is a
-concrete next change, not a wish. `docs/10-roadmap.md` is the worked version —
-it adds three foundation items this list does not have (worker resource
-sizing, a versioned queue payload, and test-harness discovery), corrects the
-effort tags below where a full read of the source disagreed with them, and
-says which two of these should not be done at all.
+Ordered by payoff per unit of work. Three have landed, along with three
+foundation items that were never on this list — worker resource sizing, a
+versioned queue payload, and test-harness discovery. **Shipped items stay here,
+struck through, because a roadmap that never visibly moves is a wish list.**
+`docs/10-roadmap.md` is the worked version and the record: what landed, what
+each item deferred to a real cluster, and which two of these should not be done
+at all.
 
 1. **Schedule the warm window instead of pinning it.** A pair of cron lines —
    `rosa edit machinepool gpu --min-replicas 1` at 08:30 and `--min-replicas 0`
@@ -612,11 +613,11 @@ says which two of these should not be done at all.
    store. An init container that copies the active checkpoint from EFS to local
    disk turns every subsequent load from an NFS read into a local read, which
    is the difference EFS costs you today. *(Medium.)*
-4. **Narrow retry, and spot separately.** These looked like one item and are
+4. ~~**Narrow retry**~~, and spot separately. These looked like one item and are
    not. Blanket retry re-runs the poison pill: a host-RAM OOM kills the pod and
    is indistinguishable at the queue level from a node reclaim, so "retry on
    worker death" retries the workflow that will kill the next worker too. The
-   retry half has **landed** on exactly those terms: jobs that died *before*
+   retry half has **shipped** on exactly those terms: jobs that died *before*
    ComfyUI ever saw the workflow are requeued once, phase breadcrumbs make
    every other death diagnosable, and nothing that reached a GPU is ever
    replayed (`docs/10-roadmap.md`, Q2). Spot never needed retry at all: an
@@ -630,7 +631,7 @@ says which two of these should not be done at all.
    a deterministic per-workflow failure into a non-deterministic one where the
    victim is whichever job allocates second. MIG partitions memory properly and
    is not available on L4. *(Revisit only on MIG-capable hardware.)*
-6. **Per-user output workspaces — landed.** Each job now writes into its own
+6. ~~**Per-user output workspaces.**~~ **Shipped** — each job now writes into its own
    `/output/<workspace>/`, named from the submitter's identity by the worker
    agent, and every output that comes back is confined there whether or not
    the save node cooperated (`docs/10-roadmap.md`, Q3). Two things it is worth
@@ -646,12 +647,14 @@ says which two of these should not be done at all.
 7. **Showback from the data you already collect.** Job attribution plus GPU
    seconds is a monthly "who spent the card" report. In most organisations this
    changes behaviour faster than any technical control. *(Small.)*
-8. **Fair queueing.** The pop is a single-list `BLMOVE`, so one person's
-   overnight batch of two hundred jobs starves the interactive users.
-   Round-robin the pop across submitters instead of ranking them: it fixes the
-   starvation without inventing a priority claim that a caller could simply
-   assert about itself. *(Medium — it moves the pop, the depth gate and the
-   KEDA trigger together, not just `worker_agent.py`.)*
+8. ~~**Fair queueing.**~~ **Shipped** — one physical Redis list still, with each
+   job spliced in at a fairness-computed position rather than always at the
+   back, so `LLEN` still means "total jobs waiting", the KEDA trigger needed no
+   change, and the pop is the same `BLMOVE` into the per-worker processing
+   list. One submitter, or none, degrades to plain FIFO by construction. The
+   enqueue cost was measured rather than assumed, and the first implementation
+   stalled Redis for 113 ms at full queue depth before it was fixed —
+   `enterprise/test/bench-fair-enqueue.py` keeps the number re-measurable.
 9. **Scale on queue *wait*, not queue depth.** Depth is a proxy; what a user
    feels is time-to-first-pixel. Export an estimated wait from the gateway and
    point KEDA's Prometheus scaler at it. *(Medium.)*
