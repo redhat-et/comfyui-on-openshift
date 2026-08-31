@@ -301,7 +301,7 @@ worker in the pool in sequence at GPU prices. The only question with an answer
 is **how far the job got**, and the only process that knows is the one that
 died. Hence a breadcrumb written ahead of the fact rather than a diagnosis
 attempted after it: the agent records `dispatched` when it takes the job and
-`executing` the moment ComfyUI accepts the prompt, and the reaper retries the
+`executing` before it hands ComfyUI the workflow, and the reaper retries the
 first and never the second. The ordering there is the whole content of the
 mechanism — a breadcrumb written *after* the transition it describes leaves a
 window in which the job is executing and the record says it is not, and that
@@ -366,6 +366,57 @@ Three smaller things that were not obvious until it was written:
   failure the reaper emits points at `oc describe pod`. The ambiguity is total
   at the queue layer and nowhere else, and a failure message that says only
   "the worker died" spends that fact.
+
+### Q2, corrected — a rule you state and then round off is not a rule
+
+Q2 shipped with the paragraph above written correctly and the code a step
+behind it, in two places. Both are worth recording, because both are the same
+mistake: the mechanism was reasoned about at the level of the sentence and
+implemented at the level of the call.
+
+**"Before the transition" meant before the POST, and the code wrote it after
+`submit_prompt()` returned.** ComfyUI has the workflow the moment the request
+is written to the socket, not when it answers — so an agent that records
+`executing` on the *return* has left the whole round trip inside the retryable
+phase. That is not a theoretical sliver: it is as long as a loaded ComfyUI
+takes to answer a POST, it widens exactly when the cluster is unhealthy, and a
+worker that dies inside it hands a workflow ComfyUI is already running to a
+second GPU. The window was known and written down when Q2 landed, which is the
+part worth being uncomfortable about — a disclosed window is still an open one,
+and "small" is not a property the reaper can read. The fix is ordering rather
+than narrowing: the `HSET` moves above the call. The cost is that a death
+inside the POST no longer earns its retry, which is the direction to err — one
+user resubmits, versus a poison workflow walking the pool.
+
+**A cancelled job is at a retryable phase precisely because it was cancelled
+early.** The reaper read the breadcrumb and nothing else, so a job the user
+cancelled while it was queued or dispatched, whose worker then died, was
+requeued with its status reset to `queued` — the retry mechanism spending a GPU
+on work whose owner had already withdrawn it, and telling them it was queued
+again. The reaper now reads `cancel_requested` alongside the phase and ends
+such a job `cancelled`: terminal, payload reclaimed, no retry spent.
+
+That second one had a pre-existing half, which is now closed too. `run_job()`
+did not consult the cancel flag until *after* `submit_prompt()`, so a job
+cancelled while it sat in the queue was submitted to ComfyUI by the next
+healthy worker to pop it and then interrupted — which is not what
+`cancel()`'s own docstring promises ("a job that has not been picked up yet
+never starts"), and is GPU time spent on a job nobody wanted. One check
+immediately before the POST closes it. The two checks are not redundant: this
+one covers the ordinary path, the reaper's covers the death path, and either
+alone leaves a door.
+
+Both are asserted end to end by `check-35-retry-doors.py`, against the stub's
+record of every workflow it has actually been handed — because "did ComfyUI
+get it" is the question the whole mechanism turns on, and until the stub
+recorded it, the suite could only infer the answer from timing. The same
+record turned `check-30-sigkill.py`'s pre-execution scenario from an
+assumption into an assertion, and showed that its kill point had been on the
+wrong side of the line all along: it killed the agent inside `submit_prompt()`
+and asserted a retry, which is the replay this mechanism exists to prevent.
+It now kills the agent where a pre-execution death actually lives — parked in
+the ComfyUI WebSocket connect, before anything has been sent — and asserts
+ComfyUI never saw the workflow.
 
 ### Q3 — the username becomes a path, and the part that cannot be tested here
 

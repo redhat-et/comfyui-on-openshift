@@ -8,12 +8,46 @@ history = {}
 
 # How long POST /prompt stalls before answering when the workflow carries the
 # __slow_prompt__ marker (docs/10-roadmap.md, Q2). worker_agent.py's
-# submit_prompt() blocks on this response, so a check that wants to SIGKILL the
-# agent while it is provably still waiting on ComfyUI's acceptance — i.e.
-# before ComfyUI has ever seen the workflow — needs a window wide enough that
-# "confirm the agent is already blocked in submit_prompt(), then kill it" is
-# not a race. See check-30-sigkill.py.
-SLOW_PROMPT_DELAY_S = 4
+# submit_prompt() blocks on this response, so this is the window in which
+# ComfyUI HAS the workflow and the agent has not been told so yet — the window
+# check-35-retry-doors.py kills an agent inside, to prove the phase breadcrumb
+# already reads "executing" by then. Wide enough that "confirm ComfyUI has
+# received it, read the breadcrumb, then kill" is not a race.
+SLOW_PROMPT_DELAY_S = 6
+
+# Every top-level node key of every workflow this stub has been handed, in
+# arrival order, appended the moment /prompt is entered and BEFORE any stall.
+#
+# This is what makes "ComfyUI never saw this workflow" an assertion rather
+# than an inference: a check gives its workflow a node key nothing else uses
+# and then asks this stub directly whether it ever arrived. Both directions
+# matter — check-30's retried job must NOT have reached here before the death
+# that retried it, and check-35's cancelled job must NOT reach here at all.
+received_nodes = []
+
+
+@app.get("/__received__")
+async def received():
+    return {"nodes": received_nodes}
+
+
+# One-shot: the next WebSocket connection stalls this long BEFORE the accept,
+# leaving the agent parked in ws.connect() — after it has claimed the job and
+# written its "dispatched" breadcrumb, and before it has sent ComfyUI anything
+# at all. That is the window a pre-execution death actually lives in now that
+# the "executing" breadcrumb is written ahead of the POST rather than after it,
+# so it is the window check-30-sigkill.py has to kill an agent inside.
+# Set through POST /__stall_next_ws__, consumed by the first connection to see
+# it, and kept well under worker_agent.py's own 30s connect timeout.
+stall_next_ws_s = 0.0
+
+
+@app.post("/__stall_next_ws__")
+async def stall_next_ws(body: dict):
+    global stall_next_ws_s
+    stall_next_ws_s = float(body.get("seconds") or 0)
+    return {"stall_next_ws_s": stall_next_ws_s}
+
 
 @app.get("/system_stats")
 async def stats():
@@ -22,6 +56,9 @@ async def stats():
 @app.post("/prompt")
 async def prompt(body: dict):
     wf = body.get("prompt") or {}
+    # Before the rejection and before the stall: this endpoint being entered
+    # at all is what "ComfyUI has been handed this workflow" means.
+    received_nodes.extend(wf.keys())
     if "__fail__" in wf:
         from fastapi.responses import JSONResponse
         return JSONResponse({"error": {"message": "required input is missing: ckpt_name"}}, status_code=400)
@@ -65,7 +102,11 @@ async def send(ws, msg):
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
+    global stall_next_ws_s
     cid = ws.query_params.get("clientId")
+    if stall_next_ws_s:
+        stall, stall_next_ws_s = stall_next_ws_s, 0.0
+        await asyncio.sleep(stall)
     await ws.accept()
     clients[cid] = ws
     try:

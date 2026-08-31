@@ -622,6 +622,10 @@ def state_key(job_id: str) -> str:
 #     failure text below points the operator at it rather than shrugging.
 #   - A death at PHASE_QUEUED or PHASE_DISPATCHED is requeued, at most
 #     MAX_JOB_RETRIES times. Nothing ran, so there is nothing to replay.
+#   - Unless the job was cancelled, which is checked before the requeue and not
+#     after. A cancelled job is at a retryable phase precisely BECAUSE the
+#     cancel stopped it early, so "retryable" would otherwise mean "hand the
+#     workflow the user withdrew to a second worker". It ends `cancelled`.
 #
 # Why the counter is HINCRBY and not read-then-write. "RPOP is atomic, so two
 # reapers each fail different entries" is the argument that makes fail-once
@@ -648,6 +652,13 @@ def state_key(job_id: str) -> str:
 RETRY_TYPE = "retry"
 
 DEAD_WORKER = "the worker running this job died without reporting back"
+
+# The cancel flag, on the job's own state hash beside the phase breadcrumb.
+# cancel() below sets it and worker_agent.py reads it; the reaper reads it too,
+# because a stranded job the user has already withdrawn must not be requeued
+# and handed to a second worker. Named once rather than spelled three times:
+# the flag is only load-bearing while every reader agrees on the string.
+CANCEL_REQUESTED_FIELD = "cancel_requested"
 
 # What the operator can do that the gateway cannot. The gateway sees a lapsed
 # heartbeat and nothing else — but the pod is not ambiguous, because F1 sized
@@ -691,6 +702,34 @@ async def fail_orphaned_job(conn: redis.Redis, job_id: str, error: str) -> None:
     await conn.xadd(
         stream_key(job_id),
         {"data": json.dumps({"type": "failed", "data": {"error": error}})},
+    )
+    await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
+
+
+async def cancel_orphaned_job(conn: redis.Redis, job_id: str) -> None:
+    """
+    Terminal, for a stranded job whose owner had already cancelled it.
+
+    The alternative is not "fail it" but "requeue it", which is the door this
+    closes: a job cancelled while queued or dispatched is at a retryable phase,
+    so without this its worker's death puts it back on the queue with its
+    status reset to 'queued', a second worker picks it up, and a workflow the
+    user withdrew is run on a GPU. `cancelled` rather than `failed` because
+    that is what actually happened to it and what the user asked for — and it
+    is equally terminal, so a tailing browser stops here either way.
+    """
+    await conn.hset(state_key(job_id), mapping={"status": "cancelled"})
+    await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
+
+    # Nothing will run this workflow now, exactly as in fail_orphaned_job().
+    await conn.delete(payload_key(job_id))
+
+    await conn.xadd(
+        stream_key(job_id),
+        {"data": json.dumps({"type": "cancelled", "data": {
+            "reason": f"{DEAD_WORKER} — and this job had already been cancelled, "
+                      f"so it was not requeued",
+        }})},
     )
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
 
@@ -753,7 +792,10 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
         # dropped.
         return
 
-    phase = await conn.hget(state_key(job_id), PHASE_FIELD)
+    # Both facts in one round trip, and both read before anything is decided:
+    # how far the job got, and whether its owner still wants it.
+    phase, cancel_requested = await conn.hmget(
+        state_key(job_id), [PHASE_FIELD, CANCEL_REQUESTED_FIELD])
 
     if phase not in RETRYABLE_PHASES:
         # Includes the case where the state hash is gone entirely (phase is
@@ -767,6 +809,22 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
                      f"so it was not retried")
 
         await fail_orphaned_job(conn, job_id, f"{DEAD_WORKER}: {got_there}. {DESCRIBE_HINT}.")
+        return
+
+    # Retryable by phase is not the same as worth retrying. A job cancelled
+    # while it was queued or dispatched is at a retryable phase by
+    # construction — the cancel is what stopped it before ComfyUI saw it — so
+    # this is the one place a requeue would hand a withdrawn workflow to a
+    # second worker and spend a GPU on it. Checked before the payload fetch and
+    # before the counter moves: a cancelled job neither needs its workflow back
+    # nor spends a retry it will never use.
+    #
+    # This does not make the worker's own check redundant, and is not made
+    # redundant by it: this one closes the death path, and run_job()'s closes
+    # the ordinary one, where a job cancelled while queued is popped by a
+    # perfectly healthy worker.
+    if cancel_requested == "1":
+        await cancel_orphaned_job(conn, job_id)
         return
 
     # A pointer entry names its workflow rather than carrying it, so fetch it
@@ -978,7 +1036,7 @@ async def cancel(job_id: str):
     if not await conn.exists(state_key(job_id)):
         raise HTTPException(404, "unknown or expired job")
 
-    await conn.hset(state_key(job_id), "cancel_requested", "1")
+    await conn.hset(state_key(job_id), CANCEL_REQUESTED_FIELD, "1")
 
     # Re-arm the TTL: if the key expired between the check and the write, the
     # HSET recreated it with no TTL at all.

@@ -44,8 +44,12 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      the past, so each write must happen BEFORE the transition it describes is
      observable: written after, there is a window in which the job is executing
      and the record says it is not, and that window is exactly when a retry
-     replays a poison workflow. The queue entry cannot carry this — it is a
-     static copy of what hub.py pushed and nothing rewrites it.
+     replays a poison workflow. ComfyUI is handed the workflow when the POST is
+     WRITTEN, not when it answers, so PHASE_EXECUTING is written before
+     submit_prompt() is called rather than after it returns — the round trip is
+     the window, and on a loaded or wedged ComfyUI it is not a short one. The
+     queue entry cannot carry this — it is a static copy of what hub.py pushed
+     and nothing rewrites it.
 
   7. Treat the submitter's name as hostile input, because it becomes a PATH.
      Each job writes into its own output workspace under OUTPUT_ROOT, named
@@ -863,14 +867,33 @@ def run_job(conn: redis.Redis, job: dict) -> None:
     ws.settimeout(RECV_TIMEOUT)
 
     try:
-        prompt_id = submit_prompt(workflow)
+        # The last moment a cancel can still be free. /api/jobs/<id>/cancel is
+        # cooperative and promises that "a job that has not been picked up yet
+        # never starts" — which is only true if somebody checks between the pop
+        # and the POST. Everything above this line is reversible; the next line
+        # is not. Without this, a job cancelled while it sat in the queue is
+        # submitted anyway and the cancel becomes an /interrupt mid-sampler,
+        # i.e. GPU time spent on work the user withdrew before it began.
+        if cancelled(conn, job_id):
+            finish(conn, job_id, "cancelled", {})
+            return
 
-        # Point 6, the other half: ComfyUI has the workflow. Written BEFORE the
-        # `accepted` event, because this is the flag that stops a death here
-        # from being retried and the event is only a thing to look at. From
-        # here on, every death this job suffers is terminal.
+        # Point 6, the other half: ComfyUI is about to be handed the workflow.
+        # BEFORE the POST rather than after it returns, because ComfyUI has the
+        # prompt from the moment the request is written — the round trip is a
+        # window in which a death would otherwise be read as "nothing ran" and
+        # replayed onto a second GPU, which is the one thing the narrow retry
+        # exists to prevent. The cost of being early is a job that dies inside
+        # the POST and is not retried; the cost of being late is a poison
+        # workflow walking the pool, so this errs early on purpose.
+        #
+        # Written BEFORE the `accepted` event for the same reason: this is the
+        # flag that decides a death's fate, and the event is only a thing to
+        # look at. From here on, every death this job suffers is terminal.
         conn.hset(state_key(job_id), PHASE_FIELD, PHASE_EXECUTING)
         conn.expire(state_key(job_id), EVENT_STREAM_TTL)
+
+        prompt_id = submit_prompt(workflow)
 
         emit(conn, job_id, {"type": "accepted", "data": {"prompt_id": prompt_id}})
 

@@ -72,14 +72,30 @@ warning at all. The agent parks each job in a per-worker processing list and
 holds a TTL'd heartbeat — see point 5 in `worker_agent.py` — and the gateway's
 reaper notices a lapsed heartbeat and acts on the stranded job. What it does
 depends on the `phase` breadcrumb on the job's own state (docs/10-roadmap.md,
-Q2): a worker SIGKILLed before ComfyUI ever saw the workflow (still blocked
-waiting on ComfyUI's acceptance) has its job requeued exactly once, as a
-non-terminal `retry` event a tailing browser does not stop at, and a second
-agent completes it. A worker SIGKILLed after execution began gets the original
-behavior unchanged — one terminal `failed` naming the dead worker, never
-requeued, and it drops out of `/api/stats` on its own — because a workflow
-that OOM-killed one worker would OOM-kill whichever worker it was requeued
-onto next.
+Q2): a worker SIGKILLed before ComfyUI was ever handed the workflow (still
+parked in the ComfyUI WebSocket connect it does before submitting anything)
+has its job requeued exactly once, as a non-terminal `retry` event a tailing
+browser does not stop at, and a second agent completes it. A worker SIGKILLed
+after execution began gets the original behavior unchanged — one terminal
+`failed` naming the dead worker, never requeued, and it drops out of
+`/api/stats` on its own — because a workflow that OOM-killed one worker would
+OOM-kill whichever worker it was requeued onto next. The stub records every
+workflow it is handed, so "ComfyUI had not seen it" is asserted rather than
+assumed on both sides of that line.
+
+**And the two doors into a replay stay shut** (`check-35-retry-doors.py`).
+The breadcrumb decides whether a death is retried, so it has to be true at
+every instant, and the retry has to be about work somebody still wants.
+ComfyUI receives a workflow when the POST is *written*, not when it answers:
+the check waits until the stub reports it has the workflow — while the agent
+is still blocked on a stalled `/prompt` — and asserts the breadcrumb already
+reads `executing`, then kills the agent there and asserts one terminal
+`failed` and no requeue. Separately, a job the user cancelled must not be
+requeued when its worker dies (the reaper's door), and must never be handed to
+ComfyUI at all when a healthy worker pops it (the worker's door, and what
+`cancel()` promises: a job that has not been picked up yet never starts). The
+second of those is measured by asking the stub whether the workflow ever
+arrived, which is the only way to see a GPU that was spent.
 
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
@@ -140,8 +156,8 @@ The convention:
 | **Runtime** | Under `CHECK_TIMEOUT` (default 240s), which is a hang kill-switch rather than a budget. Keep a check to seconds; the whole suite is meant to run in about a minute. |
 
 **You may kill the agent.** `check-20-failure-paths.py` SIGTERMs it and asserts
-it drains; `check-30-sigkill.py` SIGKILLs it and asserts the gateway's reaper
-notices. `run.sh` checks the agent is alive before each check and starts a fresh
+it drains; `check-30-sigkill.py` and `check-35-retry-doors.py` SIGKILL it and
+assert the gateway's reaper notices. `run.sh` checks the agent is alive before each check and starts a fresh
 one if the previous check left it dead, so the check after yours is unaffected —
 and no check ever runs beside a second registered worker, which assertions about
 `workers_registered` could not see through.

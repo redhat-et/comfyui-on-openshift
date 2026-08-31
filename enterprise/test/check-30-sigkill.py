@@ -14,11 +14,22 @@ that is safe to retry is one where ComfyUI never saw the workflow at all.
 Two scenarios, both against a worker's per-worker processing list and TTL'd
 heartbeat (point 5 in worker_agent.py):
 
-  A. SIGKILL BEFORE the workflow ever reached ComfyUI (the agent is still
-     blocked inside submit_prompt(), waiting on ComfyUI's own acceptance of
-     the POST). The gateway's reaper must requeue this job exactly once, as a
-     non-terminal `retry` event a tailing browser does not stop at, and a
-     second agent must pick it up and complete it.
+  A. SIGKILL BEFORE the workflow ever reached ComfyUI (the agent has claimed
+     the job and is still connecting the ComfyUI WebSocket it opens before
+     submitting anything). The gateway's reaper must requeue this job exactly
+     once, as a non-terminal `retry` event a tailing browser does not stop at,
+     and a second agent must pick it up and complete it.
+
+     The premise is asserted rather than assumed: the stub records every
+     workflow handed to it, and this check proves ComfyUI had not been handed
+     this one at the moment the worker died. An earlier version of this
+     scenario killed the agent while it was blocked inside submit_prompt()
+     instead, which does NOT satisfy the premise — ComfyUI receives a workflow
+     when the POST is written, not when it answers, so that kill point was on
+     the far side of the line this whole mechanism draws, and asserting a
+     retry there asserted the replay the mechanism exists to prevent. See
+     check-35-retry-doors.py, which now holds that window as a NON-retryable
+     case.
 
   B. SIGKILL AFTER execution began (the original scenario here: the agent is
      mid-generation, ComfyUI already accepted the prompt). This must stay
@@ -42,11 +53,12 @@ check can start a second agent of its own — proving scenario A needs one,
 since the agent this check is handed (argv[1]) is the one that dies in
 scenario A, and nothing between checks in run.sh restarts one mid-check.
 """
-import json, os, signal, subprocess, sys, time, urllib.request
+import json, os, signal, subprocess, sys, time, urllib.request, uuid
 import redis
 import websocket
 
 GW = "http://127.0.0.1:8100"
+COMFY = "http://127.0.0.1:8999"
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 WORKER_AGENT = os.environ["WORKER_AGENT"]
 failures = []
@@ -64,15 +76,23 @@ def check(name, cond, detail=""):
         failures.append(name)
 
 
-def post(path, body=None):
+def post(path, body=None, base=GW):
     data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(GW + path, data=data,
+    req = urllib.request.Request(base + path, data=data,
                                  headers={"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req, timeout=10).read())
 
 
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
+def get(path, base=GW):
+    return json.loads(urllib.request.urlopen(base + path, timeout=10).read())
+
+
+def comfy_saw(probe):
+    """Has the stub ComfyUI been handed a workflow carrying this node? It
+    records them as POST /prompt is entered, so this answers the question the
+    retry decision turns on — not "has it finished", "has it answered", or
+    "has the agent heard back", but "does ComfyUI have it"."""
+    return probe in get("/__received__", base=COMFY)["nodes"]
 
 
 def state_key(job_id):
@@ -145,16 +165,22 @@ agent_pid = int(sys.argv[1])
 agent2 = None
 
 try:
-    print("\n== A: SIGKILL before ComfyUI ever saw the workflow -> retried once, a restarted agent completes it")
+    print("\n== A: SIGKILL before ComfyUI was ever handed the workflow -> retried once, a restarted agent completes it")
 
-    job = post("/api/generate", {"workflow": {"__slow_prompt__": {"class_type": "KSampler"}}})
+    # Park the agent in the window a pre-execution death actually lives in:
+    # after it has claimed the job and written its breadcrumb, and before it
+    # has sent ComfyUI anything at all. worker_agent.py connects the ComfyUI
+    # WebSocket before it submits (point 1 in that file), so stalling the
+    # stub's accept holds the agent there with the workflow still in its own
+    # memory -- for 15s, which is a window rather than a race, and well inside
+    # the agent's own 30s connect timeout.
+    post("/__stall_next_ws__", {"seconds": 15}, base=COMFY)
+
+    probe = f"probe-{uuid.uuid4().hex[:8]}"
+    job = post("/api/generate", {"workflow": {probe: {"class_type": "KSampler"}}})
     job_id = job["job_id"]
 
-    # Wait for the ORIGINAL agent to pick the job up. It is now blocked inside
-    # submit_prompt(), waiting on fake_comfy's SLOW_PROMPT_DELAY_S-second stall
-    # before /prompt answers -- ComfyUI has not accepted (or rejected) the
-    # workflow yet by any definition.
-    deadline = time.time() + 5
+    deadline = time.time() + 10
     picked_up = False
     phase_at_pickup = None
     while time.time() < deadline:
@@ -169,6 +195,9 @@ try:
     check("the phase breadcrumb is recorded and visible on job state, and reads "
           "'dispatched' -- picked up, but ComfyUI has not yet been heard from",
           phase_at_pickup == "dispatched", phase_at_pickup)
+    check("and ComfyUI really has not been handed this workflow -- the premise "
+          "of the retry below, checked rather than assumed",
+          not comfy_saw(probe), probe)
 
     os.kill(agent_pid, signal.SIGKILL)
 
@@ -191,6 +220,10 @@ try:
           state.get("status") == "completed", state)
     check("attempt_count shows it was retried exactly once, not more",
           state.get("attempt_count") == "1", state.get("attempt_count"))
+
+    check("the second attempt is what handed the workflow to ComfyUI -- so the "
+          "retry ran it once in total, rather than replaying a run",
+          comfy_saw(probe), probe)
 
     check("comfy:queue is empty once the retried job finished",
           r.llen(QUEUE_KEY) == 0, r.llen(QUEUE_KEY))
