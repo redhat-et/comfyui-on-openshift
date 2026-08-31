@@ -6,7 +6,7 @@ Runs alongside ComfyUI in the GPU pod. ComfyUI binds 127.0.0.1 only, so this
 agent is the sole path in or out — no user can reach the GPU pod directly, and
 the pod needs no Service, no Route, and no ingress rules.
 
-Seven things here that the obvious version of this script gets wrong, each of
+Eight things here that the obvious version of this script gets wrong, each of
 which produces an intermittent bug that is miserable to diagnose in a cluster:
 
   1. Connect the WebSocket BEFORE submitting the prompt. ComfyUI starts emitting
@@ -60,6 +60,16 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      directories with an EXPLICIT mode: OpenShift's arbitrary, unstable UID
      means a directory this pod creates is unwritable by the next one unless
      it is group-writable and setgid. See BEGIN OUTPUT WORKSPACES below.
+
+  8. Treat the REPORTED FILENAME as hostile too, not just the submitter's
+     name and the workspace it names — it becomes half of a served URL.
+     output_subfolder() confines the subfolder ComfyUI reports; before FIX 4a
+     (docs/10-roadmap.md) it handed the reported `filename` back unexamined,
+     so collect_outputs() concatenated a raw, unconfined string onto an
+     otherwise-safe subfolder — confinement in one half of a path is not
+     confinement of the path. A `filename` that is not a single bare path
+     component (is_bare_filename() below) is refused outright, the same way
+     a hostile `filename_prefix` is refused rather than merely sanitized.
 """
 
 from __future__ import annotations
@@ -661,10 +671,38 @@ def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
     return scoped
 
 
-def output_subfolder(workspace: str, subfolder: str, filename: str) -> str:
+def is_bare_filename(name: str) -> bool:
     """
-    Where this output actually lives, relative to OUTPUT_ROOT — moving it into
-    the workspace if a node put it somewhere else.
+    True iff `name` is a single path component: no separator, no NUL, and not
+    "." or "..". This is the confinement rule for the REPORTED FILENAME,
+    mirroring what workspace_path() already enforces for the reported
+    workspace — a run of unsafe characters cannot be un-collapsed into a
+    traversal the way a raw "/" or ".." can.
+
+    ComfyUI's own manifest entries never put a separator in `filename`;
+    `subfolder` is the only field a save node uses to nest. So a `filename`
+    that fails this is not ComfyUI's own shape and is refused outright rather
+    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    """
+    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+
+
+def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str, str]:
+    """
+    Where this output actually lives, relative to OUTPUT_ROOT, and the bare
+    filename to serve it under — moving the file into the workspace if a node
+    put it somewhere else.
+
+    Both halves of what a URL gets built from are confined HERE, on the same
+    footing — not just subfolder. Before FIX 4a (docs/10-roadmap.md) this
+    function validated and rewrote only subfolder and handed filename back
+    unexamined; a caller building a URL by concatenating the two (as
+    collect_outputs() below does) then reproduced whatever traversal was in
+    the raw filename verbatim, subfolder confinement notwithstanding. A
+    filename that is not already a bare name (is_bare_filename() above) is
+    refused — returned as "" — rather than served from wherever it resolves
+    to; the caller is required to treat "" as "do not build a URL for this
+    output at all" (collect_outputs() does).
 
     The prefix rewrite above covers save nodes that honour filename_prefix.
     This covers the rest, and it is the half that makes "every output of this
@@ -673,7 +711,11 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> str:
     can enforce it on outputs it did not get to name.
     """
     if not filename:
-        return subfolder
+        return subfolder, ""
+
+    if not is_bare_filename(filename):
+        log(f"warning: output filename {filename!r} is not a bare filename — not served")
+        return workspace, ""
 
     try:
         ws_root = workspace_path(workspace)
@@ -681,17 +723,17 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> str:
 
     except (ValueError, OSError) as exc:
         log(f"warning: cannot place {subfolder}/{filename} in workspace {workspace}: {exc}")
-        return workspace
+        return workspace, ""
 
     if not reported.is_relative_to(OUTPUT_ROOT):
         # ComfyUI does not do this; a custom node with a hardcoded path could.
         # Never name it in a URL — hub.py would refuse to serve it anyway, and
         # this way the refusal is not the only thing standing there.
         log(f"warning: output {subfolder}/{filename} resolves outside {OUTPUT_ROOT} — not served")
-        return workspace
+        return workspace, ""
 
     if reported.is_relative_to(ws_root):
-        return subfolder  # already scoped, by the prefix rewrite
+        return subfolder, filename  # already scoped, by the prefix rewrite
 
     if not reported.exists():
         # A node reported a file it did not write, or something else removed
@@ -699,7 +741,7 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> str:
         # name the place it belonged rather than the shared root it did not.
         log(f"note: output {subfolder}/{filename} is not on disk — "
             f"reporting it under workspace {workspace}")
-        return f"{workspace}/{subfolder}".rstrip("/")
+        return f"{workspace}/{subfolder}".rstrip("/"), filename
 
     destination = ws_root / subfolder / filename
 
@@ -713,9 +755,9 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> str:
         # Still inside OUTPUT_ROOT, just not namespaced. Serving it from where
         # it really is beats reporting a URL for a file that is not there.
         if reported.exists():
-            return subfolder
+            return subfolder, filename
 
-    return f"{workspace}/{subfolder}".rstrip("/")
+    return f"{workspace}/{subfolder}".rstrip("/"), filename
 
 # END OUTPUT WORKSPACES
 # ---------------------------------------------------------------------------
@@ -981,11 +1023,22 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
     Pull the output manifest from /history. The WebSocket 'executed' events also
     carry it, but history is authoritative and survives a reconnect.
 
-    Each entry's subfolder is resolved through output_subfolder() first
-    (docs/10-roadmap.md, Q3), so what the browser is handed is where the file
-    is inside this submitter's workspace — not where a save node happened to
-    put it. The reported subfolder is rewritten as well as the url, because it
-    is what a caller reading the manifest itself would join a path from.
+    Each entry's subfolder AND filename are resolved through output_subfolder()
+    first (docs/10-roadmap.md, Q3 / FIX 4a), so what the browser is handed is
+    where the file is inside this submitter's workspace — not where a save
+    node happened to put it, and not whatever string ComfyUI (or a hostile
+    custom node) put in the manifest's `filename` field. Before FIX 4a this
+    loop confined subfolder but then concatenated the RAW filename into the
+    URL verbatim, so a manifest entry like {subfolder: "", filename:
+    "../../OUTSIDE/secret.txt"} produced a URL that resolved outside
+    OUTPUT_ROOT even though output_subfolder() itself never named a path
+    outside it — a confinement gap in the URL, not in the filesystem
+    (hub.py's /outputs endpoint independently refuses to serve the result).
+    output_subfolder() returning "" for filename now means "refused, do not
+    build a URL for this output at all", and the assert below is the same
+    invariant checked again, independently of how the URL was built — a
+    manifest entry that fails it is a bug in this function, not in the
+    filename.
     """
     try:
         entry = comfy_get(f"/history/{prompt_id}").get(prompt_id, {})
@@ -996,14 +1049,33 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
 
     for node_output in (entry.get("outputs") or {}).values():
         for image in node_output.get("images", []):
-            filename = image.get("filename")
-            subfolder = output_subfolder(workspace, image.get("subfolder") or "", filename)
+            raw_filename = image.get("filename")
+            subfolder, filename = output_subfolder(workspace, image.get("subfolder") or "", raw_filename)
+
+            if not filename:
+                continue  # refused as unsafe by output_subfolder() — never named in a URL
+
+            url = f"/outputs/{subfolder}/{filename}".replace("//", "/")
+
+            # Defense in depth: output_subfolder() should already guarantee
+            # this, but the URL is what actually reaches the browser, so it
+            # is what gets checked, independently of the function that built
+            # it. A violation here means the confinement contract itself
+            # broke, so it is loud rather than swallowed into a "warning" log
+            # line the way a hostile INPUT is above.
+            resolved = (OUTPUT_ROOT / url[len("/outputs/"):]).resolve()
+            if not resolved.is_relative_to(OUTPUT_ROOT):
+                raise RuntimeError(
+                    f"confinement invariant broken: {url!r} (from subfolder={subfolder!r}, "
+                    f"filename={filename!r}, raw_filename={raw_filename!r}) resolves to "
+                    f"{resolved}, outside {OUTPUT_ROOT}")
+
             images.append(
                 {
                     "filename": filename,
                     "subfolder": subfolder,
                     "type": image.get("type"),
-                    "url": f"/outputs/{subfolder}/{filename}".replace("//", "/"),
+                    "url": url,
                 }
             )
 

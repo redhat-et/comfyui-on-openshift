@@ -116,6 +116,19 @@ cannot see is the directory *mode*: it runs one agent as one UID, and the bug
 it would be looking for needs two pods with two different arbitrary UIDs on
 EFS. `scripts/lint.sh` pins the mode instead.
 
+**A save node's `filename_prefix` is rewritten into the workspace, and a
+traversal through it is refused.** Every workflow every other check submits is
+a bare `KSampler` with no `filename_prefix` input, so `scope_workflow_outputs()`
+(`worker_agent.py`) finds nothing to rewrite anywhere else in this suite —
+without this, every agent log line in a full run reads "0 save node(s)
+rewritten", and half of Q3 is never actually exercised. `check-60` gives one
+workflow a `SaveImage` node and asks `fake_comfy.py` what `filename_prefix` it
+actually received (its output manifest is the same either way, so that alone
+cannot prove the rewrite happened): a plain prefix must arrive already moved
+inside the submitter's workspace, and one carrying `..` must never arrive at
+all — the job fails first, naming the prefix, with no GPU spent on a workflow
+that was always going to be refused.
+
 **The queue payload envelope round-trips, and tolerates both vintages.** A
 submitted job carries `schema_version` plus the four fields reserved for later
 roadmap items, each with its default, and the test reads them off the raw Redis

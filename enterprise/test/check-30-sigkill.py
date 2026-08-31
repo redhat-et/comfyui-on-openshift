@@ -57,6 +57,23 @@ import json, os, signal, subprocess, sys, time, urllib.request, uuid
 import redis
 import websocket
 
+from queue_watch import QueueWriteWatcher
+
+# Line-buffer stdout explicitly, rather than trust the interpreter to pick
+# line buffering on its own. It only does that for a TTY; run.sh's stdout is
+# a pipe (through `make test`, and again through whatever the caller does
+# with it), so by default CPython fully buffers stdout in blocks and every
+# PASS/FAIL line sits in that buffer until enough output accumulates or the
+# process exits normally. drain() below can hang under a wrong
+# implementation until run.sh's CHECK_TIMEOUT kills this process with a
+# plain SIGTERM -- no handler is installed for it, so the interpreter is torn
+# down without running its normal atexit flush, and every line still sitting
+# in that buffer is lost with it. Line buffering writes each PASS/FAIL (and
+# each print()) through to the pipe as soon as its newline lands, so the
+# diagnostic survives a kill that gives the process no chance to clean up
+# after itself.
+sys.stdout.reconfigure(line_buffering=True)
+
 GW = "http://127.0.0.1:8100"
 COMFY = "http://127.0.0.1:8999"
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
@@ -104,12 +121,33 @@ def drain(job_id, timeout=60):
     the terminal types below, so if the gateway emits one the loop simply
     keeps reading past it — which is exactly the "a browser tailing the
     stream does not stop at it" claim, proven structurally rather than by a
-    special case."""
+    special case.
+
+    `timeout` is a wall-clock deadline, checked every iteration, not a value
+    handed to ws.settimeout() once and left there. hub.py's own /ws/{job_id}
+    sends a 'ping' every 15s whenever nothing new is on the stream (its own
+    keepalive, so a browser tab notices a socket that died silently) — and a
+    ping resets ws.recv()'s per-call timeout right back to its own full
+    length. Against a wrong implementation that never emits a terminal event
+    at all, that ping arrives well inside any reasonable per-call timeout, so
+    recv() never actually raises: the loop skips the ping, as it must, and
+    waits again — forever, regardless of what `timeout` says, until run.sh's
+    CHECK_TIMEOUT kills the whole process. Recomputing the remaining time
+    before every recv() and shrinking ws.settimeout() to match is what makes
+    `timeout` an actual ceiling on the wait: a run with no terminal event ends
+    at `timeout` seconds no matter how many pings land inside that window.
+    """
     ws = websocket.WebSocket()
     ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
+    deadline = time.time() + timeout
     seen, terminal = [], None
     while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"  drain({job_id}): no terminal event within {timeout}s "
+                  f"-- gave up; events seen so far: {seen}")
+            break
+        ws.settimeout(remaining)
         try:
             m = json.loads(ws.recv())
         except Exception:
@@ -180,6 +218,21 @@ try:
     job = post("/api/generate", {"workflow": {probe: {"class_type": "KSampler"}}})
     job_id = job["job_id"]
 
+    # Armed now, after the submit above's own (legitimate) insert, so it
+    # counts only what happens to comfy:queue from here on: the reaper's one
+    # required requeue, and nothing else. Reading LLEN once the job has
+    # finished cannot prove "exactly once" or even "at all" -- the only agent
+    # able to pop a requeued entry off this queue is the same one under test,
+    # so by the time a terminal event has been drained any entry that ever
+    # existed is already gone (queue_watch.py). Watching the write itself
+    # instead makes "exactly once" a count of commands actually issued, not
+    # an inference from a length that reads 0 whichever way this went.
+    queue_watcher = QueueWriteWatcher(
+        os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
+        os.environ.get("REDIS_PASSWORD") or None,
+        QUEUE_KEY,
+    ).start()
+
     deadline = time.time() + 10
     picked_up = False
     phase_at_pickup = None
@@ -225,8 +278,14 @@ try:
           "retry ran it once in total, rather than replaying a run",
           comfy_saw(probe), probe)
 
-    check("comfy:queue is empty once the retried job finished",
-          r.llen(QUEUE_KEY) == 0, r.llen(QUEUE_KEY))
+    queue_writes, queue_write_cmds = queue_watcher.stop()
+    check("the reaper wrote this job back onto comfy:queue exactly once -- "
+          "not zero (which the 'retry' event and attempt_count above would "
+          "already have caught) and not twice (a double-push that an "
+          "after-the-fact LLEN read could never distinguish from a single "
+          "one, since the only agent able to pop either entry is the same "
+          "one already proven to have completed the job)",
+          queue_writes == 1, queue_write_cmds)
 
     print("\n== B: SIGKILL after execution began -> stays a single terminal failure, never requeued")
 
@@ -234,6 +293,17 @@ try:
     # dies mid-generation, so this check needs no third process.
     job = post("/api/generate", {"workflow": {"__slow__": {"class_type": "KSampler"}}})
     job_id = job["job_id"]
+
+    # Same reasoning as scenario A's watcher: armed after this job's own
+    # initial insert, so what it counts from here is only a wrongly-issued
+    # requeue -- which must be zero, since this death happens after execution
+    # began and must stay a single terminal failure.
+    queue_watcher = QueueWriteWatcher(
+        os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
+        os.environ.get("REDIS_PASSWORD") or None,
+        QUEUE_KEY,
+    ).start()
+
     time.sleep(3)          # let agent2 pick it up and get into the job, well
                             # past ComfyUI's acceptance of the prompt
 
@@ -259,8 +329,13 @@ try:
     check("job state agrees", state.get("status") == "failed", state)
     check("attempt_count stayed at 0 -- this death was never retried",
           state.get("attempt_count") in (None, "0"), state.get("attempt_count"))
-    check("comfy:queue is empty after -- the job was not put back",
-          r.llen(QUEUE_KEY) == 0, r.llen(QUEUE_KEY))
+
+    queue_writes, queue_write_cmds = queue_watcher.stop()
+    check("comfy:queue never received a write for this job -- the death was "
+          "not put back, proven as the absence of the LPUSH/RPUSH/LINSERT a "
+          "requeue would have to issue rather than an LLEN read that would "
+          "show 0 either way (queue_watch.py)",
+          queue_writes == 0, queue_write_cmds)
 
     print("\n== the dead worker (agent2) drops out of the registered count")
     deadline = time.time() + 30

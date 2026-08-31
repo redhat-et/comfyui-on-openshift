@@ -145,13 +145,15 @@ $("submit").onclick = async () => {
   const job = await res.json();
   jobId = job.job_id;
   $("cancel").disabled = false;
-  // Since Q1 (docs/10-roadmap.md), queue_depth here is this job's
-  // fair-queueing position — how many jobs will actually be served before it
-  // — not a raw snapshot of the list length; the two differ once more than
-  // one submitter is queued. The "queue N" figure in the status line above
-  // comes from a separate call (refreshStats -> /api/stats) and is still the
-  // plain total backlog, unaffected by fairness.
-  say(`Queued as ${jobId} (${job.queue_depth} ahead).`);
+  // Since Q1 (docs/10-roadmap.md), /api/generate returns queue_position, not
+  // a queue_depth: this job's fair-queueing position — how many jobs will
+  // actually be served before it — not a raw snapshot of the list length;
+  // the two differ once more than one submitter is queued. The "queue N"
+  // figure in the status line above comes from a separate call
+  // (refreshStats -> /api/stats) and IS still the plain total backlog,
+  // unaffected by fairness — same word, deliberately different field name,
+  // so the two are never confused reading the response alone.
+  say(`Queued as ${jobId} (${job.queue_position} ahead).`);
   say("If the GPU pool is scaled to zero, the first job waits on a node — this can take 10+ minutes.");
 
   watch(jobId);

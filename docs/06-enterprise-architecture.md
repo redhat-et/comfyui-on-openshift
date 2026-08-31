@@ -187,6 +187,19 @@ no login. The GPU pods stay unreachable either way, so this is not catastrophic,
 but anyone who finds the hostname can spend your GPU budget — and Route
 hostnames appear in certificate transparency logs within minutes.
 
+It also means more than budget once output workspaces (above) are in the
+picture. `X-Forwarded-User` is client-supplied in this mode — `hub.py` says
+so in three places — so nothing stops a caller from setting it to someone
+else's identity. The worker does not know the difference: it writes into
+whatever workspace that header names, and an existing file of the same name
+there is silently overwritten. Under `AUTH_MODE=none` this is not a
+bypass of anything — nobody is authenticated, so there is no "other user"
+this mode was ever protecting — but it does mean a caller can overwrite
+another *named* user's prior outputs, not just spend GPU time, with nothing
+but a header of their choosing. `AUTH_MODE=oauth` is what makes
+`X-Forwarded-User` trustworthy again: the proxy sets it from a real login,
+so a caller can no longer simply assert someone else's name.
+
 ## ComfyUI-Manager and auto-downloaders
 
 Off by default (`ENABLE_MANAGER=false`), for two reasons. (The single-user
@@ -238,7 +251,7 @@ format rather than behind a button in a shared UI.
   identity the gateway can trust in *both* modes; that is a different item
   from this one, and it is not here.
 
-  Two smaller consequences worth knowing. Usernames are sanitized to an
+  Three smaller consequences worth knowing. Usernames are sanitized to an
   allowlist slug plus a hash of the original, so an output directory is
   readable ("alice-smith-example-com-7dcd3a39ad3a") without two different
   usernames ever sharing one; nothing is rejected for the *shape* of a
@@ -247,6 +260,21 @@ format rather than behind a button in a shared UI.
   contains `..` or an absolute path: ComfyUI treats that prefix as a subpath
   of its output directory, the caller wrote it, and it has an unambiguous
   safe form.
+
+  The third is the sharper way to say what "not a security boundary" means
+  in practice: `workspace_name()` (`worker_agent.py`) is a **pure, publicly
+  computable function of the username** — allowlist-slug the string, append
+  12 hex characters of `sha256(username)`, nothing else. The algorithm is
+  in this file's git history and in the worker's own source, and it takes no
+  secret as input. So a caller does not need to have SEEN one of alice's URLs
+  to read her outputs; knowing (or guessing) her username is enough to
+  *compute* `workspace_name("alice@example.com")` offline and construct the
+  path directly, the same way anyone can today. That is a strictly stronger
+  reach than "the URL is unguessable but discoverable" — it needs no
+  discovery step at all. It is still the deliberate trade this section
+  opens with (organisation, not isolation), not a bug: fixing it means
+  answering the identity question above, not hashing the workspace name
+  harder.
 - **Job priority.** Still not here, on purpose, and the reasoning changed once
   `docs/10-roadmap.md` (Q1) landed fair queueing. A priority lane needs a claim
   from the caller — "I'm interactive" — and the only identity this gateway can

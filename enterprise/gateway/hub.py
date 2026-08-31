@@ -985,6 +985,17 @@ async def generate(request: Request):
     # raw list-length snapshot once more than one lane is active, which is the
     # whole point. The overall backlog size (unaffected by fairness — it is
     # still one list) stays available from gather_stats()'s queue_depth.
+    #
+    # NAMING: this is a POSITION (how many jobs ahead of this one), not a
+    # DEPTH (how many jobs total). Before this comment the response field and
+    # the state hash field below were both spelled "queue_depth", identically
+    # to gather_stats()'s real backlog length in /api/stats and /metrics —
+    # same name, two different quantities, and the two only ever agree when
+    # exactly one submitter is queued. A reader of comfy:job:{id}:state
+    # directly (no docs in front of them) had no way to tell which one they
+    # were looking at. Renamed here rather than documented in place, because
+    # unlike a doc comment the field name travels with the value to every
+    # place it is read.
     keys, args = fair_enqueue_call(envelope)
     _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
 
@@ -993,7 +1004,7 @@ async def generate(request: Request):
     # missing phase as "unknown, do not retry", and the window between a
     # worker's BLMOVE and its first HSET would otherwise land a genuinely
     # pre-execution death in that bucket.
-    state = {"status": "queued", "queue_depth_at_submit": position,
+    state = {"status": "queued", "queue_position_at_submit": position,
              PHASE_FIELD: PHASE_QUEUED}
 
     if user:
@@ -1007,7 +1018,7 @@ async def generate(request: Request):
     await conn.xadd(stream_key(job_id), {"data": json.dumps({"type": "queued", "data": {"position": position}})})
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
 
-    return {"job_id": job_id, "status": "queued", "queue_depth": position}
+    return {"job_id": job_id, "status": "queued", "queue_position": position}
 
 
 @app.get("/api/jobs/{job_id}")

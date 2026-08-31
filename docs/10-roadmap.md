@@ -195,8 +195,8 @@ was wrong.
 
 | ID | Change | Effort | Risk | Lane | Proven by |
 |---|---|---|---|---|---|
-| Q1 | Fair queueing across submitters | Medium | Medium | Queue | e2e: a 5-job batch from one user does not delay a second user's single job |
-| Q2 | Phase breadcrumbs + retry only pre-execution deaths | Medium | **High** | Queue | e2e: a death before submit is retried once; a poison workflow fails once and is not requeued |
+| Q1 | Fair queueing across submitters — **landed** | Medium | Medium | Queue | `enterprise/test/check-50-fair-queue.py`: a whole batch queued by one submitter does not delay a single job from a second submitter behind it — round-robin by `queue_key`, the pop itself (`BLMOVE` into the per-worker processing list) unchanged. `bench-fair-enqueue.py` separately measures what one insert costs Redis at a realistic queue depth |
+| Q2 | Phase breadcrumbs + retry only pre-execution deaths — **landed** | Medium | **High** | Queue | `enterprise/test/check-30-sigkill.py` and `check-35-retry-doors.py`: a worker killed before ComfyUI ever saw the workflow is requeued exactly once; a worker killed mid-execution gets one terminal `failed` naming the dead worker and is never requeued; the `phase` breadcrumb is durable *before* the `/prompt` POST returns, not after; and a job the user already cancelled is neither requeued by the reaper nor ever submitted by a worker that pops it |
 | Q3 | Per-user output workspaces — **landed**, laptop half | Medium | **High** | Queue + cluster | `enterprise/test/check-60-user-workspaces.py`: two submitters land in two places, a hostile username is confined rather than mangled or escaped, and an anonymous submission still works and does not alias onto a real user — plus lint shapes for the directory mode. The arbitrary-UID half is on the cluster-day list below |
 | Q6 | Estimated-wait metric | Small | Low | Queue | e2e on the gauge; the scaler half is I4 |
 | Q4 | Showback report | Small | Low | Queue | e2e: GPU seconds attributed to the right user, with a bounded key set |
@@ -215,7 +215,10 @@ was wrong.
   priority is "a small change to `worker_agent.py`". The source uses `BLMOVE`
   into a per-worker processing list — a §3 invariant the reaper depends on — so
   the change moves the pop, the depth gate, the KEDA trigger's single
-  `listName`, and the client-visible `queue_depth`/`position` shape together.
+  `listName`, and the client-visible `queue_position`/`position` shape
+  together — deliberately not named `queue_depth`, which stays reserved for
+  `/api/stats`' and `/metrics`' real backlog length; see FIX 4d in this
+  branch's history for why the two were worth telling apart by name.
 - **I2's proof does not exist yet.** CI has no GPU image build at all, by
   design, and the arbitrary-UID job covers only the gateway image — whose
   Containerfile deliberately has no `chgrp 0` block. I2 must **build** its own

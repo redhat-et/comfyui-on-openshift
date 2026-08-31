@@ -22,7 +22,7 @@ on HEAD every job below — different users, hostile users, no user at all —
 resolves to the exact same flat URL. Every assertion here that checks for a
 non-flat, per-submitter workspace therefore fails on HEAD by construction.
 
-Three things this check proves, matching the roadmap's item text:
+Four things this check proves, matching the roadmap's item text:
 
   (a) two users' outputs land in separate PLACES (not just separate
       filenames) and each is served correctly from its own place.
@@ -40,6 +40,20 @@ Three things this check proves, matching the roadmap's item text:
       AUTH_MODE=none case with no proxy in front), the system still works,
       and "no user" is not silently aliased onto whichever real username
       happens to submit next.
+  (d) a save node's filename_prefix (scoped_prefix() / scope_workflow_outputs()
+      in worker_agent.py — the other half of Q3, alongside output_subfolder()
+      which (a)-(c) above already exercise) is actually rewritten into the
+      submitter's workspace before the workflow reaches ComfyUI, and a
+      traversal attempt through it is refused rather than honoured. Every
+      workflow every OTHER check in this suite submits is a bare KSampler
+      with no filename_prefix input at all, so scope_workflow_outputs() finds
+      nothing to rewrite anywhere else — every agent log line in a full
+      `make test` run reads "0 save node(s) rewritten" without this. Proven
+      by asking the stub what filename_prefix it actually received
+      (fake_comfy.py's /__received_prefixes__), not by anything the gateway
+      hands back — the stub's output manifest is the same
+      {out_0001.png, ""} regardless of this input, so it cannot tell a
+      rewritten prefix from an unrewritten one.
 
 This file does not touch enterprise/gateway/hub.py or
 enterprise/worker/worker_agent.py. check-10-stream.py's flat-URL pin (its
@@ -51,10 +65,11 @@ text. The path-traversal assertion later in that same file
 that this endpoint's static guard holds for ANY path, not that outputs are
 namespaced per user.
 """
-import json, os, pathlib, sys, time, urllib.error, urllib.request
+import json, os, pathlib, sys, time, urllib.error, urllib.request, uuid
 import websocket
 
 GW = "http://127.0.0.1:8100"
+COMFY = "http://127.0.0.1:8999"
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
 failures = []
 
@@ -112,6 +127,42 @@ def submit_and_wait(user, timeout=15):
     terminal = drain(resp["job_id"], timeout=timeout)
     images = (terminal or {}).get("data", {}).get("images", [])
     return images[0]["url"] if images else None
+
+
+def submit_with_save_node(user, prefix, timeout=15):
+    """Like submit_and_wait, but the workflow also carries a SaveImage node
+    whose filename_prefix is the thing under test -- scope_workflow_outputs()
+    (worker_agent.py) is the only code in this whole system that ever reads
+    this input, and every OTHER workflow in this suite (including
+    submit_and_wait's own) omits it entirely. The node id is unique per call
+    so fake_comfy's /__received_prefixes__ can be read for exactly this
+    submission with no risk of reading a stale value a previous call left
+    behind under the same key.
+
+    Returns (terminal_event, node_id) -- not a URL, because the property
+    under test here is what ComfyUI actually received, not what the gateway
+    reported back afterward."""
+    headers = {"Content-Type": "application/json"}
+    if user is not None:
+        headers["X-Forwarded-User"] = user
+    node_id = f"save-{uuid.uuid4().hex[:8]}"
+    workflow = {
+        "3": {"class_type": "KSampler", "inputs": {}},
+        node_id: {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix}},
+    }
+    req = urllib.request.Request(
+        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
+    )
+    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    return drain(resp["job_id"], timeout=timeout), node_id
+
+
+def received_prefix(node_id):
+    """The filename_prefix fake_comfy actually saw for `node_id` on the most
+    recent /prompt that carried it -- None if it never arrived (the traversal
+    case below, which must fail before ever reaching ComfyUI)."""
+    body = json.loads(urllib.request.urlopen(COMFY + "/__received_prefixes__", timeout=10).read())
+    return body.get(node_id)
 
 
 def workspace_dirs(url):
@@ -238,6 +289,54 @@ check("the anonymous workspace is not the same place as a real "
       "next real username happens to be",
       bool(dirs_anon) and bool(dirs_carol) and dirs_anon[0] != dirs_carol[0],
       (dirs_anon, dirs_carol))
+
+# ---------------------------------------------------------------------------
+# (d) a save node's filename_prefix is rewritten into the submitter's
+#     workspace, and a traversal attempt through it is refused
+# ---------------------------------------------------------------------------
+print("\n== (d) a save node's filename_prefix is rewritten into the submitter's workspace")
+
+BASE_PREFIX = "myrun"
+
+seed_output()
+terminal_dave, node_id = submit_with_save_node("dave", BASE_PREFIX)
+check("the save-node job still completes",
+      terminal_dave and terminal_dave["type"] == "completed", terminal_dave)
+
+images = (terminal_dave or {}).get("data", {}).get("images", [])
+url_dave = images[0]["url"] if images else None
+dave_dirs = workspace_dirs(url_dave)
+check("dave's job still produced its own workspace directory (as in (a) "
+      "above -- the SaveImage node does not change output_subfolder()'s "
+      "half of Q3)",
+      bool(dave_dirs), url_dave)
+
+expected_prefix = f"{dave_dirs[0]}/{BASE_PREFIX}" if dave_dirs else None
+got_prefix = received_prefix(node_id)
+check(f"the save node's filename_prefix reached ComfyUI already rewritten "
+      f"to live inside dave's own workspace ({expected_prefix!r}), not left "
+      f"as the bare {BASE_PREFIX!r} the workflow was submitted with -- proof "
+      f"scope_workflow_outputs() actually ran, not just that it claims 0 "
+      f"rewrites everywhere else in this suite",
+      dave_dirs and got_prefix == expected_prefix, got_prefix)
+
+print("\n== (d) a filename_prefix containing '..' is refused rather than honoured")
+
+seed_output()
+terminal_evil, evil_node_id = submit_with_save_node("dave", "../../evil")
+check("a filename_prefix carrying a '..' segment fails the job instead of "
+      "writing outside the workspace",
+      terminal_evil and terminal_evil["type"] == "failed", terminal_evil)
+
+err = (terminal_evil or {}).get("data", {}).get("error", "")
+check("the failure names filename_prefix and the offending segment, so the "
+      "caller can fix it",
+      "filename_prefix" in err and ".." in err, err[:200])
+
+check("the rejected workflow never reached ComfyUI at all -- scoped_prefix() "
+      "raises before the job is ever submitted, so nothing here spent a GPU "
+      "on a workflow that was going to be refused",
+      received_prefix(evil_node_id) is None, received_prefix(evil_node_id))
 
 print()
 if failures:
