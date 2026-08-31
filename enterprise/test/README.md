@@ -35,7 +35,10 @@ same event sequence. Browsers sleep and gateway pods roll.
 **Failures surface with their reason.** A workflow ComfyUI rejects produces a
 `failed` event carrying ComfyUI's own message, not a generic error. The
 difference between "failed" and "failed: required input is missing: ckpt_name"
-is most of the support burden.
+is most of the support burden. It is also not retried (docs/10-roadmap.md,
+Q2): the agent that submitted it never died, so this never goes through the
+reaper's worker-death path at all, whatever phase breadcrumb it happens to
+share with a job that *would* be retried.
 
 **Cancel works** on a job in flight.
 
@@ -46,13 +49,20 @@ pool scales to zero, so termination is routine. Without it, every scale-down
 throws away whatever was rendering and leaves a browser on a progress bar that
 never moves.
 
-**SIGKILL still surfaces a terminal event.** SIGTERM is the polite case; an OOM
-kill or node reclaim gives no warning at all. The test SIGKILLs the agent
-mid-job and asserts the gateway's reaper fails the stranded job with a reason
-naming the dead worker (the agent parks each job in a per-worker processing
-list and holds a TTL'd heartbeat — see point 5 in `worker_agent.py`), and that
-the dead worker drops out of `/api/stats` on its own. Deliberately `failed`,
-not requeued: a workflow that OOM-killed one worker would kill the next too.
+**SIGKILL still surfaces a terminal event — and whether it's retried depends on
+when.** SIGTERM is the polite case; an OOM kill or node reclaim gives no
+warning at all. The agent parks each job in a per-worker processing list and
+holds a TTL'd heartbeat — see point 5 in `worker_agent.py` — and the gateway's
+reaper notices a lapsed heartbeat and acts on the stranded job. What it does
+depends on the `phase` breadcrumb on the job's own state (docs/10-roadmap.md,
+Q2): a worker SIGKILLed before ComfyUI ever saw the workflow (still blocked
+waiting on ComfyUI's acceptance) has its job requeued exactly once, as a
+non-terminal `retry` event a tailing browser does not stop at, and a second
+agent completes it. A worker SIGKILLed after execution began gets the original
+behavior unchanged — one terminal `failed` naming the dead worker, never
+requeued, and it drops out of `/api/stats` on its own — because a workflow
+that OOM-killed one worker would OOM-kill whichever worker it was requeued
+onto next.
 
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.

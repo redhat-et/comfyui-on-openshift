@@ -15,6 +15,14 @@ export BOOT_TIMEOUT=30 RECV_TIMEOUT=5 JOB_TIMEOUT=60
 # production-default minutes. TTL must still exceed RECV_TIMEOUT above.
 export HEARTBEAT_TTL=10 REAPER_INTERVAL=2
 
+# The absolute path to the real worker agent. Every check gets a live agent's
+# pid as argv[1] (see start_agent below), but check-30-sigkill.py's retry
+# assertions (docs/10-roadmap.md, Q2) kill that agent mid-check and then need
+# to prove a *second*, freshly-started one drains the retried job — something
+# only possible between checks otherwise. $WORK holds copies of the checks and
+# fixtures, not the agent itself, so the check needs this to spawn one.
+export WORKER_AGENT="$REPO/enterprise/worker/worker_agent.py"
+
 # Wall-clock ceiling per check. A kill switch, not a budget: every check here
 # finishes in well under a minute, and one that does not has hung. It is a
 # single number on purpose — a check needing a different one would be a second
