@@ -56,10 +56,13 @@ a minute. Nervous: the cold start is a real user-facing weakness and the first
 thing a designer will complain about, which section 8 addresses and
 [`10-roadmap.md`](10-roadmap.md) schedules. Nervous: Redis is a single instance
 with AOF persistence, which survives a pod restart and not a zone outage.
-Nervous: a failed job is failed, not requeued — deliberately, for a reason
-given in [`06-enterprise-architecture.md`](06-enterprise-architecture.md), but
-it means a node reclaim mid-render costs a user their generation and you will
-hear about it before you hear about anything else on this list.
+Nervous: a job that dies *mid-render* is failed, not requeued — deliberately,
+for a reason given in [`06-enterprise-architecture.md`](06-enterprise-architecture.md)
+that a node reclaim does not change, so a reclaim mid-render still costs a user
+their generation and you will hear about it before you hear about anything else
+on this list. (Only the narrow case is retried: a worker that died before
+ComfyUI was ever handed the workflow, where there is nothing to replay. Section
+3 has the row.)
 
 ---
 
@@ -160,11 +163,14 @@ miserable to reproduce.
 | Bounded `recv()` timeout and a job deadline | `worker_agent.py`, note 3 | A wedged ComfyUI parks the agent forever. The pod stays `Running` and `Ready`, stops consuming the queue, reports nothing — and KEDA, seeing a growing queue, adds *more* workers beside the dead one. |
 | SIGTERM trap that drains the running job | `worker_agent.py`, note 4 / `start.sh` | The pool scales to zero, so termination is routine. Without the trap, every scale-down discards whatever was rendering. |
 | `BLMOVE` into a per-worker processing list + TTL'd heartbeat | `worker_agent.py`, note 5 | SIGKILL (OOM, node reclaim) strands the job with no terminal event. The gateway's reaper depends on the heartbeat lapsing. |
+| The `phase` breadcrumb is written **before** the transition it describes — for `executing`, before the POST is sent and not after it returns — the reaper checks `cancel_requested` **before** requeueing, the retry counter moves only by `HINCRBY`, and `retry` is not in `TERMINAL_TYPES` | `worker_agent.py`, note 6 / `hub.py`, the reaper | Four ways to break one mechanism. A breadcrumb written after the fact leaves a window in which the job is executing and the record says it is not — which is exactly when the reaper replays a workflow that already killed one worker onto the next one. ComfyUI has the workflow from the moment the POST is *written*, so "after `submit_prompt()` returns" is after the fact: the round trip is the window, it is as long as a loaded ComfyUI takes to answer, and `check-35-retry-doors.py` kills a worker inside it. Erring early costs a death inside the POST its retry; erring late costs a poison workflow walking the pool. A cancelled job is at a retryable phase *because* the cancel stopped it early, so a reaper that does not look at the flag requeues precisely the work the user withdrew, resets its status to `queued`, and hands it to a second worker. A counter read-then-written is a lost update between the two gateway replicas' reapers: both read 0, both believe they are the first attempt, one job becomes two on one GPU pool (`RPOP` being atomic bounds failing a job once and does **not** bound requeueing it once). And `retry` joining the terminal set closes every tailing browser on the retry, so the second attempt runs to completion and the user is looking at a failure. |
 | Redis Streams, not pub/sub | `hub.py` | Pub/sub delivers only to subscribers connected at publish time. The POST and the WebSocket open are two round trips — the gap is the common case. |
 | `maxmemory-policy noeviction` + `MAX_QUEUE_DEPTH` | `00-redis.yaml`, `hub.py` | The default evicts queued jobs, which presents as work vanishing at random. |
+| The fair-queueing insert **adds one entry with `LINSERT` and never rewrites the list**, and the entry it adds **carries no workflow** | `hub.py`, `FAIR_ENQUEUE_LUA` / `fair_enqueue_call()` / `scripts/lint.sh` | Two ways to break one script, and it runs on every `/api/generate`. Redis executes one command at a time, so whatever this script does, every other client waits for it — including every worker parked in `BLMOVE`, which is to say the pool stops being handed work. Placing a job fairly means reading every job already queued, so what each entry costs to read is what a submit costs everybody: with 26 KB workflows in the list, one submit against a 499-deep queue measured ~118 ms of exclusive Redis time, and ~1.2 s with 103 KB ones. The workflow therefore lives at `comfy:job:<id>:payload` and the list carries a few hundred bytes of ordering record, which puts both cases at ~2 ms and makes the cost independent of a size the *client* chooses (up to `MAX_BODY_BYTES`). Separately: Redis does not roll back a partial script, so a version that `DEL`s the queue and pushes it back has a window in which any error loses **every queued job at once** — that is the same "work vanishing at random" the row above exists to prevent, arriving by a door `noeviction` does not cover, and it is not hypothetical: an error injected after the `DEL` empties a 10-deep queue. `LINSERT` splices against a pivot and touches nothing else, so there is no such window and `LLEN` is monotonic across a submit (which is also what the KEDA trigger reads). Both halves are invisible to `make test`, which runs a three-deep queue of two-node workflows where every version of this script is instant and correct. |
 | `haproxy.router.openshift.io/timeout: 4h` **and `timeout-tunnel`** on every Route | `enterprise/manifests/` | HAProxy's 30-second default kills long generations mid-render and reads exactly like an application bug. On edge and reencrypt Routes only `timeout-tunnel` governs the upgraded WebSocket, against a one-hour router default — setting `timeout` alone still drops long jobs. Both annotations, or neither works. |
 | The `chgrp 0` / `chmod g=u` block in both Containerfiles | `app/Containerfile`, `enterprise/worker/Containerfile` | OpenShift runs the container as an arbitrary high UID with GID 0. Without it, ComfyUI cannot write `temp/`, `input/`, `user/` and the pod crash-loops. This is the single most common OpenShift containerisation failure. |
 | GPU pods sized to fit the smallest supported instance, requests equal to limits | `enterprise/manifests/02-worker.yaml`, `manifests/base/deployment.yaml` | The 16 GiB of *host* RAM on a `g6.xlarge` is not the card's 24 GB of VRAM. A memory limit above what one pod can hold on that node is unreachable, so the real ceiling becomes node pressure: an eviction, or a kernel OOM kill of ComfyUI, instead of a clean container-level `OOMKilled`. Unequal requests and limits make the pod Burstable, which is evicted before Guaranteed pods and carries a far more attractive `oom_score_adj` — on a pod holding a GPU mid-generation. |
+| A per-submitter output workspace is **sanitized, then joined, then resolved, then verified inside `OUTPUT_ROOT`**, and created with an explicit group-writable setgid mode | `worker_agent.py`, note 7 / `scripts/lint.sh` | Two ways to break one mechanism. The header the workspace is named from is client-supplied under `AUTH_MODE=none`, so a join whose containment is never re-checked — or a `resolve()` done *before* the join, which proves nothing about the joined path — is an arbitrary filesystem write from an unauthenticated request. Separately, the mode is not cosmetic: OpenShift gives each pod an arbitrary high UID that is not stable across pods, so a directory created at runtime by one worker is unwritable by the next one without `g+w`, and the files ComfyUI writes inside it do not get GID 0 without `setgid`. `mkdir`'s own mode argument is masked by umask and yields `0755`, so this must be an explicit `chmod` — and it is invisible to `make test`, which runs one agent as one UID on a local filesystem where the creator owns everything. |
 | `STORAGE_MODE=rwx` for the multi-user configuration | `enterprise/setup.sh` refuses otherwise | The gateway serves images off the volume the workers write to, and they are on different nodes by construction. gp3 is `ReadWriteOnce`. |
 
 The file-level half of this table is now mechanical. `make lint` fails on a
@@ -180,6 +186,31 @@ stopped defaulting ComfyUI to loopback, and either Containerfile losing its
 no cluster and reads no manifest — so if you are about to argue with a lint
 failure naming one of them, read its row above first. The check exists
 precisely because the edit looks harmless.
+
+Six more shapes are pinned there for the opposite reason: they are in the
+Python and the shell the suite *does* run, and the suite still cannot see
+five of them. `make lint` fails on a retry counter written by anything other
+than `HINCRBY` — whose failure mode needs the two gateway replicas
+`01-gateway.yaml` runs and `enterprise/test/run.sh` starts one — and on a
+`TERMINAL_TYPES` that gained a member, which `check-30-sigkill.py` would also
+catch but which is pinned anyway, because "add the new event type to the
+terminal set" is precisely the tidying that arrives in a diff about something
+else. It also fails on an output workspace whose directory mode is no longer
+group-writable and setgid, or that is no longer set by an explicit `chmod`,
+and on a `start.sh` that hardcodes ComfyUI's `--output-directory` instead of
+taking it from the same `OUTPUT_ROOT` the agent reads. Those three are
+the arbitrary-UID row above: one agent, one UID, one local filesystem is a
+configuration in which every one of them looks fine.
+
+The last two are the fair-queueing insert's row: `make lint` fails on a
+`FAIR_ENQUEUE_LUA` that stopped splicing with `LINSERT` or that calls anything
+destructive on the queue, and on a `fair_enqueue_call()` that stopped building
+the list entry with `queue_record()` — i.e. that put the workflow back in the
+list. Both are things a diff can restore while every test still passes and
+every reading of the code still looks right, because the suite's queue is
+three jobs deep and its workflows have two nodes. Their cost is a
+hundred-millisecond stall on every client in the cluster, and a window in
+which one error empties the whole queue.
 
 `docs/07-design-review.md` is the long form: every one of these traces back to
 a specific bug in the design this was built from. Read it once, early. It is

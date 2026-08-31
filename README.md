@@ -382,7 +382,7 @@ flowchart TD
 | Failure | Handling | User-visible result |
 |---|---|---|
 | **Graceful termination** — scale-to-zero, a node drain, a rolling deploy, a spot interruption notice | The agent traps SIGTERM, stops accepting new work, and **finishes the job in flight** before exiting (`worker_agent.py`, note 4). Termination is routine on a pool that scales to zero, so this is the common path, not the exceptional one. | The generation completes normally. Asserted by the e2e suite. |
-| **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5). When the heartbeat lapses, the gateway's reaper fails the stranded job **naming the dead worker**. | `failed: worker comfy-worker-xxxx died` — loudly, rather than a progress bar that never moves. Deliberately failed and not requeued: a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices. Asserted by the e2e suite. |
+| **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5), and writes a `phase` breadcrumb as it goes (note 6). When the heartbeat lapses, the gateway's reaper reads that breadcrumb and either fails the stranded job **naming the dead worker**, or — only if the worker died before ComfyUI was ever handed the workflow — requeues it once. | Died mid-generation: `failed: worker comfy-worker-xxxx died`, loudly, rather than a progress bar that never moves. Failed and not requeued on purpose — a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices — and the message points at `oc describe pod`, which *can* tell an OOM kill from a reclaim. Died before it started: a non-terminal `retry` event the browser reads past, and a second worker finishes the job. Both asserted by the e2e suite. |
 | **ComfyUI wedges or dies mid-job** | The agent's `recv()` is bounded and each job carries a deadline (`JOB_TIMEOUT`, 1800s). On every timeout it re-checks `/history` in case a completion event was simply missed. | The job fails with a reason instead of the pod sitting `Running` and `Ready` while silently consuming nothing — which is worse than a crash, because KEDA sees a growing queue and adds more workers beside the dead one. |
 
 #### The job itself
@@ -411,6 +411,10 @@ flowchart TD
 | **No GPU capacity, or no quota** | The worker pod stays `Pending`. `make preflight` distinguishes the two — quota is a multi-day fix, capacity is a region or instance-family change. | `docs/05-troubleshooting.md`. |
 | **First job after an idle period** | Not a failure, but it looks like one: a node has to be provisioned and a ~10 GB image pulled. | 8–17 minutes, and the gateway says so rather than leaving a bar that has not moved. Removed entirely by one warm worker — see "Where this loses". |
 | **Someone requests a path outside the output directory** | Resolved and compared against the output root before anything is served. | `/outputs/../../etc/passwd` does not resolve. Asserted by the e2e suite. |
+| **A submitter's name, or a workflow's filename prefix, tries to become a path** | Both are caller-supplied and both end up on the filesystem, so both are handled as hostile. The username is sanitized to a name that cannot contain a separator, then joined, then resolved, then verified inside the output root — in that order. A `filename_prefix` carrying `..` or an absolute path is refused outright. | A username of `../../etc/passwd` gets an ordinary confined workspace rather than a traversal; a workflow trying to write outside its workspace fails with a message naming the prefix. Asserted by the e2e suite. |
+| **ComfyUI's own reported output filename tries to become a path** | Not caller-supplied, but not trusted either: `output_subfolder()` confines the reported `subfolder` *and* the reported `filename` on the same footing, and `collect_outputs()` refuses to build a served URL from either half until both pass. A filename that is not a single bare path component (a `/`, a `..`, a NUL) is dropped from the manifest outright rather than served under a rewritten name. | A node reporting `{subfolder: "", filename: "../../OUTSIDE/secret.txt"}` produces no image entry at all — not a traversal, and not a same-named file served from the wrong place either. Asserted by the e2e suite (`check-65-output-filename-confinement.py`). |
+| **Someone reads another user's output workspace** | Deliberately possible, not a bug: `/outputs/...` is served to any caller with the URL, and the workspace name a job lands in is a *pure, publicly computable* function of the username (allowlist slug + a truncated `sha256`) — no lookup or prior URL is needed, only the username itself. Output workspaces are scoped for organisation, not for isolation; see `docs/06-enterprise-architecture.md`. | Knowing (or guessing) `alice@example.com`'s username is enough to compute her workspace path and fetch whatever is in it. Real read isolation would need an identity the gateway can trust in every `AUTH_MODE`, which is a different, unbuilt item. |
+| **Under `AUTH_MODE=none`, a caller writes into someone else's workspace** | `X-Forwarded-User` is client-supplied in this mode (`hub.py` says so in three places), and the worker writes into whichever workspace that header names, overwriting an existing same-named file there. Inherent to `AUTH_MODE=none`: with nobody authenticated, there is no "someone else" for the header to misrepresent. | Setting `X-Forwarded-User: alice` writes into (and can silently overwrite) alice's output workspace, no login required — on top of the GPU budget `AUTH_MODE=none` already warns about. Run `AUTH_MODE=oauth` if either matters to you. |
 
 </details>
 
@@ -611,12 +615,14 @@ says which two of these should not be done at all.
 4. **Narrow retry, and spot separately.** These looked like one item and are
    not. Blanket retry re-runs the poison pill: a host-RAM OOM kills the pod and
    is indistinguishable at the queue level from a node reclaim, so "retry on
-   worker death" retries the workflow that will kill the next worker too. Retry
-   only jobs that died *before* ComfyUI ever saw the workflow, and add phase
-   breadcrumbs so the rest are at least diagnosable. Spot does not need retry at
-   all: an interruption gives two minutes of notice and the existing SIGTERM
-   drain finishes anything that fits in them — its real trade is that longer
-   generations are lost. *(Medium; see `docs/10-roadmap.md` before starting.)*
+   worker death" retries the workflow that will kill the next worker too. The
+   retry half has **landed** on exactly those terms: jobs that died *before*
+   ComfyUI ever saw the workflow are requeued once, phase breadcrumbs make
+   every other death diagnosable, and nothing that reached a GPU is ever
+   replayed (`docs/10-roadmap.md`, Q2). Spot never needed retry at all: an
+   interruption gives two minutes of notice and the existing SIGTERM drain
+   finishes anything that fits in them — its real trade is that longer
+   generations are lost. *(Spot remains optional; see `docs/10-roadmap.md`.)*
 5. **NVIDIA time-slicing — listed here, and not recommended.** The device
    plugin can advertise several replicas of one card, but time-slicing provides
    **no memory isolation**: co-resident workflows share the full 24 GB and their
@@ -624,10 +630,19 @@ says which two of these should not be done at all.
    a deterministic per-workflow failure into a non-deterministic one where the
    victim is whichever job allocates second. MIG partitions memory properly and
    is not available on L4. *(Revisit only on MIG-capable hardware.)*
-6. **Per-user output workspaces.** The gateway already records the
-   authenticated user on each job; threading that into the output path is the
-   remaining half. Gets you per-user galleries and makes the next item trivial.
-   *(Small.)*
+6. **Per-user output workspaces — landed.** Each job now writes into its own
+   `/output/<workspace>/`, named from the submitter's identity by the worker
+   agent, and every output that comes back is confined there whether or not
+   the save node cooperated (`docs/10-roadmap.md`, Q3). Two things it is worth
+   knowing it does *not* do. Reads are not caller-scoped: the workspaces are
+   organisation and confinement, not access control, because the only identity
+   here is a header that is client-supplied under `AUTH_MODE=none` and a
+   guarantee that evaporates in one of two modes is worse than a documented
+   absence. And usernames are sanitized rather than rejected — an oauth-proxy
+   name is an email, so `@` and `.` are the ordinary case. *(The half that
+   still needs a cluster is the directory mode: an arbitrary, unstable UID
+   means a workspace one pod creates must be group-writable and setgid for the
+   next one.)*
 7. **Showback from the data you already collect.** Job attribution plus GPU
    seconds is a monthly "who spent the card" report. In most organisations this
    changes behaviour faster than any technical control. *(Small.)*

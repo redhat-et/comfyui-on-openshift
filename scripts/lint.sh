@@ -449,7 +449,188 @@ done
 shape_require enterprise/worker/start.sh 'COMFY_HOST:-127\.0\.0\.1' \
     "ComfyUI in the GPU pod must default to loopback. The pod has no Service and no Route, so the agent beside it is the only way in; binding 0.0.0.0 publishes unauthenticated arbitrary code execution on a node holding cloud credentials"
 
+# Q2's non-terminal retry event (docs/10-roadmap.md). check-30-sigkill.py would
+# also catch this one, and it is pinned anyway: "add the new event type to the
+# terminal set" is the kind of tidying that arrives inside a diff about
+# something else, and the row above says what it costs.
+shape_require enterprise/gateway/hub.py \
+    '^TERMINAL_TYPES = \{"completed", "failed", "cancelled"\}$' \
+    "the set of event types that END a progress stream is exactly these three. Adding the retry event to it (or renaming one of them) makes every tailing browser stop reading at the retry and sit on a dead socket while the second attempt runs to completion behind it — the job succeeds and the user never sees it"
+
+# Q3's per-user output workspaces (docs/10-roadmap.md). Both halves below are
+# invisible to enterprise/test/run.sh by construction: it runs one agent, as
+# one UID, on one laptop filesystem, where a directory the same process created
+# is writable whatever its group bits say. The failure they guard against needs
+# two pods with two different arbitrary UIDs on EFS — cluster day — and it
+# presents as the SECOND worker failing to write a user's output with a
+# permission error that reads like a storage fault.
+shape_require enterprise/worker/worker_agent.py \
+    '^WORKSPACE_DIR_MODE = 0o2775$' \
+    "runtime-created output workspaces must be setgid and group-writable. OpenShift gives each pod an arbitrary high UID with GID 0 and does not keep the UID stable across pods, so g+w is what lets the next worker write into a directory this one created, and the setgid bit is what makes ComfyUI's files inside it inherit GID 0 rather than the creating pod's group"
+
+shape_require enterprise/worker/worker_agent.py \
+    'os\.chmod\(path, WORKSPACE_DIR_MODE\)' \
+    "the mode above must be applied EXPLICITLY. mkdir's own mode argument is masked by umask (022 in this image, which yields 0755 — group-readable, not group-writable), so a workspace created without this chmod looks correct locally and is unwritable by the next pod on the cluster"
+
+# The pattern deliberately starts after the leading dashes: shape_require hands
+# it straight to `grep -qE`, which would read "--output-directory..." as flags.
+shape_require enterprise/worker/start.sh \
+    'output-directory "\$OUTPUT_ROOT"' \
+    "ComfyUI's output directory and the agent's OUTPUT_ROOT must be the same one variable. ComfyUI is long-lived with a single fixed --output-directory and the agent computes every submitter's workspace underneath it; hardcoding one side lets the pod start with the agent naming paths under a directory ComfyUI is not writing to, which 404s every generation and logs nothing"
+
 (( SHAPE_BAD == 0 )) && ok "clean" || FAILURES=$(( FAILURES + 1 ))
+
+# ---------------------------------------------------------------------------
+
+log "the retry counter moves only by HINCRBY (docs/10-roadmap.md, Q2)"
+
+# The other half of the same invariant, and the one the e2e suite structurally
+# cannot reach: enterprise/test/run.sh starts ONE gateway, and
+# enterprise/manifests/01-gateway.yaml runs two, each with its own reaper.
+#
+# "RPOP is atomic, so two reapers each take different entries" is what bounds
+# FAILING a stranded job to once. It does not bound REQUEUEING one to once: a
+# requeued job goes back on the queue, is picked up by another worker, and can
+# be stranded a second time — a different entry, a different processing list,
+# quite possibly the other replica's reaper. "Is this the first attempt?" is
+# then a question about shared state, and read-modify-write on shared state
+# (HGET the count, compare, HSET count+1) is a lost update: both replicas read
+# 0, both believe they are first, and one job becomes two on one GPU pool at
+# GPU prices. HINCRBY returns the post-increment value, so the decision is
+# taken from the atomic operation itself and exactly one caller can see 1.
+#
+# A line-oriented grep is not enough here — the wrong version is naturally
+# written as a multi-line hset(..., mapping={...}) — so this reads the source
+# and asserts every mention of the counter outside its own definition is on a
+# hincrby.
+
+if python3 - <<'EOF'
+import re, sys
+
+PATH = "enterprise/gateway/hub.py"
+FIELD = "ATTEMPT_COUNT_FIELD"
+
+source = open(PATH).read().splitlines()
+
+# The shared envelope block defines the name; everything after it uses it.
+try:
+    end = next(i for i, line in enumerate(source) if line.startswith("# END SHARED ENVELOPE"))
+except StopIteration:
+    print(f"  {PATH}: no END SHARED ENVELOPE marker — cannot tell the counter's "
+          "definition from its uses")
+    sys.exit(1)
+
+bad, seen_hincrby = [], False
+
+for n, line in enumerate(source[end:], start=end + 1):
+    if FIELD not in line:
+        continue
+
+    if re.search(r"hincrby\(", line):
+        seen_hincrby = True
+    elif not line.lstrip().startswith("#"):
+        bad.append((n, line.strip()))
+
+if bad:
+    print(f"  {PATH}: the retry counter must be written only by HINCRBY, whose "
+          "return value the retry decision is taken from. These lines touch it "
+          "some other way:")
+    for n, line in bad:
+        print(f"    {n}: {line}")
+    sys.exit(1)
+
+if not seen_hincrby:
+    print(f"  {PATH}: nothing increments the retry counter with HINCRBY — the "
+          "bound on requeue-once has gone")
+    sys.exit(1)
+
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the fair-queueing insert splices, and carries no workflow (docs/10-roadmap.md, Q1)"
+
+# Two properties of hub.py's FAIR_ENQUEUE_LUA that nothing else can see.
+#
+# The suite cannot see either one: it runs a queue three jobs deep with a
+# two-node workflow, where a script that walks megabytes and a script that
+# walks kilobytes both finish instantly and both produce the same order.
+#
+#   1. It never unmakes the queue. This script runs on every submit and Redis
+#      does not roll back a script's partial effects, so a version that DELs
+#      comfy:queue and pushes it back has a window in which an error loses
+#      every queued job at once — the "work vanishing at random" that
+#      `maxmemory-policy noeviction` exists to prevent, arriving by a door
+#      that policy does not cover. Injecting an error after the DEL in the
+#      version this replaced emptied a 10-deep queue; injecting one anywhere
+#      in this version leaves it untouched. LINSERT is what makes that true:
+#      it splices one entry against a pivot and touches nothing else.
+#
+#   2. The list entry carries no workflow. Placing a job fairly means reading
+#      every job already queued, Redis is single-threaded, and a workflow is
+#      the one field whose size the client chooses (up to MAX_BODY_BYTES). In
+#      the list, one submit against a 499-deep queue of 26 KB workflows cost
+#      ~118 ms of exclusive Redis time — a stall on every other client,
+#      including every worker parked in BLMOVE — and ~1.2 s at 103 KB. Beside
+#      the list, both are ~2 ms. queue_record() is what keeps the workflow out
+#      of the entry; a "simplification" back to json.dumps(envelope) restores
+#      the whole cost.
+
+if python3 - <<'EOF'
+import re, sys
+
+PATH = "enterprise/gateway/hub.py"
+source = open(PATH).read()
+
+problems = []
+
+match = re.search(r'FAIR_ENQUEUE_LUA = """(.*?)"""', source, re.S)
+
+if match is None:
+    print(f"  {PATH}: no FAIR_ENQUEUE_LUA script to check")
+    sys.exit(1)
+
+script = "\n".join(line for line in match.group(1).splitlines()
+                   if not line.lstrip().startswith("--"))
+
+if "LINSERT" not in script:
+    problems.append("the insert no longer uses LINSERT. Placing an entry any "
+                    "other way means rewriting the list around it")
+
+for destructive in ("DEL", "LTRIM", "LSET", "LREM", "LPOP", "RPOP"):
+    if re.search(r"'%s'" % destructive, script):
+        problems.append(f"the insert calls {destructive} on the queue. This "
+                        "script must only ever ADD one entry: Redis does not "
+                        "roll back a partial script, so anything that unmakes "
+                        "the list can lose every queued job at once")
+
+call = re.search(r"def fair_enqueue_call\(.*?\n\n\n", source, re.S)
+
+if call is None:
+    problems.append("fair_enqueue_call() is gone — the queue entry and the "
+                    "workflow beside it are built in one place on purpose")
+elif "queue_record(" not in call.group(0):
+    problems.append("fair_enqueue_call() no longer builds the list entry with "
+                    "queue_record(). The entry on comfy:queue must not carry "
+                    "the workflow: this script reads every queued entry on "
+                    "every submit, and Redis is single-threaded")
+
+for problem in problems:
+    print(f"  {PATH}: {problem}")
+
+sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
 
 # ---------------------------------------------------------------------------
 

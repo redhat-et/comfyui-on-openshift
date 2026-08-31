@@ -187,6 +187,19 @@ no login. The GPU pods stay unreachable either way, so this is not catastrophic,
 but anyone who finds the hostname can spend your GPU budget — and Route
 hostnames appear in certificate transparency logs within minutes.
 
+It also means more than budget once output workspaces (above) are in the
+picture. `X-Forwarded-User` is client-supplied in this mode — `hub.py` says
+so in three places — so nothing stops a caller from setting it to someone
+else's identity. The worker does not know the difference: it writes into
+whatever workspace that header names, and an existing file of the same name
+there is silently overwritten. Under `AUTH_MODE=none` this is not a
+bypass of anything — nobody is authenticated, so there is no "other user"
+this mode was ever protecting — but it does mean a caller can overwrite
+another *named* user's prior outputs, not just spend GPU time, with nothing
+but a header of their choosing. `AUTH_MODE=oauth` is what makes
+`X-Forwarded-User` trustworthy again: the proxy sets it from a real login,
+so a caller can no longer simply assert someone else's name.
+
 ## ComfyUI-Manager and auto-downloaders
 
 Off by default (`ENABLE_MANAGER=false`), for two reasons. (The single-user
@@ -217,29 +230,104 @@ format rather than behind a button in a shared UI.
 
 ## What is deliberately not here
 
-- **Per-user workspaces.** Every user shares one output directory. Adding
-  identity-scoped paths means threading the authenticated user from the
-  oauth-proxy headers through the gateway into the output path — worth doing,
-  not done here. (The gateway does now record that authenticated user on each
-  job's state, so attribution — whose job is this — exists without the
-  workspaces.)
-- **Job priority.** The pop is `BLMOVE` from one list into a per-worker
-  processing list — FIFO, and deliberately not a plain `BRPOP`, because the
-  processing list is what the reaper needs. Priority therefore means more than
-  a second list: it means a multi-lane pop that still parks the job somewhere
-  the reaper can find it. `docs/10-roadmap.md` (Q1) takes the fair-queueing
-  route instead, which needs no priority claim from the caller.
+- **Per-user *isolation* of outputs.** The workspaces themselves are here now —
+  `docs/10-roadmap.md` (Q3) landed them — so this entry is no longer "every
+  user shares one output directory". Each job writes into
+  `/output/<workspace>/`, named from the submitter's identity by the worker
+  agent, and every output that comes back out is confined to that directory
+  whether or not the save node cooperated.
+
+  What is still deliberately absent is **access control on reads**. The
+  workspaces are organisational and confining, not a security boundary: the
+  gateway serves `/outputs/...` to any caller who has the URL, exactly as it
+  did before. That is a decision, not an omission. The only identity this
+  system has is `X-Forwarded-User`, and under `AUTH_MODE=none` it is
+  client-supplied — `hub.py` says in three places that it must never be
+  treated as authorization. Scoping reads on it would be a control that works
+  under `AUTH_MODE=oauth` and silently evaporates under `AUTH_MODE=none`,
+  which is worse than a documented absence, because the illusion is what
+  people would rely on. It would also break the thing users actually do with
+  these URLs, which is send them to each other. Real read isolation needs an
+  identity the gateway can trust in *both* modes; that is a different item
+  from this one, and it is not here.
+
+  Three smaller consequences worth knowing. Usernames are sanitized to an
+  allowlist slug plus a hash of the original, so an output directory is
+  readable ("alice-smith-example-com-7dcd3a39ad3a") without two different
+  usernames ever sharing one; nothing is rejected for the *shape* of a
+  username, because an IdP's spelling of a person's name is not something
+  they can fix. And a workflow's `filename_prefix` **is** rejected if it
+  contains `..` or an absolute path: ComfyUI treats that prefix as a subpath
+  of its output directory, the caller wrote it, and it has an unambiguous
+  safe form.
+
+  The third is the sharper way to say what "not a security boundary" means
+  in practice: `workspace_name()` (`worker_agent.py`) is a **pure, publicly
+  computable function of the username** — allowlist-slug the string, append
+  12 hex characters of `sha256(username)`, nothing else. The algorithm is
+  in this file's git history and in the worker's own source, and it takes no
+  secret as input. So a caller does not need to have SEEN one of alice's URLs
+  to read her outputs; knowing (or guessing) her username is enough to
+  *compute* `workspace_name("alice@example.com")` offline and construct the
+  path directly, the same way anyone can today. That is a strictly stronger
+  reach than "the URL is unguessable but discoverable" — it needs no
+  discovery step at all. It is still the deliberate trade this section
+  opens with (organisation, not isolation), not a bug: fixing it means
+  answering the identity question above, not hashing the workspace name
+  harder.
+- **Job priority.** Still not here, on purpose, and the reasoning changed once
+  `docs/10-roadmap.md` (Q1) landed fair queueing. A priority lane needs a claim
+  from the caller — "I'm interactive" — and the only identity this gateway can
+  read, `X-Forwarded-User`, is exactly that self-declared and unauthenticated
+  under `AUTH_MODE=none`; a priority lane would just be a header everyone sets
+  on themselves. Round-robin sidesteps the trust decision entirely instead of
+  solving it: each submitter identity hub.py already records is a lane, lanes
+  take turns, and impersonating someone else only shares their turns, not a
+  faster one. It also did not need the second list this bullet used to say
+  priority would require — the pop is still one `BLMOVE` from one list into a
+  per-worker processing list the reaper depends on; a new job is inserted at
+  its fairness-computed position within that *same* list (`hub.py`'s
+  `fair_enqueue_script`, one atomic Lua `EVAL`) rather than always at the
+  back. What is still deliberately absent is an actual priority claim — no
+  caller, authenticated or not, can ask to go first.
 - **Multi-GPU workers.** One pod, one GPU. A worker with four cards would need
   ComfyUI's own batching or four ComfyUI processes.
 - **Redis HA.** One instance with AOF persistence. It survives a pod restart; it
   does not survive a zone outage. At one-GPU scale, adding three Redis nodes
   protects against a failure less likely than the ones you have not fixed yet.
-- **Job retry.** A worker that dies without warning — OOM, node reclaim — does
-  not lose its job silently: the agent parks each job in a per-worker
-  processing list (BLMOVE) and holds a TTL'd heartbeat, and the gateway fails
-  stranded jobs loudly once the heartbeat lapses. But failed means *failed*,
-  not requeued: a workflow that OOM-killed one worker would OOM-kill each
-  worker it was retried on, in sequence, at GPU prices. The user resubmits.
+- **General job retry.** Still not here, and for the reason this bullet always
+  gave — but `docs/10-roadmap.md` (Q2) has since carved out the one death that
+  reason does not cover, so it is worth saying exactly where the line now
+  falls. A worker that dies without warning still does not lose its job
+  silently: the agent parks each job in a per-worker processing list (BLMOVE)
+  and holds a TTL'd heartbeat, and the gateway's reaper acts on stranded jobs
+  once the heartbeat lapses. What it does now depends on a `phase` breadcrumb
+  the agent writes on the job's own state — `dispatched` until ComfyUI has been
+  handed the workflow, `executing` afterwards — and on nothing else.
+
+  A job whose worker died at `executing` is still failed, not requeued, on the
+  original argument unchanged: a host-RAM OOM kills the pod and is
+  indistinguishable *at the queue layer* from a node reclaim, so requeueing it
+  would walk a workflow that killed one worker across the whole pool, in
+  sequence, at GPU prices. The user resubmits. A job whose worker died at
+  `dispatched` is requeued once, because nothing ran: there is no poison pill
+  to replay, and the death was about the cluster rather than about the
+  workflow. Everything the agent itself reports — a rejected workflow, an
+  `execution_error` (which is how a VRAM OOM arrives), a job deadline — is
+  terminal as it always was; retryable is a phase, never an exception.
+
+  Two things follow. The retry is announced as a non-terminal `retry` event, so
+  a browser tailing the job reads past it into the second attempt rather than
+  stopping; and the attempt counter is a Redis `HINCRBY` whose return value the
+  decision is taken from, because the gateway runs two replicas and "RPOP is
+  atomic" bounds failing a job once without bounding requeueing it once. What
+  is still deliberately absent is retry as a general policy — nothing retries a
+  workflow that has been anywhere near a GPU. The ambiguity that argument rests
+  on is also no longer total for the *operator*: since the worker is sized
+  Guaranteed and within what its node can give one pod, a host-RAM OOM
+  terminates the pod `OOMKilled` and `oc describe pod` names it. The gateway
+  cannot see that; the person reading the failure can, and the failure text
+  says so.
 - **Interrupting a running sampler.** Cancel is cooperative — it stops a queued
   job and asks a running one to stop between events. Truly interrupting mid-step
   is ComfyUI's `/interrupt`, and the workers are not reachable from the gateway.

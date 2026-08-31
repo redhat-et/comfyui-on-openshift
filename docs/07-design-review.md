@@ -283,6 +283,213 @@ Two smaller things that were not obvious until the code was written:
   failure appears only when a gateway and a worker of different vintages meet on
   the queue.
 
+### Q2 — retry, and the three things that make it narrow
+
+The obvious implementation is four lines in the reaper: where it fails a
+stranded job, put the job back on the queue instead, and count attempts so it
+cannot loop. It reviews cleanly, it passes a test that kills a worker and
+watches the job finish, and it is wrong in three separate ways, each of which
+only appears in a cluster.
+
+**Retryable is a phase, not an exception.** The tempting reading of "retry a
+failed job" is "retry unless the failure looks permanent", and there is no
+such signal here. A host-RAM OOM kills the ComfyUI process, takes the pod with
+it, and reaches the gateway as a lapsed heartbeat — byte for byte the same
+thing a node reclaim produces. So a reaper that decides from *what it can see*
+is deciding from nothing, and the poison workflow gets replayed onto every
+worker in the pool in sequence at GPU prices. The only question with an answer
+is **how far the job got**, and the only process that knows is the one that
+died. Hence a breadcrumb written ahead of the fact rather than a diagnosis
+attempted after it: the agent records `dispatched` when it takes the job and
+`executing` before it hands ComfyUI the workflow, and the reaper retries the
+first and never the second. The ordering there is the whole content of the
+mechanism — a breadcrumb written *after* the transition it describes leaves a
+window in which the job is executing and the record says it is not, and that
+window is precisely when a retry replays the poison pill.
+
+It also has to live on the job's state hash rather than on the queue entry,
+which is where a first draft naturally puts it: the entry is a static copy of
+what the gateway pushed, no worker ever rewrites it, and it is the only thing
+the reaper is holding. The reserved `attempt` field on the envelope carries the
+count forward across a requeue; it cannot carry the phase, because by the time
+anyone wants to read the phase the entry is already stale by a whole job.
+
+**"RPOP is atomic" is an argument about failing, not about requeueing.** The
+reaper's existing safety note is correct and does not survive the change of
+verb. Two gateway replicas each run a reaper; RPOP hands a given stranded entry
+to exactly one of them, which is what makes "failed at most once" true. A
+requeued job, though, goes back on the queue, is picked up by another worker,
+and can be stranded a *second* time — a different entry, on a different
+processing list, seen on a different pass, quite possibly by the other replica.
+"Is this the first attempt?" is then a question about shared state, and the
+natural implementation of it — read the count, compare, write count+1 — is a
+lost update: both replicas read 0, both believe they are first, and one job
+becomes two on one GPU pool. `HINCRBY` returns the value *after* incrementing,
+so the decision is taken from the return of the atomic operation itself and
+exactly one caller can ever see `1`. None of this can be exhibited by
+`enterprise/test/run.sh`, which starts one gateway, so `scripts/lint.sh` pins
+the shape instead: the counter must be bumped by `HINCRBY`, and must never be
+written by `HSET`.
+
+**A retry event that ends the stream is worse than no retry at all.** The
+gateway's WebSocket stops reading at the first event in `TERMINAL_TYPES`. Add
+`retry` to that set — or emit the retry as a `failed` followed by a fresh
+`queued` — and the browser closes on the retry while the second attempt runs to
+completion behind it. The user sees a job that failed; the cluster spent a GPU
+finishing it successfully. `retry` is therefore deliberately *not* terminal, on
+both sides: the gateway does not stop on it, and `index.html` reports it without
+calling `done()` — the one arm of that switch which announces something has gone
+wrong and deliberately keeps the socket open. The `TERMINAL_TYPES` line in
+`hub.py` is pinned by lint too, because "add the new event type to the terminal
+set" is exactly the tidying a later reader would do, in a diff about something
+else.
+
+Three smaller things that were not obvious until it was written:
+
+- **A requeue is not a promotion.** Pushing the job to the front of the queue
+  is the natural way to write it and re-introduces the starvation Q1 exists to
+  remove, by a new door: a submitter whose workers keep dying takes slots from
+  lanes that did nothing wrong. It goes back through the same fair-queueing
+  insert as a first submission, and it is subject to the same
+  `MAX_QUEUE_DEPTH` — a pool dying faster than it drains must not be the one
+  path allowed to grow the queue past its ceiling.
+- **Re-arming a TTL is how a job becomes immortal.** `HSET` and `HINCRBY`
+  recreate a key that expired mid-flight, and a recreated key has no expiry at
+  all, in a Redis deliberately configured `noeviction`. The retry path
+  therefore uses `EXPIRE ... NX`: give the job an expiry if it has none, never
+  extend one it has. The retry cap bounds this too, but the cap is a number
+  someone may raise and the `NX` is a property of the code.
+- **The gateway's blindness is not the operator's.** The reaper genuinely
+  cannot tell a host-RAM OOM from a reclaim. F1 made the pod tell the
+  difference — sized Guaranteed and within what the node can hand one pod, it
+  now terminates `OOMKilled` instead of vanishing into node pressure — so every
+  failure the reaper emits points at `oc describe pod`. The ambiguity is total
+  at the queue layer and nowhere else, and a failure message that says only
+  "the worker died" spends that fact.
+
+### Q2, corrected — a rule you state and then round off is not a rule
+
+Q2 shipped with the paragraph above written correctly and the code a step
+behind it, in two places. Both are worth recording, because both are the same
+mistake: the mechanism was reasoned about at the level of the sentence and
+implemented at the level of the call.
+
+**"Before the transition" meant before the POST, and the code wrote it after
+`submit_prompt()` returned.** ComfyUI has the workflow the moment the request
+is written to the socket, not when it answers — so an agent that records
+`executing` on the *return* has left the whole round trip inside the retryable
+phase. That is not a theoretical sliver: it is as long as a loaded ComfyUI
+takes to answer a POST, it widens exactly when the cluster is unhealthy, and a
+worker that dies inside it hands a workflow ComfyUI is already running to a
+second GPU. The window was known and written down when Q2 landed, which is the
+part worth being uncomfortable about — a disclosed window is still an open one,
+and "small" is not a property the reaper can read. The fix is ordering rather
+than narrowing: the `HSET` moves above the call. The cost is that a death
+inside the POST no longer earns its retry, which is the direction to err — one
+user resubmits, versus a poison workflow walking the pool.
+
+**A cancelled job is at a retryable phase precisely because it was cancelled
+early.** The reaper read the breadcrumb and nothing else, so a job the user
+cancelled while it was queued or dispatched, whose worker then died, was
+requeued with its status reset to `queued` — the retry mechanism spending a GPU
+on work whose owner had already withdrawn it, and telling them it was queued
+again. The reaper now reads `cancel_requested` alongside the phase and ends
+such a job `cancelled`: terminal, payload reclaimed, no retry spent.
+
+That second one had a pre-existing half, which is now closed too. `run_job()`
+did not consult the cancel flag until *after* `submit_prompt()`, so a job
+cancelled while it sat in the queue was submitted to ComfyUI by the next
+healthy worker to pop it and then interrupted — which is not what
+`cancel()`'s own docstring promises ("a job that has not been picked up yet
+never starts"), and is GPU time spent on a job nobody wanted. One check
+immediately before the POST closes it. The two checks are not redundant: this
+one covers the ordinary path, the reaper's covers the death path, and either
+alone leaves a door.
+
+Both are asserted end to end by `check-35-retry-doors.py`, against the stub's
+record of every workflow it has actually been handed — because "did ComfyUI
+get it" is the question the whole mechanism turns on, and until the stub
+recorded it, the suite could only infer the answer from timing. The same
+record turned `check-30-sigkill.py`'s pre-execution scenario from an
+assumption into an assertion, and showed that its kill point had been on the
+wrong side of the line all along: it killed the agent inside `submit_prompt()`
+and asserted a retry, which is the replay this mechanism exists to prevent.
+It now kills the agent where a pre-execution death actually lives — parked in
+the ComfyUI WebSocket connect, before anything has been sent — and asserts
+ComfyUI never saw the workflow.
+
+### Q3 — the username becomes a path, and the part that cannot be tested here
+
+The one-line version of per-user output workspaces is
+`OUTPUT_ROOT / user / filename`, and it is a path-traversal bug written in a
+single expression. `X-Forwarded-User` is a request header, client-supplied
+whenever `AUTH_MODE=none`, and `hub.py` says so in three places — this item is
+where that sentence stops being a caveat about attribution and becomes the
+security property of a filesystem write. Everything below follows from taking
+that seriously.
+
+**Sanitize, then join, then resolve, then verify — in that order.** Each step
+covers a different failure, and reordering them silently removes one. Resolving
+before the join tells you about a path nobody is going to use. Joining without
+re-verifying containment trusts the sanitizer absolutely, and the sanitizer is
+a string rule that cannot see a symlink someone left in the output volume. The
+`resolve()`-then-`is_relative_to()` pair is the same shape `hub.py`'s
+`output_file()` already uses on the way *out*, and the two are deliberately
+independent: one refuses to build an escaping path, the other refuses to serve
+one.
+
+**The sanitizer's real risk is the opposite of the obvious one.** A pure
+allowlist — strip everything outside `[A-Za-z0-9]` — is safe and quietly
+wrong: `a/b` and `a-b` become the same directory, and so do two long usernames
+that share a prefix. That is the flat shared directory again, for two
+unlucky people, and now much harder to see. A pure hash is injective and
+unusable: an operator looking at EFS, or at a ticket, cannot tell whose
+directory anything is. So it is both — an allowlist slug for the human and 12
+hex of `sha256(user)` for uniqueness. Rejecting unusual usernames was the
+third option and is the wrong one *for the username*: an oauth-proxy identity
+is an email, `@` and `.` are the ordinary case rather than the hostile one,
+and a user whose IdP spells their name unusually cannot fix that. Rejection is
+used one layer down, for a workflow's `filename_prefix` — ComfyUI treats it as
+a subpath of the output directory, the caller wrote it, `..` in it has no
+legitimate reading, and the caller can change it.
+
+**Rewriting the prefix is necessary and is not sufficient.** ComfyUI is one
+long-lived process started with one fixed `--output-directory`, so there is no
+per-job flag to set; the only per-job control is the save node's
+`filename_prefix`, which ComfyUI treats as a subpath. Rewriting it is what
+makes the common case free — the file is written in the right place, nothing
+is copied. But it is best-effort by construction: a custom node that hardcodes
+its own path, or spells the input differently, ignores it entirely. Since the
+agent is the only way out of the pod, the agent enforces the same confinement
+again on what actually came out, moving anything reported outside the
+workspace into it and refusing to name anything that resolves outside
+`OUTPUT_ROOT` at all. "Every output of this job is inside its submitter's
+workspace" is then a property of the agent rather than a hope about nodes.
+
+**Workspaces are not access control, and saying so is the decision.** The
+tempting next step is to scope reads by the same header. That produces a
+control that works under `AUTH_MODE=oauth` and evaporates under
+`AUTH_MODE=none`, where anyone can set the header — an isolation guarantee
+that exists exactly where it is not needed. A guarantee that quietly degrades
+is worse than a documented absence, because people rely on it. Reads are
+therefore unchanged, and `docs/06-enterprise-architecture.md` now says so in
+the "deliberately not here" list rather than leaving it to be inferred.
+
+**And the half a laptop cannot prove.** The workspaces are created at runtime
+by whichever worker pod happens to run a job first, and OpenShift gives each
+pod an arbitrary high UID that is not stable across pods. So the mode matters
+as much as the path: without `g+w` the *next* pod cannot write into a
+directory this one created, and without `setgid` the files ComfyUI creates
+inside it belong to the creating pod's group instead of GID 0. Neither shows
+up in `make test`, which runs one agent as one UID on one local filesystem
+where the process that made the directory owns it. The code therefore sets the
+mode **explicitly** — `mkdir`'s own mode argument is masked by umask and would
+produce `0755` — rather than inheriting a default that happens to work here,
+and `scripts/lint.sh` pins both the constant and the `chmod` call, because a
+default that happens to work locally is precisely the kind of thing a later
+diff tidies away. The behaviour itself is on the cluster-day list in
+`docs/10-roadmap.md`: two pods, two UIDs, one EFS volume.
+
 ---
 
 ## What was right and worth keeping

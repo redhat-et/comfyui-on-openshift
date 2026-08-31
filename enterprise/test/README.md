@@ -10,6 +10,23 @@ stub ComfyUI, on your laptop. No cluster, no GPU, no AWS.
 Needs `redis-server` on PATH and `pip install redis websocket-client fastapi
 'uvicorn[standard]'`.
 
+## What it measures, separately
+
+`bench-fair-enqueue.py` is not a check and `run.sh` does not run it — it is a
+measurement, of what one `/api/generate` costs Redis at a realistic queue depth
+with a realistic workflow. The suite cannot answer that: it runs a queue three
+jobs deep with a two-node workflow, where every version of the fair-queueing
+insert is instant and correct. Redis is single-threaded, so that cost is time
+no other client gets, workers parked in `BLMOVE` included. Point it at any
+Redis; it uses its own key namespace and drains nothing:
+
+```bash
+REDIS_URL=redis://127.0.0.1:6399/0 REDIS_PASSWORD=testpass123 \
+    python3 enterprise/test/bench-fair-enqueue.py
+```
+
+Its docstring carries the recorded numbers and what a bad one means.
+
 ## What it actually asserts
 
 The point is not coverage for its own sake — it is the handful of behaviours
@@ -35,7 +52,10 @@ same event sequence. Browsers sleep and gateway pods roll.
 **Failures surface with their reason.** A workflow ComfyUI rejects produces a
 `failed` event carrying ComfyUI's own message, not a generic error. The
 difference between "failed" and "failed: required input is missing: ckpt_name"
-is most of the support burden.
+is most of the support burden. It is also not retried (docs/10-roadmap.md,
+Q2): the agent that submitted it never died, so this never goes through the
+reaper's worker-death path at all, whatever phase breadcrumb it happens to
+share with a job that *would* be retried.
 
 **Cancel works** on a job in flight.
 
@@ -46,16 +66,68 @@ pool scales to zero, so termination is routine. Without it, every scale-down
 throws away whatever was rendering and leaves a browser on a progress bar that
 never moves.
 
-**SIGKILL still surfaces a terminal event.** SIGTERM is the polite case; an OOM
-kill or node reclaim gives no warning at all. The test SIGKILLs the agent
-mid-job and asserts the gateway's reaper fails the stranded job with a reason
-naming the dead worker (the agent parks each job in a per-worker processing
-list and holds a TTL'd heartbeat — see point 5 in `worker_agent.py`), and that
-the dead worker drops out of `/api/stats` on its own. Deliberately `failed`,
-not requeued: a workflow that OOM-killed one worker would kill the next too.
+**SIGKILL still surfaces a terminal event — and whether it's retried depends on
+when.** SIGTERM is the polite case; an OOM kill or node reclaim gives no
+warning at all. The agent parks each job in a per-worker processing list and
+holds a TTL'd heartbeat — see point 5 in `worker_agent.py` — and the gateway's
+reaper notices a lapsed heartbeat and acts on the stranded job. What it does
+depends on the `phase` breadcrumb on the job's own state (docs/10-roadmap.md,
+Q2): a worker SIGKILLed before ComfyUI was ever handed the workflow (still
+parked in the ComfyUI WebSocket connect it does before submitting anything)
+has its job requeued exactly once, as a non-terminal `retry` event a tailing
+browser does not stop at, and a second agent completes it. A worker SIGKILLed
+after execution began gets the original behavior unchanged — one terminal
+`failed` naming the dead worker, never requeued, and it drops out of
+`/api/stats` on its own — because a workflow that OOM-killed one worker would
+OOM-kill whichever worker it was requeued onto next. The stub records every
+workflow it is handed, so "ComfyUI had not seen it" is asserted rather than
+assumed on both sides of that line.
+
+**And the two doors into a replay stay shut** (`check-35-retry-doors.py`).
+The breadcrumb decides whether a death is retried, so it has to be true at
+every instant, and the retry has to be about work somebody still wants.
+ComfyUI receives a workflow when the POST is *written*, not when it answers:
+the check waits until the stub reports it has the workflow — while the agent
+is still blocked on a stalled `/prompt` — and asserts the breadcrumb already
+reads `executing`, then kills the agent there and asserts one terminal
+`failed` and no requeue. Separately, a job the user cancelled must not be
+requeued when its worker dies (the reaper's door), and must never be handed to
+ComfyUI at all when a healthy worker pops it (the worker's door, and what
+`cancel()` promises: a job that has not been picked up yet never starts). The
+second of those is measured by asking the stub whether the workflow ever
+arrived, which is the only way to see a GPU that was spent.
 
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
+
+**Outputs are per-submitter, and a submitter's name cannot escape.** Two users
+submitting the identical workflow land in two different directories, which the
+stub makes a real test rather than a tautology: `fake_comfy.py` reports the
+same `{out_0001.png, ""}` for every job it is ever given, so the returned URLs
+can only differ if the submitter's identity actually changed where the output
+went (docs/10-roadmap.md, Q3). The rest of `check-60-user-workspaces.py` is
+hostile-input testing, because the identity it names a directory from is a
+request header: a username of `../../../../tmp/evil`, of `/etc/passwd`, empty,
+and 2000 characters long must each either be refused at submit or produce only
+a confined, namespaced, servable output — and, in the other direction, an
+ordinary `alice.smith@example.com` must still get a real workspace, since
+sanitizing so hard that real usernames break is its own failure. What this
+cannot see is the directory *mode*: it runs one agent as one UID, and the bug
+it would be looking for needs two pods with two different arbitrary UIDs on
+EFS. `scripts/lint.sh` pins the mode instead.
+
+**A save node's `filename_prefix` is rewritten into the workspace, and a
+traversal through it is refused.** Every workflow every other check submits is
+a bare `KSampler` with no `filename_prefix` input, so `scope_workflow_outputs()`
+(`worker_agent.py`) finds nothing to rewrite anywhere else in this suite —
+without this, every agent log line in a full run reads "0 save node(s)
+rewritten", and half of Q3 is never actually exercised. `check-60` gives one
+workflow a `SaveImage` node and asks `fake_comfy.py` what `filename_prefix` it
+actually received (its output manifest is the same either way, so that alone
+cannot prove the rewrite happened): a plain prefix must arrive already moved
+inside the submitter's workspace, and one carrying `..` must never arrive at
+all — the job fails first, naming the prefix, with no GPU spent on a workflow
+that was always going to be refused.
 
 **The queue payload envelope round-trips, and tolerates both vintages.** A
 submitted job carries `schema_version` plus the four fields reserved for later
@@ -97,8 +169,8 @@ The convention:
 | **Runtime** | Under `CHECK_TIMEOUT` (default 240s), which is a hang kill-switch rather than a budget. Keep a check to seconds; the whole suite is meant to run in about a minute. |
 
 **You may kill the agent.** `check-20-failure-paths.py` SIGTERMs it and asserts
-it drains; `check-30-sigkill.py` SIGKILLs it and asserts the gateway's reaper
-notices. `run.sh` checks the agent is alive before each check and starts a fresh
+it drains; `check-30-sigkill.py` and `check-35-retry-doors.py` SIGKILL it and
+assert the gateway's reaper notices. `run.sh` checks the agent is alive before each check and starts a fresh
 one if the previous check left it dead, so the check after yours is unaffected —
 and no check ever runs beside a second registered worker, which assertions about
 `workers_registered` could not see through.

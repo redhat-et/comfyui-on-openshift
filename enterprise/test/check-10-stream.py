@@ -68,8 +68,26 @@ check("foreign terminal event did NOT end the job early",
 
 images = (terminal or {}).get("data", {}).get("images", [])
 check("completion carried the output manifest", len(images) == 1, images)
-check("image url was rewritten for the gateway",
-      images and images[0]["url"] == "/outputs/out_0001.png", images)
+
+# Was: check("image url was rewritten for the gateway",
+#            images and images[0]["url"] == "/outputs/out_0001.png", images)
+# A flat name every job on this gateway shares is exactly what let two
+# different users' outputs collide onto the same URL in the first place
+# (docs/10-roadmap.md, Q3 -- see check-60-user-workspaces.py). The literal
+# pin cannot survive Q3 unchanged: a per-submitter workspace directory means
+# this job -- submitted with no X-Forwarded-User header at all -- no longer
+# resolves to a bare filename directly under /outputs/. What replaces it is
+# strictly stronger as a claim about isolation, not weaker as a string match:
+# it requires a real, non-flat workspace directory to exist, where the old
+# pin only required one specific flat string.
+url = images[0]["url"] if images else ""
+workspace_depth = (
+    len(url[len("/outputs/"):].split("/")) - 1 if url.startswith("/outputs/") else -1
+)
+check("image url is scoped under a per-submitter output workspace "
+      "directory, not the single flat name every job on this gateway "
+      "shared before (docs/10-roadmap.md, Q3)",
+      workspace_depth >= 1, images)
 
 print("\n== serving the image off the shared volume")
 body = urllib.request.urlopen(GW + images[0]["url"], timeout=10).read()

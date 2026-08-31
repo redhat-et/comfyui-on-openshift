@@ -75,6 +75,30 @@ spec:
         # so a bare "redis" resolves against openshift-keda's search domains and
         # fails with "no such host". setup.sh substitutes the real namespace.
         address: redis.NAMESPACE_PLACEHOLDER.svc.cluster.local:6379
+        # Q1 (docs/10-roadmap.md) gave the queue fair-queueing across
+        # submitters WITHOUT giving each submitter their own Redis list: a job
+        # is inserted at a fairness-computed position within this ONE list
+        # rather than always at the back, so comfy:queue stays the single
+        # physical list it always was, popped by the same single BLMOVE in
+        # worker_agent.py's main loop. This trigger is therefore unchanged —
+        # `listName: comfy:queue` still names the entire, only, queue, and its
+        # length still means "total jobs waiting", fair-queued or not.
+        # Nothing here was a candidate for becoming N per-submitter triggers.
+        #
+        # Nor can this trigger see a length that dips. The insert splices the
+        # new entry in with LINSERT against a pivot already on the list, so
+        # comfy:queue is only ever added to, one entry at a time, and LLEN is
+        # monotonic across a submit. An earlier version of that script rebuilt
+        # the list (DEL, then batched RPUSH, under one EVAL) and this comment
+        # used to hand cluster day the job of proving that no length-0 blip
+        # escaped the EVAL and reached the scaler as "queue drained". That
+        # question no longer exists to be answered: there is no DEL. See
+        # hub.py's BEGIN FAIR QUEUEING for the other, worse thing the rewrite
+        # cost.
+        #
+        # What cluster day still owes is the thing a laptop cannot show at
+        # all: that the pool scales 0 -> 1 -> 0 against this trigger with
+        # fair-queueing live. See docs/10-roadmap.md's cluster day section.
         listName: comfy:queue
         # Target queue depth per worker. With listLength 1, two queued jobs ask
         # for two workers — which is what you want when each job occupies a

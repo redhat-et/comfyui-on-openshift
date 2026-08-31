@@ -1,9 +1,23 @@
 """Failure paths: rejected workflow, cancel, and SIGTERM drain."""
 import json, os, signal, subprocess, sys, time, urllib.error, urllib.request
+import redis
 import websocket
 
+from queue_watch import QueueWriteWatcher
+
 GW = "http://127.0.0.1:8100"
+QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 failures = []
+
+r = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
+    password=os.environ.get("REDIS_PASSWORD") or None,
+    decode_responses=True,
+)
+
+
+def state_key(job_id):
+    return f"comfy:job:{job_id}:state"
 
 def check(name, cond, detail=""):
     print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
@@ -37,12 +51,54 @@ def drain(job_id, timeout=90):
 
 
 print("\n== a workflow ComfyUI rejects becomes a 'failed' event, with the reason")
+
+# Armed BEFORE the submit, deliberately. Arming after it looks tidier -- the
+# job's own fair-queueing insert is a legitimate write to this key, so a
+# watcher started later counts only writes that should never happen -- but it
+# cannot work: the agent can pick the job up, be rejected by ComfyUI, and
+# requeue it before MONITOR is attached, so the write this exists to catch is
+# already past. The wave-2a re-gate proved exactly that, against a mutation
+# that really did requeue the rejection: the assertion still passed.
+#
+# So count instead of watching for absence. Exactly one write may touch this
+# key for this job -- the submit's own insert -- and a requeue is a second.
+# check-30 scenario A uses the same construction for the same reason.
+watcher = QueueWriteWatcher(
+    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
+    os.environ.get("REDIS_PASSWORD") or None,
+    QUEUE_KEY,
+).start()
+
 job = post("/api/generate", {"workflow": {"__fail__": {"class_type": "KSampler"}}})
-kinds, terminal = drain(job["job_id"], timeout=30)
+job_id = job["job_id"]
+
+kinds, terminal = drain(job_id, timeout=30)
 check("terminated as failed", terminal and terminal["type"] == "failed", terminal)
 err = (terminal or {}).get("data", {}).get("error", "")
 check("the reason from ComfyUI is surfaced, not swallowed",
       "ckpt_name" in err, err[:160])
+
+# docs/10-roadmap.md, Q2: retry is scoped to a worker dying before ComfyUI
+# ever saw the workflow. This job never involved a dead worker at all -- the
+# very-much-alive agent submitted it, ComfyUI answered synchronously with a
+# rejection, and the agent reported that back itself. A phase-only reading of
+# "died early" must not be confused with this: the agent set phase to
+# 'dispatched' here too (it has not heard back from ComfyUI yet, same as a
+# job about to be retried), and it must still end up NOT retried, because
+# nothing here went through the reaper's worker-death path at all.
+check("a rejected workflow is not retried -- no 'retry' event was published",
+      "retry" not in kinds, kinds)
+
+requeues, requeue_cmds = watcher.stop()
+check("comfy:queue received exactly one write for this job -- the submit's "
+      "own insert, and no second one putting the rejection back. Counted "
+      "from before the submit, because a watcher armed after it misses a "
+      "requeue that beats MONITOR to the key",
+      requeues == 1, (requeues, requeue_cmds))
+state = r.hgetall(state_key(job_id))
+check("attempt_count stayed at 0 -- a rejection is a terminal failure, not "
+      "an attempt that gets retried",
+      state.get("attempt_count") in (None, "0"), state.get("attempt_count"))
 
 print("\n== cancel")
 job = post("/api/generate", {"workflow": {"__slow__": {"class_type": "KSampler"}}})
