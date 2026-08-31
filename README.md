@@ -225,8 +225,16 @@ handled alike. Knowing which one you hit is most of the diagnosis.
 | | What actually happens | What the user sees |
 |---|---|---|
 | **VRAM / CUDA OOM** — the common one: a resolution, batch size or model stack that does not fit the card | ComfyUI catches it and emits `execution_error`. The agent (`worker_agent.py:279`) turns that into a terminal `failed` carrying ComfyUI's own exception message. The worker stays healthy and takes the next job. | `failed: Allocation on device ...` — the real message, not a generic error. Nothing is retried, because the same workflow would fail the same way on any card. |
-| **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The kernel kills the ComfyUI process. `start.sh` waits on both children, so the pod exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses. This is the case that looks like infrastructure death, because at the queue level it is indistinguishable from one. |
-| **Node-level pressure** — eviction rather than a container kill | The kubelet evicts with a grace period, so SIGTERM arrives first and the drain below applies. | Usually nothing: the job finishes before the pod goes. |
+| **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The container hits its own memory limit and the kernel kills ComfyUI inside that cgroup. `start.sh` waits on both children, so the pod exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses. At the queue level this is still indistinguishable from infrastructure death — but the pod is not: it terminates as `OOMKilled` and `oc describe pod` names the reason. |
+| **Node-level pressure** — eviction rather than a container kill | The kubelet evicts with a grace period, so SIGTERM arrives first and the drain below applies. A GPU pod is Guaranteed QoS, so it is the last thing evicted, not the first. | Usually nothing: the job finishes before the pod goes. |
+
+That the second row says `OOMKilled` and not "the node decided" is a property of
+the manifest, not of luck: the GPU pod's memory limit is set to something the
+node can actually give it, so the container reaches its own ceiling first. A
+limit larger than the node — the shape this repo shipped with, `24Gi` on a
+16 GiB `g6.xlarge` — can never be reached, which turns the second row into the
+third and costs you the attribution. `scripts/lint.sh` fails a GPU pod that
+drifts back to it.
 
 #### Worker death
 

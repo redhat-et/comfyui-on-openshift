@@ -89,6 +89,140 @@ WORKER_KEY = f"comfy:worker:{WORKER_ID}"
 # vanish. Key shape is shared with hub.py — change both or neither.
 PROCESSING_KEY = f"comfy:processing:{WORKER_ID}"
 
+
+# ---------------------------------------------------------------------------
+# BEGIN SHARED ENVELOPE — the queue payload contract (docs/10-roadmap.md, F2)
+#
+# One entry on the queue is one JSON object of this shape:
+#
+#     {"schema_version": 1,
+#      "job_id":        "<uuid4>",
+#      "workflow":      {...},                            # ComfyUI API format
+#      "queue_key":     "",                               # reserved for Q1
+#      "attempt":       {"count": 0, "phase": "queued"},   # reserved for Q2
+#      "user":          "",                               # reserved for Q4
+#      "submitted_at":  1756400000.0}                     # reserved for Q6
+#
+# This block is MIRRORED VERBATIM in enterprise/gateway/hub.py and
+# enterprise/worker/worker_agent.py — change both or neither, the same rule the
+# processing-list key shape already follows. There is no third file to import
+# from: enterprise/setup.sh builds the two images from two different build
+# contexts (enterprise/gateway and enterprise/worker), so a shared module would
+# have to be copied into both of them anyway. scripts/lint.sh compares the two
+# copies line for line, which is what makes "change both or neither" a check
+# rather than a hope. Both directions are defined in both files even though
+# each file uses only one of them: a block that is byte-identical is one a
+# reviewer can diff, and one half of a contract is not a contract.
+#
+# Why the fields are here before anything reads them. Four roadmap items each
+# want to add a key to a payload these two files must agree on: Q1 a
+# fair-queueing lane key, Q2 an attempt count and a phase breadcrumb, Q4
+# attribution, Q6 a submit timestamp. Adding them one item at a time opens four
+# separate windows in which a gateway that writes a key runs beside a worker
+# that does not, or the reverse — and this pool scales to zero and rolls
+# constantly, so both halves of a rollout are live at once by construction.
+# Each field therefore exists NOW: it has a default, it round-trips through
+# Redis, and nothing reads it. The item that owns a field changes what reads
+# it, not the wire format.
+#
+# schema_version is bumped only for a change that is NOT backwards compatible —
+# a field removed, or one whose meaning changed under a name that stayed the
+# same. Giving a reserved field its behaviour is neither, and must not bump it.
+#
+# Tolerant in both directions, for that same rolling-deploy reason:
+#
+#   - No schema_version at all is the pre-F2 shape, {"job_id", "workflow"}. It
+#     is version 1 by definition and every reserved field takes its default, so
+#     a queue entry written before the rollout still runs afterwards.
+#   - A key this side has never heard of is carried, never rejected: it came
+#     from a newer peer, and refusing it would strand exactly the work the
+#     versioning exists to protect. The consumer reads the keys it knows.
+#
+# Nothing unbounded goes in here. The workflow is already tens of kilobytes,
+# which is why four scalars are free — and why a fifth field that grows with
+# use would not be. queue_key and user are clamped on the way in: `user` comes
+# from a request header, and under AUTH_MODE=none that header is client-
+# supplied, so its length is not ours to trust.
+# ---------------------------------------------------------------------------
+
+SCHEMA_VERSION = 1
+
+# What a payload that declares no version is taken to be. 1 rather than 0,
+# because the pre-F2 two-key shape is a valid version-1 envelope with every
+# reserved field defaulted — not a broken one.
+IMPLICIT_SCHEMA_VERSION = 1
+
+# Long enough for any real username or lane name; short enough that a header
+# nobody authenticated cannot make a queue entry interesting.
+MAX_ENVELOPE_FIELD_CHARS = 256
+
+
+def envelope_text(value) -> str:
+    """A reserved string field: always a str, always bounded, never None."""
+    return str(value)[:MAX_ENVELOPE_FIELD_CHARS] if value else ""
+
+
+def new_attempt() -> dict:
+    """A fresh, not-yet-tried breadcrumb. Q2 owns everything that moves it."""
+    return {"count": 0, "phase": "queued"}
+
+
+def build_envelope(job_id: str, workflow: dict, *, queue_key: str = "",
+                   user: str = "", attempt: dict | None = None,
+                   submitted_at: float | None = None) -> dict:
+    """
+    The producer side. Every reserved field is written with its default rather
+    than omitted, so no consumer ever has to ask whether a key is present —
+    which is the whole reason the absent-field case has only one shape (a
+    pre-F2 payload) instead of one per item.
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "job_id": job_id,
+        "workflow": workflow,
+        "queue_key": envelope_text(queue_key),
+        "attempt": dict(attempt) if isinstance(attempt, dict) else new_attempt(),
+        "user": envelope_text(user),
+        "submitted_at": time.time() if submitted_at is None else submitted_at,
+    }
+
+
+def parse_envelope(payload: dict) -> dict:
+    """
+    The consumer side, and the tolerant half of the contract.
+
+    Raises KeyError for a payload carrying no job_id or no workflow — that is a
+    malformed entry rather than an old one, and the caller drops it. Everything
+    else is defaulted, so the caller reads the same keys whichever version
+    arrived, and an unrecognised key is simply not one of the keys read.
+    """
+    if not isinstance(payload, dict):
+        raise TypeError("queue entry is not a JSON object")
+
+    version = payload.get("schema_version", IMPLICIT_SCHEMA_VERSION)
+
+    if isinstance(version, bool) or not isinstance(version, int):
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            version = IMPLICIT_SCHEMA_VERSION
+
+    attempt = payload.get("attempt")
+
+    return {
+        "schema_version": version,
+        "job_id": payload["job_id"],
+        "workflow": payload["workflow"],
+        "queue_key": envelope_text(payload.get("queue_key")),
+        "attempt": dict(attempt) if isinstance(attempt, dict) else new_attempt(),
+        "user": envelope_text(payload.get("user")),
+        "submitted_at": payload.get("submitted_at"),
+    }
+
+# END SHARED ENVELOPE
+# ---------------------------------------------------------------------------
+
+
 shutting_down = False
 
 
@@ -211,8 +345,23 @@ def wait_for_comfy() -> None:
 # One job
 # ---------------------------------------------------------------------------
 
-def run_job(conn: redis.Redis, job_id: str, workflow: dict) -> None:
-    conn.hset(state_key(job_id), mapping={"status": "running", "worker": WORKER_ID})
+def run_job(conn: redis.Redis, job: dict) -> None:
+    job_id = job["job_id"]
+    workflow = job["workflow"]
+
+    conn.hset(
+        state_key(job_id),
+        mapping={
+            "status": "running",
+            "worker": WORKER_ID,
+            # Which envelope version this worker actually parsed, recorded
+            # where an operator can read it. Mid rolling-deploy a job that
+            # says 1 came either from a gateway older than F2 or from a queue
+            # entry written before the rollout — which is the difference
+            # between "the tolerant path worked" and "nobody looked".
+            "schema_version": job["schema_version"],
+        },
+    )
     conn.expire(state_key(job_id), EVENT_STREAM_TTL)
     emit(conn, job_id, {"type": "started", "data": {"worker": WORKER_ID}})
 
@@ -378,18 +527,21 @@ def main() -> int:
 
             try:
                 try:
-                    payload = json.loads(raw)
-                    job_id = payload["job_id"]
-                    workflow = payload["workflow"]
+                    # Tolerant by contract: a pre-F2 {"job_id", "workflow"}
+                    # entry parses as version 1 with every reserved field
+                    # defaulted, and a key from a newer gateway is carried and
+                    # not read. Only a missing job_id or workflow is malformed.
+                    job = parse_envelope(json.loads(raw))
+                    job_id = job["job_id"]
 
-                except (json.JSONDecodeError, KeyError) as exc:
+                except (json.JSONDecodeError, KeyError, TypeError) as exc:
                     log(f"discarding malformed queue entry: {exc}")
                     continue
 
-                log(f"picked up {job_id}")
+                log(f"picked up {job_id} (envelope v{job['schema_version']})")
 
                 try:
-                    run_job(conn, job_id, workflow)
+                    run_job(conn, job)
 
                 except Exception as exc:  # noqa: BLE001 - every failure must reach the user
                     log(f"job {job_id} failed: {exc}")

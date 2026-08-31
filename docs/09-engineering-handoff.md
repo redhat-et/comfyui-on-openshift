@@ -164,7 +164,22 @@ miserable to reproduce.
 | `maxmemory-policy noeviction` + `MAX_QUEUE_DEPTH` | `00-redis.yaml`, `hub.py` | The default evicts queued jobs, which presents as work vanishing at random. |
 | `haproxy.router.openshift.io/timeout: 4h` **and `timeout-tunnel`** on every Route | `enterprise/manifests/` | HAProxy's 30-second default kills long generations mid-render and reads exactly like an application bug. On edge and reencrypt Routes only `timeout-tunnel` governs the upgraded WebSocket, against a one-hour router default — setting `timeout` alone still drops long jobs. Both annotations, or neither works. |
 | The `chgrp 0` / `chmod g=u` block in both Containerfiles | `app/Containerfile`, `enterprise/worker/Containerfile` | OpenShift runs the container as an arbitrary high UID with GID 0. Without it, ComfyUI cannot write `temp/`, `input/`, `user/` and the pod crash-loops. This is the single most common OpenShift containerisation failure. |
+| GPU pods sized to fit the smallest supported instance, requests equal to limits | `enterprise/manifests/02-worker.yaml`, `manifests/base/deployment.yaml` | The 16 GiB of *host* RAM on a `g6.xlarge` is not the card's 24 GB of VRAM. A memory limit above what one pod can hold on that node is unreachable, so the real ceiling becomes node pressure: an eviction, or a kernel OOM kill of ComfyUI, instead of a clean container-level `OOMKilled`. Unequal requests and limits make the pod Burstable, which is evicted before Guaranteed pods and carries a far more attractive `oom_score_adj` — on a pod holding a GPU mid-generation. |
 | `STORAGE_MODE=rwx` for the multi-user configuration | `enterprise/setup.sh` refuses otherwise | The gateway serves images off the volume the workers write to, and they are on different nodes by construction. gp3 is `ReadWriteOnce`. |
+
+The file-level half of this table is now mechanical. `make lint` fails on a
+pod that requests a GPU without tolerating the GPU taint, a GPU pod that is
+Burstable or asks for more memory or cpu than the smallest supported GPU
+instance can give one pod, a Route missing
+either timeout annotation, a Service that regained the gateway's own 8000
+beside the proxy port, a Service or Route pointed at the workers, an oauth
+patch that no longer rebinds the gateway to loopback, a Redis without
+`noeviction`, a drain window shorter than `JOB_TIMEOUT`, a `start.sh` that
+stopped defaulting ComfyUI to loopback, and either Containerfile losing its
+`chgrp 0` / `chmod g=u` block. The e2e suite can see none of those — it runs
+no cluster and reads no manifest — so if you are about to argue with a lint
+failure naming one of them, read its row above first. The check exists
+precisely because the edit looks harmless.
 
 `docs/07-design-review.md` is the long form: every one of these traces back to
 a specific bug in the design this was built from. Read it once, early. It is

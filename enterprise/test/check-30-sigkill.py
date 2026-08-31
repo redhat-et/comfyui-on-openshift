@@ -1,10 +1,10 @@
 """SIGKILL: a worker that dies with no warning must not strand its job.
 
-SIGTERM (check2.py) is the polite case. This is the impolite one — OOM kill,
-node reclaim — where the agent gets no chance to clean up. The job it had
-moved into its processing list must be failed loudly by the gateway's reaper
-once the worker's heartbeat lapses, and the worker must drop out of the
-registered count on its own.
+SIGTERM (check-20-failure-paths.py) is the polite case. This is the impolite
+one — OOM kill, node reclaim — where the agent gets no chance to clean up. The
+job it had moved into its processing list must be failed loudly by the
+gateway's reaper once the worker's heartbeat lapses, and the worker must drop
+out of the registered count on its own.
 
 run.sh shrinks HEARTBEAT_TTL and REAPER_INTERVAL so this resolves in seconds
 rather than the production-default minutes.

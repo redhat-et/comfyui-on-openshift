@@ -57,8 +57,53 @@ not requeued: a workflow that OOM-killed one worker would kill the next too.
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
 
+**The queue payload envelope round-trips, and tolerates both vintages.** A
+submitted job carries `schema_version` plus the four fields reserved for later
+roadmap items, each with its default, and the test reads them off the raw Redis
+list rather than trusting the gateway's response. It then pushes two payloads
+the gateway would never write — the pre-F2 `{job_id, workflow}` shape, and one
+carrying a field neither file defines — and asserts both run to completion with
+the version the worker actually parsed recorded on the job's state hash. This is
+the rolling-deploy case: the gateway and the workers are separate images, so a
+queue entry written by one vintage is always read by the other at some point
+during a rollout, and `docs/07-design-review.md` explains why the failure that
+matters there is a discarded entry rather than a crash.
+
 ## What it does not cover
 
 Anything requiring a real cluster: KEDA actually scaling, the machine pool
 provisioning a node, oauth-proxy, EFS, the GPU itself. Those need
 `enterprise/setup.sh` against a real cluster.
+
+## Adding a check
+
+**A check is a file. There is no second place to edit.** `run.sh` discovers
+every `check*.py` in this directory, runs them in filename order, and stops at
+the first one that exits non-zero — whose status becomes the suite's. A check
+that is dropped in here and never mentioned anywhere else still runs, and still
+fails the suite. That was not true before `docs/10-roadmap.md` item F3: the
+files were copied by a glob but invoked by hardcoded name, so a new check was
+copied, never run, and the suite stayed green.
+
+The convention:
+
+| | |
+|---|---|
+| **Name** | `check-NN-slug.py` — `NN` a zero-padded ordinal, `slug` what it is about. |
+| **Order** | Filename order, so leave gaps: `10`, `20`, `30`. Do **not** write `check4.py`; unpadded numbers sort wrong (`check10` lands between `check` and `check2`) and the ordering here is load-bearing. |
+| **argv[1]** | The pid of a worker agent that is up and polling. Ignore it if you do not need it. |
+| **Environment** | Inherited from `run.sh`: Redis on 6399, the gateway on 8100, the stub ComfyUI on 8999, and the shrunk `HEARTBEAT_TTL` / `REAPER_INTERVAL` / `JOB_TIMEOUT` that let worker-death assertions resolve in seconds. |
+| **Exit status** | 0 for pass, non-zero for fail. Print one `PASS`/`FAIL` line per assertion — the existing checks share a four-line `check()` helper worth copying. |
+| **Runtime** | Under `CHECK_TIMEOUT` (default 240s), which is a hang kill-switch rather than a budget. Keep a check to seconds; the whole suite is meant to run in about a minute. |
+
+**You may kill the agent.** `check-20-failure-paths.py` SIGTERMs it and asserts
+it drains; `check-30-sigkill.py` SIGKILLs it and asserts the gateway's reaper
+notices. `run.sh` checks the agent is alive before each check and starts a fresh
+one if the previous check left it dead, so the check after yours is unaffected —
+and no check ever runs beside a second registered worker, which assertions about
+`workers_registered` could not see through.
+
+**What a check may assume:** Redis, the stub ComfyUI, the gateway and one live
+agent are all up, and every earlier check passed. **What it may not assume:**
+that it is last, or that the queue is empty — an earlier check may have left
+finished jobs and their streams behind.

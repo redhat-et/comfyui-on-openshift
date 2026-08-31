@@ -1,0 +1,23 @@
+---
+# Fixture: a Route that kept haproxy.router.openshift.io/timeout but lost
+# timeout-tunnel. Otherwise shaped like enterprise/manifests/04-route-plain.yaml.
+# On an edge/reencrypt route only timeout-tunnel governs the upgraded
+# WebSocket (docs/09-engineering-handoff.md section 3) — keeping `timeout`
+# alone looks safe and is not. Valid YAML, so yaml.safe_load_all accepts it.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: comfy
+  labels:
+    app: comfy-gateway
+  annotations:
+    haproxy.router.openshift.io/timeout: 4h
+spec:
+  to:
+    kind: Service
+    name: comfy-gateway
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
