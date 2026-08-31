@@ -169,6 +169,7 @@ miserable to reproduce.
 | `haproxy.router.openshift.io/timeout: 4h` **and `timeout-tunnel`** on every Route | `enterprise/manifests/` | HAProxy's 30-second default kills long generations mid-render and reads exactly like an application bug. On edge and reencrypt Routes only `timeout-tunnel` governs the upgraded WebSocket, against a one-hour router default — setting `timeout` alone still drops long jobs. Both annotations, or neither works. |
 | The `chgrp 0` / `chmod g=u` block in both Containerfiles | `app/Containerfile`, `enterprise/worker/Containerfile` | OpenShift runs the container as an arbitrary high UID with GID 0. Without it, ComfyUI cannot write `temp/`, `input/`, `user/` and the pod crash-loops. This is the single most common OpenShift containerisation failure. |
 | GPU pods sized to fit the smallest supported instance, requests equal to limits | `enterprise/manifests/02-worker.yaml`, `manifests/base/deployment.yaml` | The 16 GiB of *host* RAM on a `g6.xlarge` is not the card's 24 GB of VRAM. A memory limit above what one pod can hold on that node is unreachable, so the real ceiling becomes node pressure: an eviction, or a kernel OOM kill of ComfyUI, instead of a clean container-level `OOMKilled`. Unequal requests and limits make the pod Burstable, which is evicted before Guaranteed pods and carries a far more attractive `oom_score_adj` — on a pod holding a GPU mid-generation. |
+| A per-submitter output workspace is **sanitized, then joined, then resolved, then verified inside `OUTPUT_ROOT`**, and created with an explicit group-writable setgid mode | `worker_agent.py`, note 7 / `scripts/lint.sh` | Two ways to break one mechanism. The header the workspace is named from is client-supplied under `AUTH_MODE=none`, so a join whose containment is never re-checked — or a `resolve()` done *before* the join, which proves nothing about the joined path — is an arbitrary filesystem write from an unauthenticated request. Separately, the mode is not cosmetic: OpenShift gives each pod an arbitrary high UID that is not stable across pods, so a directory created at runtime by one worker is unwritable by the next one without `g+w`, and the files ComfyUI writes inside it do not get GID 0 without `setgid`. `mkdir`'s own mode argument is masked by umask and yields `0755`, so this must be an explicit `chmod` — and it is invisible to `make test`, which runs one agent as one UID on a local filesystem where the creator owns everything. |
 | `STORAGE_MODE=rwx` for the multi-user configuration | `enterprise/setup.sh` refuses otherwise | The gateway serves images off the volume the workers write to, and they are on different nodes by construction. gp3 is `ReadWriteOnce`. |
 
 The file-level half of this table is now mechanical. `make lint` fails on a
@@ -185,14 +186,20 @@ no cluster and reads no manifest — so if you are about to argue with a lint
 failure naming one of them, read its row above first. The check exists
 precisely because the edit looks harmless.
 
-Two more shapes are pinned there for the opposite reason: they are in the
-Python the suite *does* run, and the suite still cannot see one of them. `make
-lint` fails on a retry counter written by anything other than `HINCRBY` —
-whose failure mode needs the two gateway replicas `01-gateway.yaml` runs and
-`enterprise/test/run.sh` starts one — and on a `TERMINAL_TYPES` that gained a
-member, which `check-30-sigkill.py` would also catch but which is pinned
-anyway, because "add the new event type to the terminal set" is precisely the
-tidying that arrives in a diff about something else.
+Four more shapes are pinned there for the opposite reason: they are in the
+Python and the shell the suite *does* run, and the suite still cannot see
+three of them. `make lint` fails on a retry counter written by anything other
+than `HINCRBY` — whose failure mode needs the two gateway replicas
+`01-gateway.yaml` runs and `enterprise/test/run.sh` starts one — and on a
+`TERMINAL_TYPES` that gained a member, which `check-30-sigkill.py` would also
+catch but which is pinned anyway, because "add the new event type to the
+terminal set" is precisely the tidying that arrives in a diff about something
+else. It also fails on an output workspace whose directory mode is no longer
+group-writable and setgid, or that is no longer set by an explicit `chmod`,
+and on a `start.sh` that hardcodes ComfyUI's `--output-directory` instead of
+taking it from the same `OUTPUT_ROOT` the agent reads. Those last three are
+the arbitrary-UID row above: one agent, one UID, one local filesystem is a
+configuration in which every one of them looks fine.
 
 `docs/07-design-review.md` is the long form: every one of these traces back to
 a specific bug in the design this was built from. Read it once, early. It is

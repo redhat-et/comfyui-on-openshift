@@ -370,6 +370,7 @@ flowchart TD
 | **No GPU capacity, or no quota** | The worker pod stays `Pending`. `make preflight` distinguishes the two — quota is a multi-day fix, capacity is a region or instance-family change. | `docs/05-troubleshooting.md`. |
 | **First job after an idle period** | Not a failure, but it looks like one: a node has to be provisioned and a ~10 GB image pulled. | 8–17 minutes, and the gateway says so rather than leaving a bar that has not moved. Removed entirely by one warm worker — see "Where this loses". |
 | **Someone requests a path outside the output directory** | Resolved and compared against the output root before anything is served. | `/outputs/../../etc/passwd` does not resolve. Asserted by the e2e suite. |
+| **A submitter's name, or a workflow's filename prefix, tries to become a path** | Both are caller-supplied and both end up on the filesystem, so both are handled as hostile. The username is sanitized to a name that cannot contain a separator, then joined, then resolved, then verified inside the output root — in that order. A `filename_prefix` carrying `..` or an absolute path is refused outright. | A username of `../../etc/passwd` gets an ordinary confined workspace rather than a traversal; a workflow trying to write outside its workspace fails with a message naming the prefix. Asserted by the e2e suite. |
 
 </details>
 
@@ -542,10 +543,19 @@ says which two of these should not be done at all.
    a deterministic per-workflow failure into a non-deterministic one where the
    victim is whichever job allocates second. MIG partitions memory properly and
    is not available on L4. *(Revisit only on MIG-capable hardware.)*
-6. **Per-user output workspaces.** The gateway already records the
-   authenticated user on each job; threading that into the output path is the
-   remaining half. Gets you per-user galleries and makes the next item trivial.
-   *(Small.)*
+6. **Per-user output workspaces — landed.** Each job now writes into its own
+   `/output/<workspace>/`, named from the submitter's identity by the worker
+   agent, and every output that comes back is confined there whether or not
+   the save node cooperated (`docs/10-roadmap.md`, Q3). Two things it is worth
+   knowing it does *not* do. Reads are not caller-scoped: the workspaces are
+   organisation and confinement, not access control, because the only identity
+   here is a header that is client-supplied under `AUTH_MODE=none` and a
+   guarantee that evaporates in one of two modes is worse than a documented
+   absence. And usernames are sanitized rather than rejected — an oauth-proxy
+   name is an email, so `@` and `.` are the ordinary case. *(The half that
+   still needs a cluster is the directory mode: an arbitrary, unstable UID
+   means a workspace one pod creates must be group-writable and setgid for the
+   next one.)*
 7. **Showback from the data you already collect.** Job attribution plus GPU
    seconds is a monthly "who spent the card" report. In most organisations this
    changes behaviour faster than any technical control. *(Small.)*

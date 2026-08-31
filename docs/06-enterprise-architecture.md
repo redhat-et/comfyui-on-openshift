@@ -217,12 +217,36 @@ format rather than behind a button in a shared UI.
 
 ## What is deliberately not here
 
-- **Per-user workspaces.** Every user shares one output directory. Adding
-  identity-scoped paths means threading the authenticated user from the
-  oauth-proxy headers through the gateway into the output path — worth doing,
-  not done here. (The gateway does now record that authenticated user on each
-  job's state, so attribution — whose job is this — exists without the
-  workspaces.)
+- **Per-user *isolation* of outputs.** The workspaces themselves are here now —
+  `docs/10-roadmap.md` (Q3) landed them — so this entry is no longer "every
+  user shares one output directory". Each job writes into
+  `/output/<workspace>/`, named from the submitter's identity by the worker
+  agent, and every output that comes back out is confined to that directory
+  whether or not the save node cooperated.
+
+  What is still deliberately absent is **access control on reads**. The
+  workspaces are organisational and confining, not a security boundary: the
+  gateway serves `/outputs/...` to any caller who has the URL, exactly as it
+  did before. That is a decision, not an omission. The only identity this
+  system has is `X-Forwarded-User`, and under `AUTH_MODE=none` it is
+  client-supplied — `hub.py` says in three places that it must never be
+  treated as authorization. Scoping reads on it would be a control that works
+  under `AUTH_MODE=oauth` and silently evaporates under `AUTH_MODE=none`,
+  which is worse than a documented absence, because the illusion is what
+  people would rely on. It would also break the thing users actually do with
+  these URLs, which is send them to each other. Real read isolation needs an
+  identity the gateway can trust in *both* modes; that is a different item
+  from this one, and it is not here.
+
+  Two smaller consequences worth knowing. Usernames are sanitized to an
+  allowlist slug plus a hash of the original, so an output directory is
+  readable ("alice-smith-example-com-7dcd3a39ad3a") without two different
+  usernames ever sharing one; nothing is rejected for the *shape* of a
+  username, because an IdP's spelling of a person's name is not something
+  they can fix. And a workflow's `filename_prefix` **is** rejected if it
+  contains `..` or an absolute path: ComfyUI treats that prefix as a subpath
+  of its output directory, the caller wrote it, and it has an unambiguous
+  safe form.
 - **Job priority.** Still not here, on purpose, and the reasoning changed once
   `docs/10-roadmap.md` (Q1) landed fair queueing. A priority lane needs a claim
   from the caller — "I'm interactive" — and the only identity this gateway can

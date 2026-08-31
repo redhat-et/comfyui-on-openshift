@@ -6,7 +6,7 @@ Runs alongside ComfyUI in the GPU pod. ComfyUI binds 127.0.0.1 only, so this
 agent is the sole path in or out — no user can reach the GPU pod directly, and
 the pod needs no Service, no Route, and no ingress rules.
 
-Six things here that the obvious version of this script gets wrong, each of
+Seven things here that the obvious version of this script gets wrong, each of
 which produces an intermittent bug that is miserable to diagnose in a cluster:
 
   1. Connect the WebSocket BEFORE submitting the prompt. ComfyUI starts emitting
@@ -46,14 +46,28 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      and the record says it is not, and that window is exactly when a retry
      replays a poison workflow. The queue entry cannot carry this — it is a
      static copy of what hub.py pushed and nothing rewrites it.
+
+  7. Treat the submitter's name as hostile input, because it becomes a PATH.
+     Each job writes into its own output workspace under OUTPUT_ROOT, named
+     from an X-Forwarded-User that is client-supplied whenever AUTH_MODE=none.
+     Sanitize into a name that cannot contain a separator, THEN join, THEN
+     resolve, THEN verify the result is still inside OUTPUT_ROOT — a resolve
+     before the join proves nothing about the joined path. And create those
+     directories with an EXPLICIT mode: OpenShift's arbitrary, unstable UID
+     means a directory this pod creates is unwritable by the next one unless
+     it is group-writable and setgid. See BEGIN OUTPUT WORKSPACES below.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pathlib
+import re
 import signal
 import socket
+import stat
 import sys
 import time
 import urllib.error
@@ -83,6 +97,12 @@ COMFY_ADDR = f"{COMFY_HOST}:{COMFY_PORT}"
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "60"))
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
+
+# The shared output volume, as this container sees it. It must be the same
+# directory start.sh hands ComfyUI as --output-directory — start.sh reads this
+# same variable for exactly that reason — because everything below computes
+# where an output SHOULD be from paths ComfyUI reports relative to it.
+OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 
 WORKER_ID = os.environ.get("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
 CLIENT_ID = str(uuid.uuid4())
@@ -314,6 +334,323 @@ signal.signal(signal.SIGINT, handle_sigterm)
 
 
 # ---------------------------------------------------------------------------
+# BEGIN OUTPUT WORKSPACES — one directory per submitter (docs/10-roadmap.md, Q3)
+#
+# Every generation used to land in one flat /output shared by everyone, so two
+# users' jobs could and did report the same URL. Each job now writes inside
+# OUTPUT_ROOT/<workspace>/, where <workspace> is derived from the envelope's
+# `user` field — the X-Forwarded-User the gateway recorded, which F2 reserved
+# for exactly this.
+#
+# WHAT THIS IS AND IS NOT. It is organisation and confinement: whose output is
+# whose, and no job can write or name a path outside OUTPUT_ROOT. It is NOT an
+# access control boundary — reads are deliberately not caller-scoped, see
+# docs/06-enterprise-architecture.md. Under AUTH_MODE=none X-Forwarded-User is
+# client-supplied, and hub.py says in three places that it must never be
+# treated as authorization; scoping reads on it would be authorization derived
+# from an unauthenticated header, i.e. a control that silently evaporates in
+# one of the two supported modes. A URL is exactly as guessable as it was
+# before this item.
+#
+# That is also why this code lives HERE rather than in hub.py. The gateway is
+# the public attack surface and it never needed to grow a filesystem-naming
+# rule: the agent is the only process that both knows who submitted the job
+# and touches the volume, and it is already the only path in or out of a GPU
+# pod. No envelope field is added either — the workspace is a pure function of
+# `user`, so there is nothing for a gateway and a worker of different vintages
+# to disagree about on the wire.
+#
+# THE SANITIZATION RULE: allowlist-slug + hash suffix, and it never rejects a
+# username.
+#
+#   workspace("alice.smith@example.com") -> "alice-smith-example-com-9f2a...."
+#   workspace("../../etc/passwd")        -> "etc-passwd-1c07...."
+#   workspace("")  / no header           -> "_anonymous"
+#
+# Every run of characters outside [A-Za-z0-9] collapses to "-", so a separator
+# ("/"), a traversal segment (".."), a leading "/" and a NUL cannot survive
+# into the name at all — the dangerous shapes are not escaped or rejected,
+# they are unrepresentable. The 12 hex characters of sha256(user) then restore
+# what the allowlist threw away: two different usernames that slug identically
+# ("a/b" and "a-b", or two long names sharing a 40-character prefix) still get
+# two different directories. That is why this is not a plain allowlist —
+# a plain one silently MERGES two people's outputs, which is the same bug as
+# the flat directory, only harder to see.
+#
+# And it is why it is not a plain hash either. An operator looking at EFS, or
+# at a support ticket, has to be able to tell whose directory this is; a tree
+# of bare digests is unusable, and the roadmap's own warning is that mangling
+# real usernames is as bad as admitting bad ones. An oauth-proxy username is
+# an email — "@" and "." are the ordinary case, not the hostile one, and they
+# survive here as readable "-" separators with the identity kept whole by the
+# digest.
+#
+# Rejecting was the third option and is the wrong one for the username: a
+# rejected submit is a user who cannot use the cluster at all because of how
+# their IdP spells their name, and the shape that would have to be rejected
+# (anything with a "/" or a "..") is not reliably distinguishable from a
+# legitimate exotic username. Rejection IS used, deliberately, one layer down
+# — for a filename_prefix that already contains traversal, see
+# scoped_prefix() — because that one is a workflow the caller wrote, it has an
+# unambiguous safe form, and the caller can fix it.
+#
+# ORDER OF OPERATIONS, which is the whole security argument: sanitize the
+# username into a name that cannot contain a separator, THEN join it onto
+# OUTPUT_ROOT, THEN resolve, THEN verify the result is still inside
+# OUTPUT_ROOT (workspace_path below). Resolving before joining proves nothing
+# about the joined path, and a join whose containment is never re-checked
+# trusts the sanitizer completely — the resolve()-then-verify is what catches
+# a symlink planted in the output volume, which no amount of string filtering
+# can see.
+#
+# DIRECTORY MODE, which is the half a laptop cannot prove. OpenShift runs each
+# pod as an arbitrary high UID with GID 0, and the UID is not stable across
+# pods. A directory one worker creates at runtime is therefore read-only to
+# the next worker unless it is group-writable, and its children belong to the
+# creator's group unless the setgid bit forces GID 0 down the tree. Hence an
+# EXPLICIT chmod to 2775 rather than trusting mkdir's mode argument (masked by
+# umask, which is 022 in this image and would produce 0755 — group-readable,
+# not group-writable) and rather than trusting the local filesystem's
+# defaults. See docs/09-engineering-handoff.md §3.
+# ---------------------------------------------------------------------------
+
+# Where a job with no authenticated submitter goes. Deliberately not "" (which
+# would put anonymous output loose in the shared root again) and deliberately
+# not derivable from any username: a real workspace is always
+# "<slug>-<12 hex>", and the leading underscore is a character the slug rule
+# cannot emit, so "no user" can never alias onto whoever submits next.
+ANON_WORKSPACE = "_anonymous"
+
+# Everything outside the allowlist collapses to a single "-".
+WORKSPACE_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
+
+# Bounds on the readable half. 40 + 1 + 12 is far below NAME_MAX (255) even
+# before hub.py's own 256-character clamp on the header.
+MAX_WORKSPACE_SLUG_CHARS = 40
+WORKSPACE_DIGEST_CHARS = 12
+
+# setgid + group-writable. Both halves are load-bearing under an arbitrary UID:
+# g+w is what lets the NEXT pod write here at all, and setgid is what makes the
+# files and subdirectories ComfyUI creates inside inherit GID 0 instead of the
+# creating pod's own group.
+WORKSPACE_DIR_MODE = 0o2775
+
+# What ComfyUI's own SaveImage defaults to when a workflow leaves it empty.
+DEFAULT_FILENAME_PREFIX = "ComfyUI"
+
+# The one input ComfyUI treats as a path relative to --output-directory. Save
+# nodes spell it this way (SaveImage, SaveAnimatedPNG/WEBP and the video nodes
+# that copy them), which is what makes rewriting it the whole per-job scoping
+# mechanism: ComfyUI is a long-lived process started with ONE fixed
+# --output-directory, so there is no per-job flag to set instead.
+FILENAME_PREFIX_INPUT = "filename_prefix"
+
+
+def workspace_name(user: str) -> str:
+    """The submitter's directory name. Total, never raises, never rejects."""
+    if not user:
+        return ANON_WORKSPACE
+
+    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
+    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
+
+    # .strip("-") again: the truncation above can leave a trailing separator.
+    # "user" when nothing readable survived — the digest still separates two
+    # such names from each other.
+    return f"{slug.strip('-') or 'user'}-{digest}"
+
+
+def workspace_path(workspace: str) -> pathlib.Path:
+    """
+    Join, resolve, then verify — in that order, and never any other.
+
+    The sanitizer above is the reason this can only ever be a single name, and
+    this is the reason it does not have to be trusted: a resolved path that is
+    not under OUTPUT_ROOT is refused whatever produced it, including a symlink
+    already sitting in the output volume that no string rule could see.
+    """
+    candidate = (OUTPUT_ROOT / workspace).resolve()
+
+    if not candidate.is_relative_to(OUTPUT_ROOT):
+        raise ValueError(f"workspace {workspace!r} resolves outside {OUTPUT_ROOT}")
+
+    return candidate
+
+
+def set_shared_mode(path: pathlib.Path) -> None:
+    """
+    Force WORKSPACE_DIR_MODE, explicitly, on a directory we may not own.
+
+    Not a no-op even right after mkdir: mkdir's mode is masked by umask. Not
+    fatal if it fails either — a directory created by an EARLIER pod is owned
+    by a UID this pod does not have, so chmod is EPERM there, and that is the
+    normal steady state rather than an error. It is logged, because a
+    workspace that is not group-writable is precisely what makes the next
+    pod's write fail with a permission error that reads like a storage fault.
+
+    The read-back is what keeps the cluster's steady state quiet: pod 2 finds
+    the mode pod 1 already set, and never issues the chmod that would EPERM.
+    It does not converge everywhere — a developer laptop, where this process
+    is not a member of the directory's group, has the kernel silently drop
+    S_ISGID and this re-chmods once per job, harmlessly. The bit that is not
+    observable on a laptop is exactly the bit cluster day is for; see
+    docs/09-engineering-handoff.md §3.
+    """
+    try:
+        if stat.S_IMODE(path.stat().st_mode) != WORKSPACE_DIR_MODE:
+            os.chmod(path, WORKSPACE_DIR_MODE)
+
+    except OSError as exc:
+        log(f"warning: could not set mode {oct(WORKSPACE_DIR_MODE)} on {path}: {exc} "
+            f"— another pod's UID may not be able to write here")
+
+
+def ensure_workspace(path: pathlib.Path) -> None:
+    """Create every level below OUTPUT_ROOT, each with the explicit mode."""
+    current = OUTPUT_ROOT
+
+    for part in path.relative_to(OUTPUT_ROOT).parts:
+        current = current / part
+
+        try:
+            current.mkdir()
+
+        except FileExistsError:
+            pass  # another worker pod got here first; that is the normal case
+
+        set_shared_mode(current)
+
+
+def scoped_prefix(workspace: str, prefix) -> str:
+    """
+    Move one save node's filename_prefix inside this submitter's workspace.
+
+    ComfyUI treats filename_prefix as a path relative to its output directory
+    and will happily create subdirectories from it, so it is a caller-supplied
+    path component in the same sense the username is — except that here
+    rejection is the right answer. A prefix carrying ".." or an absolute path
+    has no legitimate reading: the caller is asking to write outside the place
+    the system just decided their output goes, and the job fails with a
+    message naming the prefix so they can fix it.
+
+    Idempotent: a prefix already inside this workspace is left alone, so a
+    requeued job (Q2) or a workflow copied out of a previous run is not nested
+    one level deeper each time. A prefix naming SOMEBODY ELSE'S workspace is
+    not special-cased — it is simply prefixed like any other, landing inside
+    the submitter's own workspace under a confusing name and outside nobody's.
+    """
+    text = prefix if isinstance(prefix, str) else ""
+    text = text.strip() or DEFAULT_FILENAME_PREFIX
+
+    if "\0" in text or "\\" in text or text.startswith("/"):
+        raise ValueError(
+            f"{FILENAME_PREFIX_INPUT} {prefix!r} is an absolute or escaped path; "
+            f"it must be a plain relative name inside your output workspace")
+
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+
+    if any(part == ".." for part in parts):
+        raise ValueError(
+            f"{FILENAME_PREFIX_INPUT} {prefix!r} contains a '..' path segment; "
+            f"it must be a plain relative name inside your output workspace")
+
+    if not parts:
+        parts = [DEFAULT_FILENAME_PREFIX]
+
+    if parts[0] == workspace:
+        return "/".join(parts)
+
+    return "/".join([workspace] + parts)
+
+
+def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
+    """
+    Rewrite every save node's filename_prefix in place, before submitting.
+
+    This is what makes the common case cost nothing: ComfyUI writes straight
+    into the workspace, so there is no copy afterwards. It is best-effort by
+    construction — a custom node that hardcodes its own output path, or spells
+    the input differently, is not covered — which is why the collection side
+    below enforces the same confinement again on what actually came out.
+    """
+    scoped = 0
+
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.get("inputs")
+
+        if not isinstance(inputs, dict) or FILENAME_PREFIX_INPUT not in inputs:
+            continue
+
+        inputs[FILENAME_PREFIX_INPUT] = scoped_prefix(workspace, inputs[FILENAME_PREFIX_INPUT])
+        scoped += 1
+
+    return scoped
+
+
+def output_subfolder(workspace: str, subfolder: str, filename: str) -> str:
+    """
+    Where this output actually lives, relative to OUTPUT_ROOT — moving it into
+    the workspace if a node put it somewhere else.
+
+    The prefix rewrite above covers save nodes that honour filename_prefix.
+    This covers the rest, and it is the half that makes "every output of this
+    job is inside its submitter's workspace" a property rather than a hope:
+    the agent is the only path out of the pod, so it is the only place that
+    can enforce it on outputs it did not get to name.
+    """
+    if not filename:
+        return subfolder
+
+    try:
+        ws_root = workspace_path(workspace)
+        reported = (OUTPUT_ROOT / subfolder / filename).resolve()
+
+    except (ValueError, OSError) as exc:
+        log(f"warning: cannot place {subfolder}/{filename} in workspace {workspace}: {exc}")
+        return workspace
+
+    if not reported.is_relative_to(OUTPUT_ROOT):
+        # ComfyUI does not do this; a custom node with a hardcoded path could.
+        # Never name it in a URL — hub.py would refuse to serve it anyway, and
+        # this way the refusal is not the only thing standing there.
+        log(f"warning: output {subfolder}/{filename} resolves outside {OUTPUT_ROOT} — not served")
+        return workspace
+
+    if reported.is_relative_to(ws_root):
+        return subfolder  # already scoped, by the prefix rewrite
+
+    if not reported.exists():
+        # A node reported a file it did not write, or something else removed
+        # it. There is nothing to move and nothing to serve either way, so
+        # name the place it belonged rather than the shared root it did not.
+        log(f"note: output {subfolder}/{filename} is not on disk — "
+            f"reporting it under workspace {workspace}")
+        return f"{workspace}/{subfolder}".rstrip("/")
+
+    destination = ws_root / subfolder / filename
+
+    try:
+        ensure_workspace(destination.parent)
+        os.replace(reported, destination)
+
+    except OSError as exc:
+        log(f"warning: could not move {reported} into {ws_root}: {exc}")
+
+        # Still inside OUTPUT_ROOT, just not namespaced. Serving it from where
+        # it really is beats reporting a URL for a file that is not there.
+        if reported.exists():
+            return subfolder
+
+    return f"{workspace}/{subfolder}".rstrip("/")
+
+# END OUTPUT WORKSPACES
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Redis
 # ---------------------------------------------------------------------------
 
@@ -414,6 +751,12 @@ def run_job(conn: redis.Redis, job: dict) -> None:
     job_id = job["job_id"]
     workflow = job["workflow"]
 
+    # Whose output this is (docs/10-roadmap.md, Q3). Derived from the
+    # envelope's `user` — the only identity that reaches this pod — and from
+    # nothing about this worker or this attempt, so a requeued job lands in
+    # the same place on whichever worker picks it up next.
+    workspace = workspace_name(job["user"])
+
     conn.hset(
         state_key(job_id),
         mapping={
@@ -436,6 +779,16 @@ def run_job(conn: redis.Redis, job: dict) -> None:
     )
     conn.expire(state_key(job_id), EVENT_STREAM_TTL)
     emit(conn, job_id, {"type": "started", "data": {"worker": WORKER_ID}})
+
+    # Before anything is submitted, and before the WebSocket is even opened:
+    # make the workspace exist with the right mode, and point every save node
+    # at it. A workflow whose filename_prefix already tries to escape raises
+    # here and fails the job with a message naming the prefix — the caller
+    # never reaches ComfyUI, and no directory is created for a request that
+    # was going to be refused.
+    scoped = scope_workflow_outputs(workflow, workspace)
+    ensure_workspace(workspace_path(workspace))
+    log(f"job {job_id} -> workspace {workspace} ({scoped} save node(s) rewritten)")
 
     # Connect first, submit second. See point 1 in the module docstring.
     ws = websocket.WebSocket()
@@ -478,7 +831,7 @@ def run_job(conn: redis.Redis, job: dict) -> None:
                 # that our prompt has not quietly completed while we were not
                 # looking, then keep waiting.
                 if prompt_finished(prompt_id):
-                    finish(conn, job_id, "completed", collect_outputs(prompt_id))
+                    finish(conn, job_id, "completed", collect_outputs(prompt_id, workspace))
                     return
 
                 emit(conn, job_id, {"type": "waiting", "data": {"prompt_id": prompt_id}})
@@ -516,7 +869,7 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             # Newer ComfyUI emits execution_success; older builds signal
             # completion with executing/node=None. Accept either.
             if kind == "execution_success" or (kind == "executing" and data.get("node") is None):
-                finish(conn, job_id, "completed", collect_outputs(prompt_id))
+                finish(conn, job_id, "completed", collect_outputs(prompt_id, workspace))
                 return
 
     finally:
@@ -533,10 +886,16 @@ def prompt_finished(prompt_id: str) -> bool:
         return False
 
 
-def collect_outputs(prompt_id: str) -> dict:
+def collect_outputs(prompt_id: str, workspace: str) -> dict:
     """
     Pull the output manifest from /history. The WebSocket 'executed' events also
     carry it, but history is authoritative and survives a reconnect.
+
+    Each entry's subfolder is resolved through output_subfolder() first
+    (docs/10-roadmap.md, Q3), so what the browser is handed is where the file
+    is inside this submitter's workspace — not where a save node happened to
+    put it. The reported subfolder is rewritten as well as the url, because it
+    is what a caller reading the manifest itself would join a path from.
     """
     try:
         entry = comfy_get(f"/history/{prompt_id}").get(prompt_id, {})
@@ -547,13 +906,14 @@ def collect_outputs(prompt_id: str) -> dict:
 
     for node_output in (entry.get("outputs") or {}).values():
         for image in node_output.get("images", []):
-            subfolder = image.get("subfolder") or ""
+            filename = image.get("filename")
+            subfolder = output_subfolder(workspace, image.get("subfolder") or "", filename)
             images.append(
                 {
-                    "filename": image.get("filename"),
+                    "filename": filename,
                     "subfolder": subfolder,
                     "type": image.get("type"),
-                    "url": f"/outputs/{subfolder}/{image.get('filename')}".replace("//", "/"),
+                    "url": f"/outputs/{subfolder}/{filename}".replace("//", "/"),
                 }
             )
 

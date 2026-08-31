@@ -457,6 +457,27 @@ shape_require enterprise/gateway/hub.py \
     '^TERMINAL_TYPES = \{"completed", "failed", "cancelled"\}$' \
     "the set of event types that END a progress stream is exactly these three. Adding the retry event to it (or renaming one of them) makes every tailing browser stop reading at the retry and sit on a dead socket while the second attempt runs to completion behind it — the job succeeds and the user never sees it"
 
+# Q3's per-user output workspaces (docs/10-roadmap.md). Both halves below are
+# invisible to enterprise/test/run.sh by construction: it runs one agent, as
+# one UID, on one laptop filesystem, where a directory the same process created
+# is writable whatever its group bits say. The failure they guard against needs
+# two pods with two different arbitrary UIDs on EFS — cluster day — and it
+# presents as the SECOND worker failing to write a user's output with a
+# permission error that reads like a storage fault.
+shape_require enterprise/worker/worker_agent.py \
+    '^WORKSPACE_DIR_MODE = 0o2775$' \
+    "runtime-created output workspaces must be setgid and group-writable. OpenShift gives each pod an arbitrary high UID with GID 0 and does not keep the UID stable across pods, so g+w is what lets the next worker write into a directory this one created, and the setgid bit is what makes ComfyUI's files inside it inherit GID 0 rather than the creating pod's group"
+
+shape_require enterprise/worker/worker_agent.py \
+    'os\.chmod\(path, WORKSPACE_DIR_MODE\)' \
+    "the mode above must be applied EXPLICITLY. mkdir's own mode argument is masked by umask (022 in this image, which yields 0755 — group-readable, not group-writable), so a workspace created without this chmod looks correct locally and is unwritable by the next pod on the cluster"
+
+# The pattern deliberately starts after the leading dashes: shape_require hands
+# it straight to `grep -qE`, which would read "--output-directory..." as flags.
+shape_require enterprise/worker/start.sh \
+    'output-directory "\$OUTPUT_ROOT"' \
+    "ComfyUI's output directory and the agent's OUTPUT_ROOT must be the same one variable. ComfyUI is long-lived with a single fixed --output-directory and the agent computes every submitter's workspace underneath it; hardcoding one side lets the pod start with the agent naming paths under a directory ComfyUI is not writing to, which 404s every generation and logs nothing"
+
 (( SHAPE_BAD == 0 )) && ok "clean" || FAILURES=$(( FAILURES + 1 ))
 
 # ---------------------------------------------------------------------------

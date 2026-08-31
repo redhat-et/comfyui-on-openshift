@@ -67,6 +67,22 @@ onto next.
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
 
+**Outputs are per-submitter, and a submitter's name cannot escape.** Two users
+submitting the identical workflow land in two different directories, which the
+stub makes a real test rather than a tautology: `fake_comfy.py` reports the
+same `{out_0001.png, ""}` for every job it is ever given, so the returned URLs
+can only differ if the submitter's identity actually changed where the output
+went (docs/10-roadmap.md, Q3). The rest of `check-60-user-workspaces.py` is
+hostile-input testing, because the identity it names a directory from is a
+request header: a username of `../../../../tmp/evil`, of `/etc/passwd`, empty,
+and 2000 characters long must each either be refused at submit or produce only
+a confined, namespaced, servable output — and, in the other direction, an
+ordinary `alice.smith@example.com` must still get a real workspace, since
+sanitizing so hard that real usernames break is its own failure. What this
+cannot see is the directory *mode*: it runs one agent as one UID, and the bug
+it would be looking for needs two pods with two different arbitrary UIDs on
+EFS. `scripts/lint.sh` pins the mode instead.
+
 **The queue payload envelope round-trips, and tolerates both vintages.** A
 submitted job carries `schema_version` plus the four fields reserved for later
 roadmap items, each with its default, and the test reads them off the raw Redis

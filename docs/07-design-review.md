@@ -367,6 +367,78 @@ Three smaller things that were not obvious until it was written:
   at the queue layer and nowhere else, and a failure message that says only
   "the worker died" spends that fact.
 
+### Q3 — the username becomes a path, and the part that cannot be tested here
+
+The one-line version of per-user output workspaces is
+`OUTPUT_ROOT / user / filename`, and it is a path-traversal bug written in a
+single expression. `X-Forwarded-User` is a request header, client-supplied
+whenever `AUTH_MODE=none`, and `hub.py` says so in three places — this item is
+where that sentence stops being a caveat about attribution and becomes the
+security property of a filesystem write. Everything below follows from taking
+that seriously.
+
+**Sanitize, then join, then resolve, then verify — in that order.** Each step
+covers a different failure, and reordering them silently removes one. Resolving
+before the join tells you about a path nobody is going to use. Joining without
+re-verifying containment trusts the sanitizer absolutely, and the sanitizer is
+a string rule that cannot see a symlink someone left in the output volume. The
+`resolve()`-then-`is_relative_to()` pair is the same shape `hub.py`'s
+`output_file()` already uses on the way *out*, and the two are deliberately
+independent: one refuses to build an escaping path, the other refuses to serve
+one.
+
+**The sanitizer's real risk is the opposite of the obvious one.** A pure
+allowlist — strip everything outside `[A-Za-z0-9]` — is safe and quietly
+wrong: `a/b` and `a-b` become the same directory, and so do two long usernames
+that share a prefix. That is the flat shared directory again, for two
+unlucky people, and now much harder to see. A pure hash is injective and
+unusable: an operator looking at EFS, or at a ticket, cannot tell whose
+directory anything is. So it is both — an allowlist slug for the human and 12
+hex of `sha256(user)` for uniqueness. Rejecting unusual usernames was the
+third option and is the wrong one *for the username*: an oauth-proxy identity
+is an email, `@` and `.` are the ordinary case rather than the hostile one,
+and a user whose IdP spells their name unusually cannot fix that. Rejection is
+used one layer down, for a workflow's `filename_prefix` — ComfyUI treats it as
+a subpath of the output directory, the caller wrote it, `..` in it has no
+legitimate reading, and the caller can change it.
+
+**Rewriting the prefix is necessary and is not sufficient.** ComfyUI is one
+long-lived process started with one fixed `--output-directory`, so there is no
+per-job flag to set; the only per-job control is the save node's
+`filename_prefix`, which ComfyUI treats as a subpath. Rewriting it is what
+makes the common case free — the file is written in the right place, nothing
+is copied. But it is best-effort by construction: a custom node that hardcodes
+its own path, or spells the input differently, ignores it entirely. Since the
+agent is the only way out of the pod, the agent enforces the same confinement
+again on what actually came out, moving anything reported outside the
+workspace into it and refusing to name anything that resolves outside
+`OUTPUT_ROOT` at all. "Every output of this job is inside its submitter's
+workspace" is then a property of the agent rather than a hope about nodes.
+
+**Workspaces are not access control, and saying so is the decision.** The
+tempting next step is to scope reads by the same header. That produces a
+control that works under `AUTH_MODE=oauth` and evaporates under
+`AUTH_MODE=none`, where anyone can set the header — an isolation guarantee
+that exists exactly where it is not needed. A guarantee that quietly degrades
+is worse than a documented absence, because people rely on it. Reads are
+therefore unchanged, and `docs/06-enterprise-architecture.md` now says so in
+the "deliberately not here" list rather than leaving it to be inferred.
+
+**And the half a laptop cannot prove.** The workspaces are created at runtime
+by whichever worker pod happens to run a job first, and OpenShift gives each
+pod an arbitrary high UID that is not stable across pods. So the mode matters
+as much as the path: without `g+w` the *next* pod cannot write into a
+directory this one created, and without `setgid` the files ComfyUI creates
+inside it belong to the creating pod's group instead of GID 0. Neither shows
+up in `make test`, which runs one agent as one UID on one local filesystem
+where the process that made the directory owns it. The code therefore sets the
+mode **explicitly** — `mkdir`'s own mode argument is masked by umask and would
+produce `0755` — rather than inheriting a default that happens to work here,
+and `scripts/lint.sh` pins both the constant and the `chmod` call, because a
+default that happens to work locally is precisely the kind of thing a later
+diff tidies away. The behaviour itself is on the cluster-day list in
+`docs/10-roadmap.md`: two pods, two UIDs, one EFS volume.
+
 ---
 
 ## What was right and worth keeping

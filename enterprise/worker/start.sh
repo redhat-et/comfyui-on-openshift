@@ -26,6 +26,15 @@ COMFY_HOST="${COMFY_HOST:-127.0.0.1}"
 COMFY_PORT="${COMFY_PORT:-8188}"
 COMFY_ROOT="${COMFY_ROOT:-/opt/comfyui}"
 
+# One variable for both halves. ComfyUI is a long-lived process with a single
+# fixed --output-directory, and worker_agent.py computes each submitter's
+# output workspace underneath that same directory (docs/10-roadmap.md, Q3) from
+# its own OUTPUT_ROOT. Two variables would let the pod come up with the agent
+# naming paths under a directory ComfyUI is not writing to — every generation
+# would 404 and nothing would log an error.
+OUTPUT_ROOT="${OUTPUT_ROOT:-/output}"
+export OUTPUT_ROOT
+
 comfy_pid=""
 agent_pid=""
 
@@ -61,7 +70,7 @@ python3 main.py \
     --listen "$COMFY_HOST" \
     --port "$COMFY_PORT" \
     --models-directory /models \
-    --output-directory /output \
+    --output-directory "$OUTPUT_ROOT" \
     --temp-directory /tmp &
 comfy_pid=$!
 

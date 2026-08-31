@@ -39,9 +39,10 @@ machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
 nothing until there is a cluster at ~$2.04/hour. Only five items are
 cluster-only for a failing assertion; ten have a laptop half.
 
-**Sixteen invariants are load-bearing** — `docs/09-engineering-handoff.md` §3.
-(Fourteen when this was written; F1 added the fifteenth and Q2 the sixteenth,
-which is what "changes an invariant" looks like in practice.)
+**Seventeen invariants are load-bearing** — `docs/09-engineering-handoff.md`
+§3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth
+and Q3 the seventeenth, which is what "changes an invariant" looks like in
+practice.)
 Thirteen of the items touch at least one, so "the risky ones get a second
 reviewer" is not a useful filter. The filter that *is* useful: an item is
 high-risk if it **changes** an invariant rather than merely working near one.
@@ -180,7 +181,7 @@ What landed:
 check is a file and not also an edit in two hardcoded places, and settle the
 naming convention before six items each create their own `check4.py`. Then
 extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
-assertions. Ten of the sixteen §3 invariants are properties of files rather
+assertions. Eleven of the seventeen §3 invariants are properties of files rather
 than of a running system — a missing toleration, a Service that regained a
 port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
 — and the e2e suite structurally cannot see any of them. This is also what
@@ -196,7 +197,7 @@ was wrong.
 |---|---|---|---|---|---|
 | Q1 | Fair queueing across submitters | Medium | Medium | Queue | e2e: a 5-job batch from one user does not delay a second user's single job |
 | Q2 | Phase breadcrumbs + retry only pre-execution deaths | Medium | **High** | Queue | e2e: a death before submit is retried once; a poison workflow fails once and is not requeued |
-| Q3 | Per-user output workspaces | Medium | **High** | Queue + cluster | e2e on scoping and on a hostile username; arbitrary-UID behaviour needs a cluster |
+| Q3 | Per-user output workspaces — **landed**, laptop half | Medium | **High** | Queue + cluster | `enterprise/test/check-60-user-workspaces.py`: two submitters land in two places, a hostile username is confined rather than mangled or escaped, and an anonymous submission still works and does not alias onto a real user — plus lint shapes for the directory mode. The arbitrary-UID half is on the cluster-day list below |
 | Q6 | Estimated-wait metric | Small | Low | Queue | e2e on the gauge; the scaler half is I4 |
 | Q4 | Showback report | Small | Low | Queue | e2e: GPU seconds attributed to the right user, with a bounded key set |
 | Q5 | GPU-second quota breaker | Medium | Medium | Queue | e2e including quota exhausted and quota data missing (must fail open) |
@@ -322,10 +323,17 @@ at once.
 
 Two cluster-only halves that are easy to miss: Q1's KEDA trigger names a single
 list, so nothing on a laptop proves the pool still scales from zero once the
-pop changes shape; and Q3's real failure mode is arbitrary-UID, since
-per-user directories created by one worker pod must be group-writable for a
-second pod running as a different UID, on EFS, with two pods — unprovable
-anywhere but a cluster.
+pop changes shape; and Q3's real failure mode is arbitrary-UID, unprovable
+anywhere but a cluster. Precisely what Q3 still owes, since the code is
+otherwise landed: run a job as some user, note the mode and group of the
+`/output/<workspace>` directory the worker created (expect `2775` and GID 0),
+then get a SECOND worker pod — a scale-up, or a rollout, so the UID differs —
+to run another job for the SAME user, and confirm it writes into that existing
+directory rather than failing with `EACCES`. Then confirm the file ComfyUI
+wrote inside it is group-owned by GID 0 (that is the setgid bit doing its job,
+not the mkdir) and that the gateway, mounting the same EFS volume read-only as
+a third arbitrary UID, can still serve it. EFS specifically, not gp3: the
+whole point is two pods on two nodes.
 
 Last step of the session is `make park` or `make down`, confirmed with
 `make status`.
