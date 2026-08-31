@@ -27,6 +27,50 @@ with a queue, cluster SSO, and a GPU pool that scales to zero. The queue and
 gateway logic is covered by an end-to-end test suite that runs on your laptop
 in about a minute — no cluster, no GPU, no AWS account (`make test`).
 
+## What changes for the people using it
+
+Almost nothing. This is stock ComfyUI — the upstream project at a pinned tag,
+not a reimplementation and not a wrapper — so the loop a designer already has
+survives intact:
+
+| Their loop | On this platform |
+|---|---|
+| Load a template | Stock ComfyUI, the same workflow JSON. Identical. |
+| Find errors and missing models | ComfyUI-Manager lists exactly what the workflow needs and you do not have. Identical. |
+| Load the models | One click — into `/models`, a volume that outlives the cluster, pulled at datacenter bandwidth rather than over a home connection. Same action, better outcome. |
+| Run a complicated node graph | Stock ComfyUI on an L4 24 GB. For most designers, a bigger card than the one under their desk. |
+| Load the next template, repeat | Identical. |
+
+Two things are genuinely different, and both are better known up front than
+discovered. **Model downloads persist; runtime custom-*node* installs do not** —
+Manager will tell you a node is missing, but making it stick means
+`app/src/custom_nodes/` and a rebuild. And in the multi-user configuration **the
+gateway is not the ComfyUI canvas**: authoring stays in ComfyUI, and the gateway
+is where a finished workflow goes to run on a shared GPU.
+
+The reason any of this is worth doing is where the time actually goes:
+
+```mermaid
+flowchart LR
+    A["Load a template"] --> B["Find errors and<br/>missing models"]
+    B --> C["Load the models<br/>one click, onto shared storage"]
+    C --> D["Wire and fix<br/>the node graph"]
+    D --> E["Run it<br/>~2 min"]
+    E --> A
+
+    classDef nogpu fill:#e8eefc,stroke:#5b7bc4,color:#12233f
+    classDef gpu fill:#fde8e2,stroke:#d6552b,color:#4a1608
+    class A,B,C,D nogpu
+    class E gpu
+```
+
+Four of those five steps never touch a GPU. Setting a scenario up — finding a
+template, chasing the models it needs, wiring and fixing the graph — takes far
+longer than the inference, which is often a couple of minutes or less. A
+designer needs a GPU for a small fraction of their working day, so ten designers
+do not need ten GPUs. They need one pool, a queue, and a card that turns off in
+between.
+
 ## Which path are you on?
 
 | You | Do this |
@@ -52,6 +96,19 @@ this repository rather than a claim.
   layer saves money — an idle GPU node bills identically whether a pod is
   scheduled on it or not — and it is the layer most tutorials skip.
   (`enterprise/manifests/03-autoscale.yaml`)
+```mermaid
+flowchart LR
+    Q[("Redis queue<br/>goes empty")] --> K{{"KEDA"}}
+    K -->|"worker replicas to 0"| P["Pods gone<br/><b>saves nothing</b>"]
+    P --> A{{"Machine pool<br/>autoscaler"}}
+    A -->|"nothing scheduled,<br/>node reclaimed"| N["GPU node gone<br/><b>saves ~$0.98/hr</b>"]
+
+    classDef nil fill:#e8eefc,stroke:#5b7bc4,color:#12233f
+    classDef real fill:#fde8e2,stroke:#d6552b,color:#4a1608
+    class P nil
+    class N real
+```
+
 - **A ~15-minute rebuild makes teardown a habit instead of a heroic act.**
   HCP's flat $0.25/hour control-plane fee and fast build are what turn
   `make down` into a cron line. On a cluster that takes forty minutes to
@@ -82,6 +139,23 @@ this repository rather than a claim.
   to `127.0.0.1` and has no Service and no Route. This is not defence in depth,
   it is the primary control, and it removes ComfyUI's entire vulnerability
   class from the network. (`docs/04-exposing.md`)
+```mermaid
+flowchart LR
+    B["Browsers"] --> R["Route<br/>edge/reencrypt TLS"]
+    R --> P["oauth-proxy<br/>cluster SSO + SubjectAccessReview"]
+    P --> G["Gateway<br/>accepts one workflow JSON,<br/>pushes it onto a list"]
+    G -- "Redis is the only path" --> W["Workers<br/>ComfyUI bound to 127.0.0.1<br/>no Service, no Route"]
+
+    classDef exposed fill:#fde8e2,stroke:#d6552b,color:#4a1608
+    classDef sealed fill:#e8eefc,stroke:#5b7bc4,color:#12233f
+    class B,R,P,G exposed
+    class W sealed
+```
+
+Everything on the left is reachable and authenticated. The worker on the right
+is reachable by nothing at all — which is why ComfyUI having no login of its own
+stops being a problem rather than becoming one.
+
 - **SSO you already own.** An `oauth-proxy` sidecar puts the cluster's own
   identity provider in front of the gateway, and rebinds the gateway to
   loopback so the login cannot be bypassed from inside the cluster either.
@@ -236,6 +310,24 @@ limit larger than the node — the shape this repo shipped with, `24Gi` on a
 third and costs you the attribution. `scripts/lint.sh` fails a GPU pod that
 drifts back to it.
 
+```mermaid
+flowchart TD
+    X{"Out of memory"} --> V["<b>VRAM</b> — the card is full<br/>resolution, batch, model stack"]
+    X --> H["<b>Host RAM</b> — the node is full<br/>checkpoint load, VAE decode"]
+
+    V --> V1["ComfyUI catches it,<br/>emits execution_error"]
+    V1 --> V2["failed, carrying ComfyUI's<br/>own message.<br/>Worker healthy, takes the next job."]
+
+    H --> H1["Container hits its own limit,<br/>kernel kills ComfyUI"]
+    H1 --> H2["Pod exits OOMKilled —<br/>oc describe pod names the reason"]
+    H2 --> H3["Job stranded, then failed by the<br/>gateway's reaper once the<br/>heartbeat lapses"]
+
+    classDef clean fill:#e8eefc,stroke:#5b7bc4,color:#12233f
+    classDef rough fill:#fde8e2,stroke:#d6552b,color:#4a1608
+    class V,V1,V2 clean
+    class H,H1,H2,H3 rough
+```
+
 #### Worker death
 
 | Failure | Handling | User-visible result |
@@ -299,6 +391,21 @@ The smallest useful cluster — one ComfyUI pod on an L4, us-east-2, on-demand:
 | Running | ~2.04 | — |
 | GPU parked (`make park`) | ~1.06 | ~5 min |
 | Cluster torn down (`make down`) | ~0.05 | ~15 min |
+
+```mermaid
+stateDiagram-v2
+    Running: Running · ~$2.04/hr
+    Parked: GPU parked · ~$1.06/hr
+    Down: Cluster deleted · ~$0.05/hr
+    Gone: Everything deleted · $0
+
+    [*] --> Running: make up
+    Running --> Parked: make park
+    Parked --> Running: back in ~5 min
+    Running --> Down: make down
+    Down --> Running: back in ~15 min
+    Down --> Gone: make destroy
+```
 
 | Habit | Monthly |
 |---|---:|
@@ -509,6 +616,13 @@ same ones CI invokes, so local and CI checks cannot drift.
   UID 1000670000 with GID 0, exactly as `restricted-v2` will run it.
 - **Lint.** shellcheck, YAML, Python, and pinned parsing edge cases.
 
+The file-level half of those guarantees is now **mechanically enforced rather
+than reviewed**: `scripts/lint.sh` fails the build on a worker that lost its GPU
+toleration, a Route that lost `timeout-tunnel`, a Service that regained the
+gateway's own port, a Containerfile that lost its `chgrp 0` block, or a GPU pod
+whose memory limit no longer fits the node. The end-to-end suite runs no cluster
+and reads no manifest, so it can see none of them.
+
 `docs/07-design-review.md` is the most useful artifact here: a written account
 of every claim the original design's manifests did not implement and every line
 of its Python that would not have run. It is the list of things you would
@@ -527,7 +641,7 @@ Everything lives in `.env`. The ones you are most likely to change:
 | `COMFYUI_IMAGE` | empty | empty means build in-cluster from `app/Containerfile` |
 | `COMFYUI_REF` | `v0.32.0` | ComfyUI tag both images build — pinning is deliberate |
 | `SCALE_TO_ZERO` | `true` | `false` pins one warm worker — see "Where this loses" |
-| `ENABLE_MANAGER` | `false` | bake in ComfyUI-Manager (one-click missing-model downloads) — read the note in `.env.example` |
+| `ENABLE_MANAGER` | `false` | **Turn this on for the single-user path.** It is what keeps the familiar loop intact: load a workflow, Manager lists every model you are missing, one click puts them on the persistent volume. Leave it off for the shared pool — there it hands every UI user code execution on a node with cloud credentials, and nothing it writes survives the node being reclaimed. `app/Containerfile` has the full reasoning. |
 | `BUDGET_ALERT_EMAIL` | empty | **set this** |
 
 ## Three things that will bite you
