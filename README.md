@@ -449,8 +449,10 @@ that lands in the middle of a creative loop.
 
 ```mermaid
 gantt
+    title Minutes to first image
     dateFormat X
-    axisFormat %M min
+    axisFormat %M
+    tickInterval 5minute
     todayMarker off
     section Cold pool
     Provision a GPU node        :0, 300
