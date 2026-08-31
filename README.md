@@ -341,7 +341,7 @@ flowchart TD
 | Failure | Handling | User-visible result |
 |---|---|---|
 | **Graceful termination** — scale-to-zero, a node drain, a rolling deploy, a spot interruption notice | The agent traps SIGTERM, stops accepting new work, and **finishes the job in flight** before exiting (`worker_agent.py`, note 4). Termination is routine on a pool that scales to zero, so this is the common path, not the exceptional one. | The generation completes normally. Asserted by the e2e suite. |
-| **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5). When the heartbeat lapses, the gateway's reaper fails the stranded job **naming the dead worker**. | `failed: worker comfy-worker-xxxx died` — loudly, rather than a progress bar that never moves. Deliberately failed and not requeued: a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices. Asserted by the e2e suite. |
+| **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5), and writes a `phase` breadcrumb as it goes (note 6). When the heartbeat lapses, the gateway's reaper reads that breadcrumb and either fails the stranded job **naming the dead worker**, or — only if the worker died before ComfyUI was ever handed the workflow — requeues it once. | Died mid-generation: `failed: worker comfy-worker-xxxx died`, loudly, rather than a progress bar that never moves. Failed and not requeued on purpose — a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices — and the message points at `oc describe pod`, which *can* tell an OOM kill from a reclaim. Died before it started: a non-terminal `retry` event the browser reads past, and a second worker finishes the job. Both asserted by the e2e suite. |
 | **ComfyUI wedges or dies mid-job** | The agent's `recv()` is bounded and each job carries a deadline (`JOB_TIMEOUT`, 1800s). On every timeout it re-checks `/history` in case a completion event was simply missed. | The job fails with a reason instead of the pod sitting `Running` and `Ready` while silently consuming nothing — which is worse than a crash, because KEDA sees a growing queue and adds more workers beside the dead one. |
 
 #### The job itself
@@ -527,12 +527,14 @@ says which two of these should not be done at all.
 4. **Narrow retry, and spot separately.** These looked like one item and are
    not. Blanket retry re-runs the poison pill: a host-RAM OOM kills the pod and
    is indistinguishable at the queue level from a node reclaim, so "retry on
-   worker death" retries the workflow that will kill the next worker too. Retry
-   only jobs that died *before* ComfyUI ever saw the workflow, and add phase
-   breadcrumbs so the rest are at least diagnosable. Spot does not need retry at
-   all: an interruption gives two minutes of notice and the existing SIGTERM
-   drain finishes anything that fits in them — its real trade is that longer
-   generations are lost. *(Medium; see `docs/10-roadmap.md` before starting.)*
+   worker death" retries the workflow that will kill the next worker too. The
+   retry half has **landed** on exactly those terms: jobs that died *before*
+   ComfyUI ever saw the workflow are requeued once, phase breadcrumbs make
+   every other death diagnosable, and nothing that reached a GPU is ever
+   replayed (`docs/10-roadmap.md`, Q2). Spot never needed retry at all: an
+   interruption gives two minutes of notice and the existing SIGTERM drain
+   finishes anything that fits in them — its real trade is that longer
+   generations are lost. *(Spot remains optional; see `docs/10-roadmap.md`.)*
 5. **NVIDIA time-slicing — listed here, and not recommended.** The device
    plugin can advertise several replicas of one card, but time-slicing provides
    **no memory isolation**: co-resident workflows share the full 24 GB and their

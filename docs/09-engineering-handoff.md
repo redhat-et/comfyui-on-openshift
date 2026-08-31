@@ -56,10 +56,13 @@ a minute. Nervous: the cold start is a real user-facing weakness and the first
 thing a designer will complain about, which section 8 addresses and
 [`10-roadmap.md`](10-roadmap.md) schedules. Nervous: Redis is a single instance
 with AOF persistence, which survives a pod restart and not a zone outage.
-Nervous: a failed job is failed, not requeued — deliberately, for a reason
-given in [`06-enterprise-architecture.md`](06-enterprise-architecture.md), but
-it means a node reclaim mid-render costs a user their generation and you will
-hear about it before you hear about anything else on this list.
+Nervous: a job that dies *mid-render* is failed, not requeued — deliberately,
+for a reason given in [`06-enterprise-architecture.md`](06-enterprise-architecture.md)
+that a node reclaim does not change, so a reclaim mid-render still costs a user
+their generation and you will hear about it before you hear about anything else
+on this list. (Only the narrow case is retried: a worker that died before
+ComfyUI was ever handed the workflow, where there is nothing to replay. Section
+3 has the row.)
 
 ---
 
@@ -160,6 +163,7 @@ miserable to reproduce.
 | Bounded `recv()` timeout and a job deadline | `worker_agent.py`, note 3 | A wedged ComfyUI parks the agent forever. The pod stays `Running` and `Ready`, stops consuming the queue, reports nothing — and KEDA, seeing a growing queue, adds *more* workers beside the dead one. |
 | SIGTERM trap that drains the running job | `worker_agent.py`, note 4 / `start.sh` | The pool scales to zero, so termination is routine. Without the trap, every scale-down discards whatever was rendering. |
 | `BLMOVE` into a per-worker processing list + TTL'd heartbeat | `worker_agent.py`, note 5 | SIGKILL (OOM, node reclaim) strands the job with no terminal event. The gateway's reaper depends on the heartbeat lapsing. |
+| The `phase` breadcrumb is written **before** the transition it describes, the retry counter moves only by `HINCRBY`, and `retry` is not in `TERMINAL_TYPES` | `worker_agent.py`, note 6 / `hub.py`, the reaper | Three ways to break one mechanism. A breadcrumb written after the fact leaves a window in which the job is executing and the record says it is not — which is exactly when the reaper replays a workflow that already killed one worker onto the next one. A counter read-then-written is a lost update between the two gateway replicas' reapers: both read 0, both believe they are the first attempt, one job becomes two on one GPU pool (`RPOP` being atomic bounds failing a job once and does **not** bound requeueing it once). And `retry` joining the terminal set closes every tailing browser on the retry, so the second attempt runs to completion and the user is looking at a failure. |
 | Redis Streams, not pub/sub | `hub.py` | Pub/sub delivers only to subscribers connected at publish time. The POST and the WebSocket open are two round trips — the gap is the common case. |
 | `maxmemory-policy noeviction` + `MAX_QUEUE_DEPTH` | `00-redis.yaml`, `hub.py` | The default evicts queued jobs, which presents as work vanishing at random. |
 | `haproxy.router.openshift.io/timeout: 4h` **and `timeout-tunnel`** on every Route | `enterprise/manifests/` | HAProxy's 30-second default kills long generations mid-render and reads exactly like an application bug. On edge and reencrypt Routes only `timeout-tunnel` governs the upgraded WebSocket, against a one-hour router default — setting `timeout` alone still drops long jobs. Both annotations, or neither works. |
@@ -180,6 +184,15 @@ stopped defaulting ComfyUI to loopback, and either Containerfile losing its
 no cluster and reads no manifest — so if you are about to argue with a lint
 failure naming one of them, read its row above first. The check exists
 precisely because the edit looks harmless.
+
+Two more shapes are pinned there for the opposite reason: they are in the
+Python the suite *does* run, and the suite still cannot see one of them. `make
+lint` fails on a retry counter written by anything other than `HINCRBY` —
+whose failure mode needs the two gateway replicas `01-gateway.yaml` runs and
+`enterprise/test/run.sh` starts one — and on a `TERMINAL_TYPES` that gained a
+member, which `check-30-sigkill.py` would also catch but which is pinned
+anyway, because "add the new event type to the terminal set" is precisely the
+tidying that arrives in a diff about something else.
 
 `docs/07-design-review.md` is the long form: every one of these traces back to
 a specific bug in the design this was built from. Read it once, early. It is

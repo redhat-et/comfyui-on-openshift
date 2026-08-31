@@ -283,6 +283,90 @@ Two smaller things that were not obvious until the code was written:
   failure appears only when a gateway and a worker of different vintages meet on
   the queue.
 
+### Q2 — retry, and the three things that make it narrow
+
+The obvious implementation is four lines in the reaper: where it fails a
+stranded job, put the job back on the queue instead, and count attempts so it
+cannot loop. It reviews cleanly, it passes a test that kills a worker and
+watches the job finish, and it is wrong in three separate ways, each of which
+only appears in a cluster.
+
+**Retryable is a phase, not an exception.** The tempting reading of "retry a
+failed job" is "retry unless the failure looks permanent", and there is no
+such signal here. A host-RAM OOM kills the ComfyUI process, takes the pod with
+it, and reaches the gateway as a lapsed heartbeat — byte for byte the same
+thing a node reclaim produces. So a reaper that decides from *what it can see*
+is deciding from nothing, and the poison workflow gets replayed onto every
+worker in the pool in sequence at GPU prices. The only question with an answer
+is **how far the job got**, and the only process that knows is the one that
+died. Hence a breadcrumb written ahead of the fact rather than a diagnosis
+attempted after it: the agent records `dispatched` when it takes the job and
+`executing` the moment ComfyUI accepts the prompt, and the reaper retries the
+first and never the second. The ordering there is the whole content of the
+mechanism — a breadcrumb written *after* the transition it describes leaves a
+window in which the job is executing and the record says it is not, and that
+window is precisely when a retry replays the poison pill.
+
+It also has to live on the job's state hash rather than on the queue entry,
+which is where a first draft naturally puts it: the entry is a static copy of
+what the gateway pushed, no worker ever rewrites it, and it is the only thing
+the reaper is holding. The reserved `attempt` field on the envelope carries the
+count forward across a requeue; it cannot carry the phase, because by the time
+anyone wants to read the phase the entry is already stale by a whole job.
+
+**"RPOP is atomic" is an argument about failing, not about requeueing.** The
+reaper's existing safety note is correct and does not survive the change of
+verb. Two gateway replicas each run a reaper; RPOP hands a given stranded entry
+to exactly one of them, which is what makes "failed at most once" true. A
+requeued job, though, goes back on the queue, is picked up by another worker,
+and can be stranded a *second* time — a different entry, on a different
+processing list, seen on a different pass, quite possibly by the other replica.
+"Is this the first attempt?" is then a question about shared state, and the
+natural implementation of it — read the count, compare, write count+1 — is a
+lost update: both replicas read 0, both believe they are first, and one job
+becomes two on one GPU pool. `HINCRBY` returns the value *after* incrementing,
+so the decision is taken from the return of the atomic operation itself and
+exactly one caller can ever see `1`. None of this can be exhibited by
+`enterprise/test/run.sh`, which starts one gateway, so `scripts/lint.sh` pins
+the shape instead: the counter must be bumped by `HINCRBY`, and must never be
+written by `HSET`.
+
+**A retry event that ends the stream is worse than no retry at all.** The
+gateway's WebSocket stops reading at the first event in `TERMINAL_TYPES`. Add
+`retry` to that set — or emit the retry as a `failed` followed by a fresh
+`queued` — and the browser closes on the retry while the second attempt runs to
+completion behind it. The user sees a job that failed; the cluster spent a GPU
+finishing it successfully. `retry` is therefore deliberately *not* terminal, on
+both sides: the gateway does not stop on it, and `index.html` reports it without
+calling `done()` — the one arm of that switch which announces something has gone
+wrong and deliberately keeps the socket open. The `TERMINAL_TYPES` line in
+`hub.py` is pinned by lint too, because "add the new event type to the terminal
+set" is exactly the tidying a later reader would do, in a diff about something
+else.
+
+Three smaller things that were not obvious until it was written:
+
+- **A requeue is not a promotion.** Pushing the job to the front of the queue
+  is the natural way to write it and re-introduces the starvation Q1 exists to
+  remove, by a new door: a submitter whose workers keep dying takes slots from
+  lanes that did nothing wrong. It goes back through the same fair-queueing
+  insert as a first submission, and it is subject to the same
+  `MAX_QUEUE_DEPTH` — a pool dying faster than it drains must not be the one
+  path allowed to grow the queue past its ceiling.
+- **Re-arming a TTL is how a job becomes immortal.** `HSET` and `HINCRBY`
+  recreate a key that expired mid-flight, and a recreated key has no expiry at
+  all, in a Redis deliberately configured `noeviction`. The retry path
+  therefore uses `EXPIRE ... NX`: give the job an expiry if it has none, never
+  extend one it has. The retry cap bounds this too, but the cap is a number
+  someone may raise and the `NX` is a property of the code.
+- **The gateway's blindness is not the operator's.** The reaper genuinely
+  cannot tell a host-RAM OOM from a reclaim. F1 made the pod tell the
+  difference — sized Guaranteed and within what the node can hand one pod, it
+  now terminates `OOMKilled` instead of vanishing into node pressure — so every
+  failure the reaper emits points at `oc describe pod`. The ambiguity is total
+  at the queue layer and nowhere else, and a failure message that says only
+  "the worker died" spends that fact.
+
 ---
 
 ## What was right and worth keeping

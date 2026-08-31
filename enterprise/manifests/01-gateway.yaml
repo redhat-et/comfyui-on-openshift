@@ -11,6 +11,15 @@ spec:
   # progress, so any replica can serve any job's WebSocket — no sticky sessions,
   # no shared in-memory state, and a rollout does not drop every connection at
   # once. Clients reconnect and replay from the start of the stream.
+  #
+  # This number is load-bearing for hub.py's reaper, in the direction that is
+  # easy to miss: TWO reapers run, and they race. RPOP being atomic is what
+  # makes them safe to fail a job at most once, and it is NOT what makes them
+  # safe to REQUEUE one at most once (docs/10-roadmap.md, Q2) — that comes from
+  # the atomic HINCRBY on the attempt counter. enterprise/test/run.sh starts one
+  # gateway and so cannot exhibit the race; scripts/lint.sh pins the shape, and
+  # cluster day is where two replicas racing over one dying worker gets watched
+  # for real.
   replicas: 2
 
   selector:

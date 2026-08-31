@@ -6,7 +6,7 @@ Runs alongside ComfyUI in the GPU pod. ComfyUI binds 127.0.0.1 only, so this
 agent is the sole path in or out — no user can reach the GPU pod directly, and
 the pod needs no Service, no Route, and no ingress rules.
 
-Five things here that the obvious version of this script gets wrong, each of
+Six things here that the obvious version of this script gets wrong, each of
 which produces an intermittent bug that is miserable to diagnose in a cluster:
 
   1. Connect the WebSocket BEFORE submitting the prompt. ComfyUI starts emitting
@@ -31,9 +31,21 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      polite case; SIGKILL (an OOM, a node reclaim) gives no warning at all.
      BLMOVE parks the in-flight job in a per-worker processing list and a
      TTL'd heartbeat key marks this worker alive; when the heartbeat lapses,
-     the gateway's reaper fails the stranded job loudly instead of letting it
-     disappear. Failed, not requeued — a workflow that OOM-killed one worker
-     would OOM-kill the next one too.
+     the gateway's reaper acts on the stranded job loudly instead of letting
+     it disappear.
+
+  6. Write down HOW FAR the job got, before doing the thing. The reaper above
+     can see that a worker died and cannot see what killed it, so what it is
+     allowed to do about a stranded job depends entirely on the `phase`
+     breadcrumb this agent leaves on the job's state hash: PHASE_DISPATCHED
+     while ComfyUI has not been handed the workflow (retryable — nothing ran),
+     PHASE_EXECUTING once it has (terminal — a workflow that OOM-killed one
+     worker would OOM-kill the next one too). The breadcrumb is a promise about
+     the past, so each write must happen BEFORE the transition it describes is
+     observable: written after, there is a window in which the job is executing
+     and the record says it is not, and that window is exactly when a retry
+     replays a poison workflow. The queue entry cannot carry this — it is a
+     static copy of what hub.py pushed and nothing rewrites it.
 """
 
 from __future__ import annotations
@@ -99,7 +111,7 @@ PROCESSING_KEY = f"comfy:processing:{WORKER_ID}"
 #      "job_id":        "<uuid4>",
 #      "workflow":      {...},                            # ComfyUI API format
 #      "queue_key":     "",                               # reserved for Q1
-#      "attempt":       {"count": 0, "phase": "queued"},   # reserved for Q2
+#      "attempt":       {"count": 0, "phase": "queued"},   # Q2: retry + phase
 #      "user":          "",                               # reserved for Q4
 #      "submitted_at":  1756400000.0}                     # reserved for Q6
 #
@@ -156,6 +168,44 @@ IMPLICIT_SCHEMA_VERSION = 1
 # nobody authenticated cannot make a queue entry interesting.
 MAX_ENVELOPE_FIELD_CHARS = 256
 
+# The phase vocabulary (docs/10-roadmap.md, Q2). Three values, and the only
+# distinction any of them exists to draw is "has ComfyUI been handed this
+# workflow yet?" — because that is the one question that decides whether a
+# worker's death may be retried.
+#
+#   queued      nobody has picked it up. hub.py writes this at submit.
+#   dispatched  a worker has it and has written its name on the job, but
+#               ComfyUI has not answered. The agent is inside submit_prompt().
+#   executing   ComfyUI accepted the prompt. From here the workflow has run,
+#               at least partly, on a GPU.
+#
+# These are shared vocabulary rather than gateway-private constants because
+# BOTH files use them and must use them identically: worker_agent.py writes the
+# breadcrumb, hub.py's reaper reads it and decides a job's fate from it, and a
+# rolling deploy always has one vintage of each running at once. A worker that
+# wrote "submitted" against a gateway that reads "executing" would silently
+# make every mid-generation death retryable — the exact poison-pill replay the
+# narrowing exists to prevent — with nothing failing anywhere to say so.
+PHASE_QUEUED = "queued"
+PHASE_DISPATCHED = "dispatched"
+PHASE_EXECUTING = "executing"
+
+# The phases in which ComfyUI provably has not started on this workflow, so a
+# worker that died here can be requeued without replaying anything onto a
+# second GPU. Everything else — including a phase this side does not recognise
+# and a state hash that has expired — is not retryable, which is the safe
+# direction: the cost of not retrying is one user resubmitting, the cost of
+# retrying wrongly is a poison workflow walking the whole pool.
+RETRYABLE_PHASES = frozenset({PHASE_QUEUED, PHASE_DISPATCHED})
+
+# Where the breadcrumb and the attempt counter live on the job's own state
+# hash, beside status/worker/schema_version. The queue entry cannot carry the
+# live phase: it is a static copy of what hub.py pushed, and the worker never
+# rewrites it, so by the time the reaper is looking at a stranded entry the
+# only thing that knows how far the job got is the state hash.
+PHASE_FIELD = "phase"
+ATTEMPT_COUNT_FIELD = "attempt_count"
+
 
 def envelope_text(value) -> str:
     """A reserved string field: always a str, always bounded, never None."""
@@ -164,7 +214,22 @@ def envelope_text(value) -> str:
 
 def new_attempt() -> dict:
     """A fresh, not-yet-tried breadcrumb. Q2 owns everything that moves it."""
-    return {"count": 0, "phase": "queued"}
+    return {"count": 0, "phase": PHASE_QUEUED}
+
+
+def attempt_count_of(envelope: dict) -> int:
+    """
+    How many times this entry has already been requeued, per the entry itself.
+
+    Advisory only, and deliberately so: the queue entry is a copy, and two
+    gateway replicas both holding a copy is exactly the case this number must
+    not be trusted to bound. The authority is the atomic counter on the job's
+    state hash (hub.py's reaper, HINCRBY); this is what an operator reads off
+    a raw queue entry and what the worker logs.
+    """
+    count = (envelope.get("attempt") or {}).get("count", 0)
+
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
 
 def build_envelope(job_id: str, workflow: dict, *, queue_key: str = "",
@@ -360,6 +425,13 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             # entry written before the rollout — which is the difference
             # between "the tolerant path worked" and "nobody looked".
             "schema_version": job["schema_version"],
+            # Point 6: this job is now mine, and ComfyUI has not been handed
+            # the workflow. Written in the SAME HSET as status/worker, not a
+            # second round trip after it — the gateway's reaper reads status
+            # and phase together, and a job that looked running with no phase
+            # would be read as "how far it got is unknown" and refused a retry
+            # it had earned.
+            PHASE_FIELD: PHASE_DISPATCHED,
         },
     )
     conn.expire(state_key(job_id), EVENT_STREAM_TTL)
@@ -372,6 +444,14 @@ def run_job(conn: redis.Redis, job: dict) -> None:
 
     try:
         prompt_id = submit_prompt(workflow)
+
+        # Point 6, the other half: ComfyUI has the workflow. Written BEFORE the
+        # `accepted` event, because this is the flag that stops a death here
+        # from being retried and the event is only a thing to look at. From
+        # here on, every death this job suffers is terminal.
+        conn.hset(state_key(job_id), PHASE_FIELD, PHASE_EXECUTING)
+        conn.expire(state_key(job_id), EVENT_STREAM_TTL)
+
         emit(conn, job_id, {"type": "accepted", "data": {"prompt_id": prompt_id}})
 
         deadline = time.time() + JOB_TIMEOUT
@@ -538,7 +618,9 @@ def main() -> int:
                     log(f"discarding malformed queue entry: {exc}")
                     continue
 
-                log(f"picked up {job_id} (envelope v{job['schema_version']})")
+                retries = attempt_count_of(job)
+                log(f"picked up {job_id} (envelope v{job['schema_version']}"
+                    + (f", retry {retries}" if retries else "") + ")")
 
                 try:
                     run_job(conn, job)

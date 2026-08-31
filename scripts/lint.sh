@@ -449,7 +449,87 @@ done
 shape_require enterprise/worker/start.sh 'COMFY_HOST:-127\.0\.0\.1' \
     "ComfyUI in the GPU pod must default to loopback. The pod has no Service and no Route, so the agent beside it is the only way in; binding 0.0.0.0 publishes unauthenticated arbitrary code execution on a node holding cloud credentials"
 
+# Q2's non-terminal retry event (docs/10-roadmap.md). check-30-sigkill.py would
+# also catch this one, and it is pinned anyway: "add the new event type to the
+# terminal set" is the kind of tidying that arrives inside a diff about
+# something else, and the row above says what it costs.
+shape_require enterprise/gateway/hub.py \
+    '^TERMINAL_TYPES = \{"completed", "failed", "cancelled"\}$' \
+    "the set of event types that END a progress stream is exactly these three. Adding the retry event to it (or renaming one of them) makes every tailing browser stop reading at the retry and sit on a dead socket while the second attempt runs to completion behind it — the job succeeds and the user never sees it"
+
 (( SHAPE_BAD == 0 )) && ok "clean" || FAILURES=$(( FAILURES + 1 ))
+
+# ---------------------------------------------------------------------------
+
+log "the retry counter moves only by HINCRBY (docs/10-roadmap.md, Q2)"
+
+# The other half of the same invariant, and the one the e2e suite structurally
+# cannot reach: enterprise/test/run.sh starts ONE gateway, and
+# enterprise/manifests/01-gateway.yaml runs two, each with its own reaper.
+#
+# "RPOP is atomic, so two reapers each take different entries" is what bounds
+# FAILING a stranded job to once. It does not bound REQUEUEING one to once: a
+# requeued job goes back on the queue, is picked up by another worker, and can
+# be stranded a second time — a different entry, a different processing list,
+# quite possibly the other replica's reaper. "Is this the first attempt?" is
+# then a question about shared state, and read-modify-write on shared state
+# (HGET the count, compare, HSET count+1) is a lost update: both replicas read
+# 0, both believe they are first, and one job becomes two on one GPU pool at
+# GPU prices. HINCRBY returns the post-increment value, so the decision is
+# taken from the atomic operation itself and exactly one caller can see 1.
+#
+# A line-oriented grep is not enough here — the wrong version is naturally
+# written as a multi-line hset(..., mapping={...}) — so this reads the source
+# and asserts every mention of the counter outside its own definition is on a
+# hincrby.
+
+if python3 - <<'EOF'
+import re, sys
+
+PATH = "enterprise/gateway/hub.py"
+FIELD = "ATTEMPT_COUNT_FIELD"
+
+source = open(PATH).read().splitlines()
+
+# The shared envelope block defines the name; everything after it uses it.
+try:
+    end = next(i for i, line in enumerate(source) if line.startswith("# END SHARED ENVELOPE"))
+except StopIteration:
+    print(f"  {PATH}: no END SHARED ENVELOPE marker — cannot tell the counter's "
+          "definition from its uses")
+    sys.exit(1)
+
+bad, seen_hincrby = [], False
+
+for n, line in enumerate(source[end:], start=end + 1):
+    if FIELD not in line:
+        continue
+
+    if re.search(r"hincrby\(", line):
+        seen_hincrby = True
+    elif not line.lstrip().startswith("#"):
+        bad.append((n, line.strip()))
+
+if bad:
+    print(f"  {PATH}: the retry counter must be written only by HINCRBY, whose "
+          "return value the retry decision is taken from. These lines touch it "
+          "some other way:")
+    for n, line in bad:
+        print(f"    {n}: {line}")
+    sys.exit(1)
+
+if not seen_hincrby:
+    print(f"  {PATH}: nothing increments the retry counter with HINCRBY — the "
+          "bound on requeue-once has gone")
+    sys.exit(1)
+
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
 
 # ---------------------------------------------------------------------------
 

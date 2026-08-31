@@ -196,6 +196,17 @@ function watch(id) {
         done();
         return;
 
+      // Not terminal, and the one case here that must NOT call done(): the
+      // job went back on the queue and its second attempt streams into this
+      // same socket. Closing here would leave the user watching nothing while
+      // their job ran to completion behind them.
+      case "retry":
+        $("progress").style.width = "0%";
+        say(`The worker running this job disappeared before it started `
+            + `generating. Requeued (attempt ${(d.attempt || 0) + 1}`
+            + `${d.position ? `, ${d.position} ahead` : ""}).`);
+        return;
+
       case "failed":
         say("Failed: " + (d.error || "unknown"), "bad");
         done();

@@ -243,12 +243,39 @@ format rather than behind a button in a shared UI.
 - **Redis HA.** One instance with AOF persistence. It survives a pod restart; it
   does not survive a zone outage. At one-GPU scale, adding three Redis nodes
   protects against a failure less likely than the ones you have not fixed yet.
-- **Job retry.** A worker that dies without warning — OOM, node reclaim — does
-  not lose its job silently: the agent parks each job in a per-worker
-  processing list (BLMOVE) and holds a TTL'd heartbeat, and the gateway fails
-  stranded jobs loudly once the heartbeat lapses. But failed means *failed*,
-  not requeued: a workflow that OOM-killed one worker would OOM-kill each
-  worker it was retried on, in sequence, at GPU prices. The user resubmits.
+- **General job retry.** Still not here, and for the reason this bullet always
+  gave — but `docs/10-roadmap.md` (Q2) has since carved out the one death that
+  reason does not cover, so it is worth saying exactly where the line now
+  falls. A worker that dies without warning still does not lose its job
+  silently: the agent parks each job in a per-worker processing list (BLMOVE)
+  and holds a TTL'd heartbeat, and the gateway's reaper acts on stranded jobs
+  once the heartbeat lapses. What it does now depends on a `phase` breadcrumb
+  the agent writes on the job's own state — `dispatched` until ComfyUI has been
+  handed the workflow, `executing` afterwards — and on nothing else.
+
+  A job whose worker died at `executing` is still failed, not requeued, on the
+  original argument unchanged: a host-RAM OOM kills the pod and is
+  indistinguishable *at the queue layer* from a node reclaim, so requeueing it
+  would walk a workflow that killed one worker across the whole pool, in
+  sequence, at GPU prices. The user resubmits. A job whose worker died at
+  `dispatched` is requeued once, because nothing ran: there is no poison pill
+  to replay, and the death was about the cluster rather than about the
+  workflow. Everything the agent itself reports — a rejected workflow, an
+  `execution_error` (which is how a VRAM OOM arrives), a job deadline — is
+  terminal as it always was; retryable is a phase, never an exception.
+
+  Two things follow. The retry is announced as a non-terminal `retry` event, so
+  a browser tailing the job reads past it into the second attempt rather than
+  stopping; and the attempt counter is a Redis `HINCRBY` whose return value the
+  decision is taken from, because the gateway runs two replicas and "RPOP is
+  atomic" bounds failing a job once without bounding requeueing it once. What
+  is still deliberately absent is retry as a general policy — nothing retries a
+  workflow that has been anywhere near a GPU. The ambiguity that argument rests
+  on is also no longer total for the *operator*: since the worker is sized
+  Guaranteed and within what its node can give one pod, a host-RAM OOM
+  terminates the pod `OOMKilled` and `oc describe pod` names it. The gateway
+  cannot see that; the person reading the failure can, and the failure text
+  says so.
 - **Interrupting a running sampler.** Cancel is cooperative — it stops a queued
   job and asks a running one to stop between events. Truly interrupting mid-step
   is ComfyUI's `/interrupt`, and the workers are not reachable from the gateway.

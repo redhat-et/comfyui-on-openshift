@@ -39,9 +39,9 @@ machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
 nothing until there is a cluster at ~$2.04/hour. Only five items are
 cluster-only for a failing assertion; ten have a laptop half.
 
-**Fifteen invariants are load-bearing** — `docs/09-engineering-handoff.md` §3.
-(Fourteen when this was written; F1 added the fifteenth, which is what "changes
-an invariant" looks like in practice.)
+**Sixteen invariants are load-bearing** — `docs/09-engineering-handoff.md` §3.
+(Fourteen when this was written; F1 added the fifteenth and Q2 the sixteenth,
+which is what "changes an invariant" looks like in practice.)
 Thirteen of the items touch at least one, so "the risky ones get a second
 reviewer" is not a useful filter. The filter that *is* useful: an item is
 high-risk if it **changes** an invariant rather than merely working near one.
@@ -180,7 +180,7 @@ What landed:
 check is a file and not also an edit in two hardcoded places, and settle the
 naming convention before six items each create their own `check4.py`. Then
 extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
-assertions. Ten of the fifteen §3 invariants are properties of files rather
+assertions. Ten of the sixteen §3 invariants are properties of files rather
 than of a running system — a missing toleration, a Service that regained a
 port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
 — and the e2e suite structurally cannot see any of them. This is also what
