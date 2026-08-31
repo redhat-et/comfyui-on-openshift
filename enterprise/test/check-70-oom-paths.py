@@ -147,18 +147,17 @@ check("that terminal event is a failure, not a silent completion",
 check("the failure carries a reason rather than an empty error",
       len(((terminal or {}).get("data", {}) or {}).get("error", "")) > 0,
       ((terminal or {}).get("data", {}) or {}).get("error", "")[:160])
-# What actually resolves this is the per-job deadline, not the closed socket:
-# the agent does not treat a dropped ComfyUI connection as terminal, so it
-# waits out JOB_TIMEOUT and fails with the deadline as the reason. That is the
-# bounded-deadline invariant doing its job, and this is the only assertion in
-# the suite that exercises it -- which is why this check is allowed to take a
-# minute. It is also a finding: in production the pod exit is what makes this
-# fast (start.sh waits on both children, so a dead ComfyUI ends the pod), and
-# a socket that closes while ComfyUI is still alive would hold the GPU for the
-# full JOB_TIMEOUT -- 1800s by default. See docs/10-roadmap.md.
-check("it resolves on the job deadline rather than parking forever, and says so",
-      terminal and "exceeded" in ((terminal.get("data") or {}).get("error", "")),
-      f"{elapsed:.1f}s / {((terminal or {}).get('data') or {}).get('error','')}")
+# A closed socket must resolve NOW, not at the job deadline. Writing this check
+# is what found that it did not: a server-side close arrives as an empty frame,
+# "" is a str so it slipped past the binary-frame guard, failed to parse, and
+# hit `continue` -- spinning the recv loop at full speed for the whole of
+# JOB_TIMEOUT while holding a GPU. 1800s by default in production.
+check("a closed socket resolves immediately, not at the job deadline -- a dead "
+      "ComfyUI must not hold a card for JOB_TIMEOUT",
+      elapsed < 30, f"{elapsed:.1f}s")
+check("and the reason names the lost connection rather than the deadline",
+      terminal and "closed the connection" in ((terminal.get("data") or {}).get("error", "")),
+      ((terminal or {}).get("data") or {}).get("error", "")[:160])
 
 follow = post("/api/generate", {"workflow": {"9": {"class_type": "SaveImage"}}})
 kinds2, terminal2 = drain(follow["job_id"], timeout=45)

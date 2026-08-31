@@ -252,10 +252,15 @@ stranded job in seconds. The exposure is the narrower case — a socket that
 closes while ComfyUI is still alive — where a worker holds a GPU for the full
 `JOB_TIMEOUT`, **1800 seconds by default**, doing nothing.
 
-Worth fixing, cheaply: treat a closed socket as a reason to re-check `/history`
-immediately and fail if the prompt is unknown, rather than waiting for the
-deadline. *(Small. The deadline stays as the backstop it was always meant to
-be.)*
+**Fixed.** A closed socket now re-checks `/history` once — the prompt may have
+landed in the instant before the process went — and otherwise fails immediately
+with a reason naming the lost connection. Measured in `check-70`: 65.0s to 0.2s.
+The deadline stays as the backstop it was always meant to be.
+
+The root cause was worse than "waits for the deadline". A server-side close
+arrives as an *empty frame*, and `""` is a `str`, so it slipped past the
+binary-frame guard, failed to parse as JSON, and hit `continue` — spinning the
+receive loop at full speed for the whole of `JOB_TIMEOUT` while holding a card.
 
 ### Deferred, with reasons
 

@@ -156,10 +156,15 @@ async def run(client_id, pid, slow=False, vram_oom=False, die=False):
             # /history never learns about this prompt. See check-70's docstring
             # for the half that is not reproducible here.
             clients.pop(client_id, None)
-            try:
-                await ws.close(code=1006)
-            except Exception:
-                pass
+            # Ask the endpoint coroutine to return, which is what actually
+            # closes the connection: calling ws.close() from this task does
+            # not, while the endpoint is parked in its own await. Keyed on the
+            # SOCKET, not the clientId -- a reconnecting agent can leave more
+            # than one endpoint coroutine alive for the same id, and a
+            # cid-keyed flag is then consumed by whichever polls first, which
+            # closes an already-dead connection and leaves the live one open.
+            if ws is not None:
+                dying_ws.add(id(ws))
             return
 
     filename, subfolder = "out_0001.png", ""
@@ -183,6 +188,11 @@ async def send(ws, msg):
         except Exception:
             pass
 
+# id()s of the WebSocket objects whose connection should be dropped, as a dead
+# ComfyUI process would drop it. Set by run(); consumed by the endpoint below.
+dying_ws: set = set()
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     global stall_next_ws_s
@@ -194,6 +204,11 @@ async def ws_endpoint(ws: WebSocket):
     clients[cid] = ws
     try:
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(0.05)
+            if id(ws) in dying_ws:
+                dying_ws.discard(id(ws))
+                clients.pop(cid, None)
+                await ws.close(code=1006)
+                return
     except WebSocketDisconnect:
         clients.pop(cid, None)

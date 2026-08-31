@@ -958,6 +958,35 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             try:
                 raw = ws.recv()
 
+                # A server-side close surfaces as an empty frame rather than an
+                # exception, and "" is a str, so it slips past the binary-frame
+                # guard below, fails to parse, and hits `continue` -- spinning
+                # this loop at full speed until the job deadline while holding a
+                # GPU. Treat it as what it is.
+                if raw == "":
+                    raise websocket.WebSocketConnectionClosedException(
+                        "ComfyUI closed the connection")
+
+            except (websocket.WebSocketConnectionClosedException,
+                    ConnectionResetError, OSError) as exc:
+                # ComfyUI's socket is gone mid-job. Do not wait out JOB_TIMEOUT
+                # for it: ask /history once, because the prompt may have landed
+                # in the instant before the process went, and otherwise fail now
+                # with a reason that names what happened.
+                #
+                # In a pod this is usually moot -- start.sh waits on both
+                # children, so a dead ComfyUI ends the pod and the gateway's
+                # reaper takes the job. The case this covers is a socket that
+                # closes while ComfyUI is still alive, where the deadline was
+                # otherwise 1800 seconds of a card doing nothing.
+                if prompt_finished(prompt_id):
+                    finish(conn, job_id, "completed", collect_outputs(prompt_id, workspace))
+                    return
+
+                raise RuntimeError(
+                    f"ComfyUI closed the connection mid-job and /history does "
+                    f"not know prompt {prompt_id} ({exc})") from exc
+
             except websocket.WebSocketTimeoutException:
                 # No news for RECV_TIMEOUT. Confirm ComfyUI is still alive and
                 # that our prompt has not quietly completed while we were not
