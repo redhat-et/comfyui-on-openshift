@@ -1,0 +1,59 @@
+---
+# Fixture: a GPU worker Deployment whose memory limit does not fit the
+# smallest GPU instance type this repo supports. Otherwise shaped like
+# enterprise/manifests/02-worker.yaml, including the toleration, so the only
+# thing this fixture isolates is the sizing.
+#
+# Unlike the other fixtures in this directory, this is not a hypothetical
+# regression: enterprise/manifests/02-worker.yaml on HEAD has exactly this
+# shape today (F1, docs/10-roadmap.md). g5.xlarge and g6.xlarge — tied for
+# the smallest system RAM among the GPU instance types this repo supports
+# (scripts/06-status.sh's cost table; g6.xlarge is also .env.example's
+# GPU_INSTANCE_TYPE default; g6e.xlarge and g6.2xlarge are larger) — have
+# only 16Gi of system RAM each, before subtracting kubelet/system-reserved
+# and the DaemonSets a GPU node also runs (NVIDIA driver, device plugin,
+# NFD, monitoring). A 24Gi limit is unreachable there: the container can
+# never hit its own cgroup ceiling, so the real ceiling is node memory
+# pressure, which produces an eviction or a kernel OOM kill of the ComfyUI
+# process instead of a clean container-level OOMKilled — and a burstable
+# pod (requests 8Gi < limits 24Gi) whose limit exceeds node capacity is a
+# prime eviction candidate to begin with.
+#
+# Valid YAML, so yaml.safe_load_all accepts it happily — the bug
+# scripts/unit-tests.sh proves scripts/lint.sh does not catch this.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-worker
+  labels:
+    app: comfy-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: comfy-worker
+  template:
+    metadata:
+      labels:
+        app: comfy-worker
+    spec:
+      nodeSelector:
+        GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: worker
+          image: comfy-worker:latest
+          resources:
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "1"
+              memory: 8Gi
+            limits:
+              # No GPU instance type this repo supports has 24Gi of system
+              # RAM to give a single pod — see the file header.
+              nvidia.com/gpu: 1
+              cpu: "3"
+              memory: 24Gi

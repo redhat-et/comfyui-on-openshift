@@ -19,6 +19,7 @@ without ever touching the manifests that actually ship.
 | `manifests/worker-no-gpu-toleration.yaml` | GPU worker Deployment with no `nvidia.com/gpu` toleration |
 | `manifests/route-missing-timeout-tunnel.yaml` | Route with `timeout` but no `timeout-tunnel` |
 | `manifests/gateway-svc-exposes-container-port.yaml` | Gateway Service listing the gateway's own container port (8000) alongside the proxy port |
+| `manifests/worker-memory-exceeds-smallest-instance.yaml` | GPU worker Deployment whose memory `limits` do not fit the smallest GPU instance type this repo supports (F1, `docs/10-roadmap.md`) — not hypothetical, `enterprise/manifests/02-worker.yaml` has this shape on HEAD |
 
 The fourth case — a Containerfile losing its `chgrp 0` / `chmod g=u` block —
 has no fixture file here. `scripts/lint.sh` does not scan Containerfiles by

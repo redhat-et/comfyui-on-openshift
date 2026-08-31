@@ -197,6 +197,40 @@ trap - EXIT
 
 # ---------------------------------------------------------------------------
 
+log "scripts/lint.sh — worker memory limit vs. smallest supported GPU instance (F1, docs/10-roadmap.md)"
+
+# F1 (docs/10-roadmap.md): enterprise/manifests/02-worker.yaml requests
+# memory: 8Gi and limits memory: 24Gi. The smallest GPU instance type this
+# repo supports is a tie between g5.xlarge and g6.xlarge (scripts/06-status.sh
+# lists m5.xlarge, m5.2xlarge, g5.xlarge, g6.xlarge, g6.2xlarge, g6e.xlarge and
+# g4dn.xlarge; among the GPU families, g5.xlarge/g6.xlarge/g4dn.xlarge each
+# have 16 GiB of system RAM, the smallest of the lot — g6.2xlarge and
+# g6e.xlarge have 32 GiB. g6.xlarge is also .env.example's GPU_INSTANCE_TYPE
+# default), and 16 GiB of *system* RAM has nothing to do with the 24 GB of
+# *VRAM* the L4/A10G GPU itself carries. A 24Gi container memory limit is
+# therefore unreachable on that node: the container can never hit its own
+# cgroup ceiling, so the real ceiling is node memory pressure, which produces
+# an eviction or a kernel OOM kill of the ComfyUI process instead of a clean
+# container-level OOMKilled — and a burstable pod (requests 8Gi < limits
+# 24Gi) whose limit exceeds node capacity is a prime eviction candidate to
+# begin with.
+#
+# Unlike the three fixtures above, this is not a hypothetical regression —
+# the real, unmodified enterprise/manifests/02-worker.yaml already has this
+# shape, which the fixture mirrors byte-for-byte for the fields that matter.
+# scripts/lint.sh has no check for it yet, so this assertion is written
+# failing on purpose: F1 is the manifest/lint fix, not this commit.
+
+trap cleanup_manifest_fixture_drops EXIT
+
+expect_true "lint fails a worker manifest whose memory limit does not fit the smallest supported GPU instance type" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-memory-exceeds-smallest-instance.yaml"
+
+cleanup_manifest_fixture_drops
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+
 log "scripts/lint.sh — Containerfile arbitrary-UID block (F3, docs/10-roadmap.md)"
 
 # The fourth shape case has no fixture file under scripts/lint-fixtures/:
