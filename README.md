@@ -71,6 +71,31 @@ designer needs a GPU for a small fraction of their working day, so ten designers
 do not need ten GPUs. They need one pool, a queue, and a card that turns off in
 between.
 
+## How it fits together
+
+One pod and one GPU for a single person. For a team, a FastAPI gateway on cheap
+CPU nodes, Redis as the queue and progress bus, and GPU workers that are
+unreachable by design and scale between 0 and N on queue depth:
+
+```mermaid
+flowchart LR
+    B[Browsers] --> R["Route<br/>cluster SSO"]
+    R --> G["Gateway<br/>CPU nodes, 2 replicas"]
+    G -- jobs --> Q[("Redis<br/>queue + progress log")]
+    Q -- jobs --> W["Workers 0..N<br/>agent ⇄ ComfyUI on loopback<br/>GPU nodes"]
+    W -- progress --> Q
+    Q -- replayable tail --> G
+    W -- writes --> E[("EFS<br/>models + outputs")]
+    E -. read-only .-> G
+    K{{KEDA}} -. queue depth<br/>scales pods and nodes .-> W
+```
+
+![The gateway: paste a workflow, watch progress, collect the images](docs/images/gateway.png)
+
+Nothing in that picture is a component this repo invented. The queue is Redis,
+the scaling is KEDA and a machine pool, the login is the cluster's own identity
+provider, and the thing doing the generating is stock ComfyUI.
+
 ## Which path are you on?
 
 | You | Do this |
@@ -260,24 +285,7 @@ make cluster gpu storage
 make enterprise                        # one script does the rest
 ```
 
-A FastAPI gateway on cheap CPU nodes, Redis as the queue and progress bus, and
-GPU workers that are unreachable by design and scale between 0 and N on queue
-depth:
-
-```mermaid
-flowchart LR
-    B[Browsers] --> R["Route<br/>cluster SSO"]
-    R --> G["Gateway<br/>CPU nodes, 2 replicas"]
-    G -- jobs --> Q[("Redis<br/>queue + progress log")]
-    Q -- jobs --> W["Workers 0..N<br/>agent ⇄ ComfyUI on loopback<br/>GPU nodes"]
-    W -- progress --> Q
-    Q -- replayable tail --> G
-    W -- writes --> E[("EFS<br/>models + outputs")]
-    E -. read-only .-> G
-    K{{KEDA}} -. queue depth<br/>scales pods and nodes .-> W
-```
-
-![The gateway: paste a workflow, watch progress, collect the images](docs/images/gateway.png)
+The shape of it is in **How it fits together** above.
 
 `enterprise/README.md` to run it, `docs/06-enterprise-architecture.md` for why
 it is shaped that way.
@@ -439,6 +447,21 @@ period is 8–17 minutes: provision a node, pull a ~10 GB image, initialise CUDA
 load the checkpoint. For a designer adjusting a prompt every four minutes,
 that lands in the middle of a creative loop.
 
+```mermaid
+gantt
+    dateFormat X
+    axisFormat %M min
+    todayMarker off
+    section Cold pool
+    Provision a GPU node        :0, 300
+    Pull the ~10 GB image       :300, 780
+    CUDA init, custom node scan :780, 900
+    Load the checkpoint         :900, 1020
+    Generate                    :crit, 1020, 1140
+    section Warm worker
+    Generate                    :crit, 0, 120
+```
+
 The fix is a warm worker, and it is one variable:
 
 ```bash
@@ -550,6 +573,39 @@ touches, what proves it, what order they can safely land in, and which of them
 cannot be finished without a real cluster. `docs/06-enterprise-architecture.md`
 has the complementary list: what is deliberately *not* here and why, including
 Redis HA, multi-GPU workers, and interrupting a running sampler.
+
+## What you actually operate
+
+Worth being concrete about, because it is the difference between running this
+and running a Kubernetes cluster:
+
+```mermaid
+flowchart TB
+    subgraph theirs["Somebody else's pager"]
+        C["API server, etcd, scheduler,<br/>control-plane upgrades"]
+        D["NVIDIA driver, compiled against<br/>the running RHCOS kernel"]
+        N["Node provisioning,<br/>reclaim and replacement"]
+        T["Route TLS, cluster SSO,<br/>certificate rotation"]
+    end
+    subgraph yours["Yours"]
+        G["A FastAPI process"]
+        A["A Python agent"]
+        R["One Redis"]
+        B["The bill"]
+    end
+
+    classDef theirs fill:#e8eefc,stroke:#5b7bc4,color:#12233f
+    classDef yours fill:#fde8e2,stroke:#d6552b,color:#4a1608
+    class C,D,N,T theirs
+    class G,A,R,B yours
+```
+
+That division is why this repository is around nine thousand lines and not a
+distributed system. When you are deciding whether to add something, the first
+question is whether OpenShift already does it — because in this problem domain
+it usually does, and the version you would write is the version nobody
+maintains. `docs/09-engineering-handoff.md` is the long form, for whoever picks
+this up next.
 
 ## What is in here
 
