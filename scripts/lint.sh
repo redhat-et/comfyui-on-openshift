@@ -504,6 +504,17 @@ shape_require enterprise/worker/start.sh \
     'output-directory "\$OUTPUT_ROOT"' \
     "ComfyUI's output directory and the agent's OUTPUT_ROOT must be the same one variable. ComfyUI is long-lived with a single fixed --output-directory and the agent computes every submitter's workspace underneath it; hardcoding one side lets the pod start with the agent naming paths under a directory ComfyUI is not writing to, which 404s every generation and logs nothing"
 
+# The GPU worker image's ENTRYPOINT is start.sh, so anything appended to
+# `docker run <image> ...` lands in start.sh's positional parameters and
+# nowhere else. CI has no GPU and boots this image with `--cpu`; without the
+# forward that flag is swallowed silently, ComfyUI looks for a card that is not
+# there, and the failure reads like a broken image rather than a runner with no
+# card. Nothing in the e2e suite can see this: it runs worker_agent.py directly
+# against a stub, never through the entrypoint.
+shape_require enterprise/worker/start.sh \
+    '^[[:space:]]*"\$@" &$' \
+    "start.sh is the worker image's ENTRYPOINT and must forward its own arguments to ComfyUI. Nightly CI boots this image with --cpu because GitHub runners have no GPU; swallowed, the flag produces a CUDA failure that looks like an image regression"
+
 (( SHAPE_BAD == 0 )) && ok "clean" || FAILURES=$(( FAILURES + 1 ))
 
 # ---------------------------------------------------------------------------

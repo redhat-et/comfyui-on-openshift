@@ -70,12 +70,22 @@ cd "$COMFY_ROOT" || exit 1
 # --models-directory, NOT --base-directory: --base-directory would relocate
 # custom_nodes lookup to /models/custom_nodes, silently ignoring every node
 # baked into this image, and put checkpoints at /models/models/checkpoints.
+#
+# "$@" LAST, and it is not decoration. This script is the image's ENTRYPOINT,
+# so whatever is appended to `docker run <image> ...` arrives here — and the
+# only consumer that needs it is CI, which has no GPU and boots this image with
+# `--cpu` to prove the arbitrary-UID permissions actually work. Dropped, the
+# flag is silently swallowed by start.sh, ComfyUI looks for a card that is not
+# there, and the job fails in a way that reads like a broken image rather than
+# a runner with no GPU. Appended last so a caller can also override any default
+# above it: ComfyUI's argparse takes the LAST occurrence of a repeated flag.
 python3 main.py \
     --listen "$COMFY_HOST" \
     --port "$COMFY_PORT" \
     --models-directory /models \
     --output-directory "$OUTPUT_ROOT" \
-    --temp-directory /tmp &
+    --temp-directory /tmp \
+    "$@" &
 comfy_pid=$!
 
 echo "[start] launching agent"
