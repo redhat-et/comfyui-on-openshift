@@ -93,12 +93,79 @@ delete_network()
         return 0
     fi
 
+    # With STORAGE_MODE=rwx, 04-storage.sh left EFS mount targets — ENIs — in
+    # this stack's private subnets. CloudFormation cannot delete a subnet with
+    # an ENI still attached, so the stack delete below fails, and because this
+    # script runs under set -e that used to abort right here: before
+    # report_stragglers ran and before the OIDC cleanup that follows this
+    # function in 'all' mode. Clear those mount targets first.
+    delete_efs_mount_targets_in_network
+
     log "Deleting CloudFormation stack $NETWORK_STACK_NAME"
     aws cloudformation delete-stack --stack-name "$NETWORK_STACK_NAME"
 
     info "waiting for the VPC and NAT gateway to go away"
-    aws cloudformation wait stack-delete-complete --stack-name "$NETWORK_STACK_NAME"
-    ok "gone"
+    if aws cloudformation wait stack-delete-complete --stack-name "$NETWORK_STACK_NAME"; then
+        ok "gone"
+    else
+        warn "stack delete did not finish — something is still attached to the VPC"
+        aws cloudformation describe-stack-events --stack-name "$NETWORK_STACK_NAME" \
+            --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+            --output text 2>/dev/null | sed 's/^/    /'
+        info ""
+        info "Remove whatever is still attached (a security group with a live"
+        info "reference, a leftover ENI, an EFS mount target this run missed),"
+        info "then re-run:"
+        info "  aws cloudformation delete-stack --stack-name $NETWORK_STACK_NAME"
+        info "  make destroy"
+    fi
+}
+
+# EFS mount targets are ENIs in the network stack's subnets, tagged and named
+# the way 04-storage.sh's efs_filesystem() creates them: filesystem
+# "${CLUSTER_NAME}-models". Deleting a mount target only removes the network
+# attachment point — 04-storage.sh recreates it on the next 'make storage' in
+# a few seconds — it does not touch anything stored on the filesystem, so
+# unlike delete_cluster's confirm_destructive this needs no confirmation.
+#
+# The filesystem itself is deliberately NOT deleted here, 'all' or not: models
+# live there and outliving the cluster is the entire reason to choose
+# STORAGE_MODE=rwx in the first place (04-storage.sh says so; the header
+# comment at the top of this file says so too). report_stragglers lists it on
+# the way out so it is never a silent survivor.
+delete_efs_mount_targets_in_network()
+{
+    local fs_name="${CLUSTER_NAME}-models"
+    local file_system_id mount_target_ids mt_id
+
+    file_system_id="$(aws efs describe-file-systems \
+        --query "FileSystems[?Name=='${fs_name}'].FileSystemId|[0]" --output text 2>/dev/null)"
+
+    if [[ "$file_system_id" == "None" || -z "$file_system_id" ]]; then
+        return 0
+    fi
+
+    mount_target_ids="$(aws efs describe-mount-targets --file-system-id "$file_system_id" \
+        --query 'MountTargets[].MountTargetId' --output text 2>/dev/null)"
+
+    if [[ -z "$mount_target_ids" ]]; then
+        ok "EFS $file_system_id ($fs_name) has no mount targets in the way"
+        return 0
+    fi
+
+    log "EFS mount targets on $file_system_id ($fs_name) would block the stack delete"
+    for mt_id in $mount_target_ids; do
+        aws efs delete-mount-target --mount-target-id "$mt_id"
+        info "deleting $mt_id"
+    done
+
+    printf '          waiting for mount targets to go ' >&2
+    while [[ -n "$(aws efs describe-mount-targets --file-system-id "$file_system_id" \
+        --query 'MountTargets[].MountTargetId' --output text 2>/dev/null)" ]]; do
+        printf '.' >&2
+        sleep 5
+    done
+    printf ' gone\n' >&2
 }
 
 report_stragglers()
