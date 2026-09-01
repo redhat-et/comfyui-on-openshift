@@ -25,9 +25,13 @@ MODE="${1:-}"
 
 # --yes skips the type-the-cluster-name confirmation. It exists for cron
 # (docs/02-cost.md schedules nightly teardown); interactive use should not
-# pass it.
+# pass it. Script-local, not exported: confirm_destructive is a function
+# called from this same shell, and load_env (lib/common.sh) deliberately
+# unsets any inherited ASSUME_YES, so only seeing --yes on this script's own
+# argv, right here, may set it.
 if [[ "${2:-}" == "--yes" ]]; then
-    export ASSUME_YES=true
+    # shellcheck disable=SC2034  # read by confirm_destructive in lib/common.sh
+    ASSUME_YES=true
 fi
 
 require_rosa_platform()

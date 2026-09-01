@@ -16,10 +16,23 @@ export REPO_ROOT
 
 load_env()
 {
+    # ASSUME_YES may only come from an explicit --yes argument to a script
+    # that accepts one (99-teardown.sh) — never from .env, and never from
+    # whatever happened to already be exported in the calling shell. Strip it
+    # both before and after sourcing .env: before, so an inherited
+    # `export ASSUME_YES=true` from a previous run does not survive into this
+    # one; after, because `set -a` below exports anything .env sets,
+    # including a stray ASSUME_YES=true line someone copied from a cron
+    # example. A script sets its own script-local ASSUME_YES afterward, once
+    # it has actually seen --yes on its own argv.
+    unset ASSUME_YES
+
     if [[ -f "${REPO_ROOT}/.env" ]]; then
         # shellcheck disable=SC1091
         set -a; source "${REPO_ROOT}/.env"; set +a
     fi
+
+    unset ASSUME_YES
 
     # Where the cluster lives.
     : "${PLATFORM:=rosa}"

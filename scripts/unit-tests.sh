@@ -479,6 +479,31 @@ expect_true "a known instance type still returns its rate with no warning" \
 
 # ---------------------------------------------------------------------------
 
+log "lib/common.sh — ASSUME_YES only comes from --yes, never from the environment (S4)"
+
+# The comment on confirm_destructive claims ASSUME_YES is set only by an
+# explicit --yes argument, never by an environment default. Before this fix
+# that was aspirational: `set -a; source .env; set +a` exports whatever .env
+# happens to set, and an ASSUME_YES already exported by the calling shell
+# survived untouched. load_env now unsets ASSUME_YES both before and after
+# sourcing .env, so simulate the exact scenario the comment promises against
+# — ASSUME_YES exported in the environment before a script ever looks at its
+# own argv — and confirm confirm_destructive still asks (and, with no
+# terminal attached, still refuses) rather than silently proceeding.
+assume_yes_env_does_not_bypass_confirm()
+{
+    (
+        export ASSUME_YES=true
+        load_env
+        CLUSTER_NAME=test-cluster confirm_destructive "test" </dev/null >/dev/null 2>&1
+    )
+}
+
+expect_false "ASSUME_YES=true in the environment does not bypass confirm_destructive" \
+    assume_yes_env_does_not_bypass_confirm
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then
