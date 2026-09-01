@@ -657,8 +657,14 @@ at all.
    stalled Redis for 113 ms at full queue depth before it was fixed —
    `enterprise/test/bench-fair-enqueue.py` keeps the number re-measurable.
 9. **Scale on queue *wait*, not queue depth.** Depth is a proxy; what a user
-   feels is time-to-first-pixel. Export an estimated wait from the gateway and
-   point KEDA's Prometheus scaler at it. *(Medium.)*
+   feels is time-to-first-pixel. *(Medium.)* *(The gauge half — Q6 in
+   `docs/10-roadmap.md` — is landed: `/metrics` exports
+   `comfy_estimated_wait_seconds`, the age of the queue entry served next,
+   derived from the `submitted_at` already on every queue envelope. It reads
+   zero or absent only when the queue is actually empty, and keeps growing
+   with wall-clock time — including with zero workers running, which is the
+   scale-to-zero case a Prometheus-scaler trigger needs a real number for.
+   Pointing KEDA's Prometheus scaler at it is I4 and still needs a cluster.)*
 10. **A model lockfile.** `models.lock` next to `COMFYUI_REF`, enforced by the
     S3 sync job, so an image tag and a model set pin together and a workflow
     that rendered last quarter still renders. Reject anything that is not

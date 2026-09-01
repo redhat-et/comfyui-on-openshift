@@ -198,7 +198,7 @@ was wrong.
 | Q1 | Fair queueing across submitters — **landed** | Medium | Medium | Queue | `enterprise/test/check-50-fair-queue.py`: a whole batch queued by one submitter does not delay a single job from a second submitter behind it — round-robin by `queue_key`, the pop itself (`BLMOVE` into the per-worker processing list) unchanged. `bench-fair-enqueue.py` separately measures what one insert costs Redis at a realistic queue depth |
 | Q2 | Phase breadcrumbs + retry only pre-execution deaths — **landed** | Medium | **High** | Queue | `enterprise/test/check-30-sigkill.py` and `check-35-retry-doors.py`: a worker killed before ComfyUI ever saw the workflow is requeued exactly once; a worker killed mid-execution gets one terminal `failed` naming the dead worker and is never requeued; the `phase` breadcrumb is durable *before* the `/prompt` POST returns, not after; and a job the user already cancelled is neither requeued by the reaper nor ever submitted by a worker that pops it |
 | Q3 | Per-user output workspaces — **landed**, laptop half | Medium | **High** | Queue + cluster | `enterprise/test/check-60-user-workspaces.py`: two submitters land in two places, a hostile username is confined rather than mangled or escaped, and an anonymous submission still works and does not alias onto a real user — plus lint shapes for the directory mode. The arbitrary-UID half is on the cluster-day list below |
-| Q6 | Estimated-wait metric | Small | Low | Queue | e2e on the gauge; the scaler half is I4 |
+| Q6 | Estimated-wait metric — **landed** | Small | Low | Queue | `enterprise/test/check-80-estimated-wait.py`: `comfy_estimated_wait_seconds` is exposed on `/metrics` in proper gauge form, reads zero or absent only with an empty queue, and reflects a manufactured entry's real `submitted_at` (grows with wall-clock time, not with a constant or queue depth) — the scaler half is I4 |
 | Q4 | Showback report | Small | Low | Queue | e2e: GPU seconds attributed to the right user, with a bounded key set |
 | Q5 | GPU-second quota breaker | Medium | Medium | Queue | e2e including quota exhausted and quota data missing (must fail open) |
 | I1 | Schedule the warm window | Small | Low | Infra | New unit test on a pure helper; behaviour on cluster day |
@@ -261,6 +261,72 @@ The root cause was worse than "waits for the deadline". A server-side close
 arrives as an *empty frame*, and `""` is a `str`, so it slipped past the
 binary-frame guard, failed to parse as JSON, and hit `continue` — spinning the
 receive loop at full speed for the whole of `JOB_TIMEOUT` while holding a card.
+
+### Q6 landed — the contract it owes I4
+
+Q6 is done: `hub.py`'s `estimated_wait_seconds()` reads `LINDEX comfy:queue -1`
+— the tail, which `worker_agent.py`'s `BLMOVE ... src="RIGHT"` always pops
+next, whatever fair queueing did to the rest of the list — and reports how
+long *that* entry's `submitted_at` (F2) has been sitting there. `metrics()`
+exports it as `comfy_estimated_wait_seconds`, a third gauge beside
+`comfy_queue_depth` and `comfy_workers_registered`, picked up by the same
+unfiltered ServiceMonitor `enterprise/setup.sh` already applies — no
+`metricRelabelings` allowlist exists to update.
+
+**What it means at zero workers, decided rather than left open.** The
+scale-to-zero case — no worker running at all — is the case a user actually
+hits, and the roadmap item that specified Q6 asked for a decision here rather
+than a default: report a real, honest number, not "unknown". The alternative
+(reporting the gauge absent whenever `workers_registered == 0`) was considered
+and rejected, specifically because it is the one case I4 exists to act on: a
+KEDA Prometheus trigger cannot fire off a series that is not there. Unlike a
+depth × average-service-time forecast — which has no service-time sample to
+build from until something has finished, and is a fabricated number at zero
+workers — age-of-the-next-entry needs no such model. It is a directly measured
+elapsed time that is simply true, and keeps growing, with nobody serving it.
+An empty queue reports `0.0` (not absent) for the same reason: there is
+nothing to be waiting on, which is itself the honest answer, not a stand-in
+for "no data".
+
+**The contract a Prometheus-scaler trigger (I4) needs from this gauge:**
+
+- **Metric name and unit.** `comfy_estimated_wait_seconds`, already in wall-
+  clock seconds — no unit conversion on the KEDA side.
+- **Query surface.** OpenShift user-workload monitoring's Thanos Querier
+  (`thanos-querier.openshift-monitoring.svc.cluster.local:9091` in-cluster),
+  namespace-scoped to `$APP_NAMESPACE` — Thanos multi-tenancy requires the
+  `namespace` field on the trigger, not just the query string. Authentication
+  needs a bearer token (a ServiceAccount bound to a view role on that
+  namespace's metrics), wired through a `TriggerAuthentication` the way
+  `comfy-redis-auth` already wires the Redis password in
+  `03-autoscale.yaml` — a `bearerAuth`, not a `secretTargetRef`, since there
+  is no static secret to reference.
+- **Activation from zero.** KEDA's `prometheus` trigger's `activationThreshold`
+  is the field that matters here, distinct from `threshold`: it is what lets
+  a `0.0` reading mean "stay at zero" while a real, growing value crosses it
+  and scales `0 -> 1`. This only works because the gauge is a number at zero
+  workers rather than absent — see above.
+- **Add, don't replace.** A `ScaledObject` may hold more than one trigger
+  (OR'd by default), so this is a second `type: prometheus` trigger added
+  alongside the existing `type: redis` one in `03-autoscale.yaml`, not a
+  replacement for it. The two are independent signals over the same queue —
+  instantaneous depth vs. accumulated wait — and either firing should scale
+  up.
+- **Poll cadence bound.** The value only changes as fast as the ServiceMonitor
+  scrapes it (`interval: 30s`, `configure_metrics()` in `enterprise/setup.sh`)
+  plus Prometheus's own ingest lag. A `pollingInterval` on the trigger shorter
+  than that queries data that has not moved yet; 30s or coarser is the honest
+  floor, not KEDA's 15s default the Redis trigger uses.
+- **Threshold value is a product decision, not a technical one.** It trades
+  against the 8-15 minute cold start `03-autoscale.yaml` already documents:
+  too low and a worker scales up for a job that would have been picked up in
+  seconds anyway; too high and a user waits through avoidable idle-queue time
+  before the pool even starts warming. Cluster day is where this gets tuned
+  against a real cold start, the same way `cooldownPeriod: 600` was chosen
+  against it.
+
+None of the above is implemented. This section exists so I4 starts from a
+contract instead of re-deriving one from `hub.py`.
 
 ### Deferred, with reasons
 

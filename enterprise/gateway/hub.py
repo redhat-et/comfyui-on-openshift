@@ -1204,6 +1204,55 @@ async def readyz():
     return {"ok": True}
 
 
+async def estimated_wait_seconds(conn: redis.Redis) -> float | None:
+    """
+    Q6 (docs/10-roadmap.md) — how long has the job about to be served already
+    been waiting, derived from the `submitted_at` F2 already reserved on the
+    envelope. No second time field, no service-time model.
+
+    Which entry: LMOVE pops `src="RIGHT"` (worker_agent.py's BLMOVE), so the
+    tail — index -1 — is always the entry served next, whatever fair queueing
+    (BEGIN FAIR QUEUEING above) did to the rest of the list. Its age is the
+    queue-side latency a caller submitting right now would be waiting behind,
+    the same "age of the oldest thing in line" a queueing system reports when
+    it has no per-item service-time estimate to build a forecast from (the SQS
+    ApproximateAgeOfOldestMessage shape) — a fact read off one entry, not a
+    depth-based guess.
+
+    An empty queue reads as LINDEX returning None: 0.0, not "unknown" — there
+    is nothing to be waiting on. A malformed or pre-F2 entry (no
+    `submitted_at` at all) reads as None — "unknown" — rather than a
+    fabricated 0, the same "absence is a distinct value from zero" rule
+    check-80's `gauge_value()` relies on.
+
+    Scale-to-zero (`workers_registered == 0`) is the case the roadmap item
+    calls out by name, and it is deliberately NOT special-cased into
+    "unknown" here: unlike a depth × average-service-time forecast — which has
+    no service-time sample to build from when nothing has ever finished, and
+    would be a genuinely fabricated number at zero workers — this is a
+    directly measured elapsed time that stays true, and keeps growing, with
+    no worker running at all. Making it absent at zero workers would blind the
+    one signal I4's Prometheus scaler needs in order to scale the pool up FROM
+    zero in the first place (see docs/10-roadmap.md's deferred_to_cluster note
+    for I4's trigger contract) — the exact case an "honest unknown" would be
+    most tempting, and least affordable, to report.
+    """
+    raw = await conn.lindex(QUEUE_KEY, -1)
+
+    if raw is None:
+        return 0.0
+
+    try:
+        submitted_at = json.loads(raw).get("submitted_at")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+    if isinstance(submitted_at, bool) or not isinstance(submitted_at, (int, float)):
+        return None
+
+    return max(0.0, time.time() - submitted_at)
+
+
 async def gather_stats() -> dict:
     conn = client()
 
@@ -1217,6 +1266,7 @@ async def gather_stats() -> dict:
     return {
         "queue_depth": await conn.llen(QUEUE_KEY),
         "workers_registered": workers,
+        "estimated_wait_seconds": await estimated_wait_seconds(conn),
     }
 
 
@@ -1228,14 +1278,14 @@ async def stats():
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics():
     """
-    Prometheus text format, hand-rolled — two gauges do not justify a client
+    Prometheus text format, hand-rolled — three gauges do not justify a client
     library dependency. OpenShift's user-workload monitoring scrapes this via
     the ServiceMonitor enterprise/setup.sh applies, which is what makes
     "queue deeper than N for 30 minutes" an alert instead of a support ticket.
     """
     data = await gather_stats()
 
-    return (
+    text = (
         "# HELP comfy_queue_depth Jobs waiting in the Redis queue.\n"
         "# TYPE comfy_queue_depth gauge\n"
         f"comfy_queue_depth {data['queue_depth']}\n"
@@ -1243,6 +1293,23 @@ async def metrics():
         "# TYPE comfy_workers_registered gauge\n"
         f"comfy_workers_registered {data['workers_registered']}\n"
     )
+
+    # Absent, not zero, when estimated_wait_seconds() could not read a real
+    # submitted_at off the next entry to serve (see its docstring) — an
+    # omitted sample is Prometheus's own way of saying "no data" instead of
+    # a fabricated number a dashboard would plot as if it meant something.
+    wait = data["estimated_wait_seconds"]
+
+    if wait is not None:
+        text += (
+            "# HELP comfy_estimated_wait_seconds Age of the queue entry "
+            "served next, i.e. how long a job submitted right now would "
+            "wait behind it.\n"
+            "# TYPE comfy_estimated_wait_seconds gauge\n"
+            f"comfy_estimated_wait_seconds {wait:.3f}\n"
+        )
+
+    return text
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -389,12 +389,17 @@ fi
 # ---------------------------------------------------------------------------
 # Metrics
 #
-# The gateway serves /metrics (queue depth, live workers — two gauges, no job
-# or user data). A ServiceMonitor lets OpenShift's user-workload monitoring
-# scrape it, which turns "queue deeper than N for 30 minutes" into an alert
-# instead of a support ticket. In oauth mode the scrape goes through the
-# proxy's 8443, which skips auth for /metrics only; in none mode, straight to
-# the gateway port.
+# The gateway serves /metrics (queue depth, live workers, estimated wait —
+# three gauges, no job or user data). A ServiceMonitor lets OpenShift's
+# user-workload monitoring scrape it, which turns "queue deeper than N for 30
+# minutes" into an alert instead of a support ticket. In oauth mode the scrape
+# goes through the proxy's 8443, which skips auth for /metrics only; in none
+# mode, straight to the gateway port.
+#
+# No metricRelabelings here: the scrape is unfiltered, so a new gauge added to
+# metrics() (hub.py) — comfy_estimated_wait_seconds, docs/10-roadmap.md Q6 —
+# is picked up the moment the image ships it, with nothing to edit in this
+# file. I4's Prometheus scaler trigger reads it the same way once it exists.
 # ---------------------------------------------------------------------------
 
 configure_metrics()
@@ -448,7 +453,7 @@ spec:
 EOF
     fi
 
-    ok "ServiceMonitor applied — comfy_queue_depth, comfy_workers_registered"
+    ok "ServiceMonitor applied — comfy_queue_depth, comfy_workers_registered, comfy_estimated_wait_seconds"
 
     # ServiceMonitors in user namespaces are scraped only once user-workload
     # monitoring is switched on, which is a one-time cluster-admin setting.
