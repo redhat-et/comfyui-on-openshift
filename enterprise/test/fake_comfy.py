@@ -2,6 +2,66 @@
 import asyncio, json, uuid
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
+
+# ---------------------------------------------------------------------------
+# THE OPENING HANDSHAKE HAS TO BE ALLOWED TO TAKE LONGER THAN TEN SECONDS.
+#
+# stall_next_ws_s below parks a connection BEFORE ws.accept(), and under ASGI
+# the accept IS the handshake response: uvicorn runs this module's websocket
+# endpoint from inside websockets' opening handshake, and the legacy
+# implementation (websockets.legacy.server.WebSocketServerProtocol, which
+# uvicorn's WebSocketProtocol subclasses) wraps that whole step in
+# `open_timeout` — ten seconds, defaulted in websockets and passed by no
+# uvicorn setting.
+#
+# Past that ceiling the stall stops being a stall. The handshake is abandoned,
+# the TCP connection is dropped, worker_agent.py's ws.connect() raises
+# WebSocketConnectionClosedException("Connection to remote host was lost."),
+# and a fixture that promised "ComfyUI is SLOW to accept" has delivered
+# "ComfyUI is DEAD" instead. That is the one substitution it must never make:
+# a check about what a live worker does while parked is then asserting it
+# against a job that never ran at all. check-36-live-worker-fencing.py stalls
+# for HEARTBEAT_TTL + 5 — 15s with the TTL run.sh exports — so it sat the
+# wrong side of that ceiling and read the dead ComfyUI as its own subject.
+#
+# Only the legacy implementation carries this timer: uvicorn's sansio and
+# wsproto websocket implementations time the opening handshake nowhere, so
+# for those there is nothing to lift and this is a no-op. That reasoning is
+# not trusted to stay true — check-36 times the park it gets and asserts it
+# lasted, so a ceiling that reappears somewhere this cannot reach fails an
+# assertion that names the stall instead of silently inverting a scenario.
+#
+# What the ceiling cost while it was there, which is why the assertion is
+# worth its line: check-36 scenario B's "ComfyUI was handed this workflow
+# exactly once" passed with worker_agent.py's ownership fence disabled. The
+# reaped attempt was dying in ws.connect() before it ever reached the fence,
+# so the assertion that exists to prove the fence works could not fail.
+# ---------------------------------------------------------------------------
+def _lift_ws_handshake_timeout() -> None:
+    try:
+        from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+        from websockets.legacy.server import WebSocketServerProtocol
+    except ImportError:  # no legacy implementation to patch
+        return
+
+    if not (isinstance(AutoWebSocketsProtocol, type)
+            and issubclass(AutoWebSocketsProtocol, WebSocketServerProtocol)):
+        return
+
+    original_init = AutoWebSocketsProtocol.__init__
+
+    def __init__(self, *args, **kwargs):
+        # After the original, not through it: uvicorn calls super().__init__()
+        # with an explicit keyword list that does not include open_timeout, so
+        # there is no default to override on the way in.
+        original_init(self, *args, **kwargs)
+        self.open_timeout = None
+
+    AutoWebSocketsProtocol.__init__ = __init__
+
+
+_lift_ws_handshake_timeout()
+
 app = FastAPI()
 clients = {}
 history = {}
@@ -56,6 +116,16 @@ async def received_prefixes_endpoint():
 # so it is the window check-30-sigkill.py has to kill an agent inside.
 # Set through POST /__stall_next_ws__, consumed by the first connection to see
 # it, and kept well under worker_agent.py's own 30s connect timeout.
+#
+# Not observable from in here, which is why the check asserts it by the clock
+# instead. An abandoned handshake leaves this endpoint's coroutine running:
+# it sleeps out the rest of the stall and its `await ws.accept()` returns
+# normally onto a transport that closed while it was still sleeping, so a
+# counter incremented after the accept reads the same in both worlds. The
+# only party that can tell a stall from a drop is the client, and here the
+# client is the agent under test — so the assertion lives in
+# check-36-live-worker-fencing.py, as the wall-clock time the park actually
+# lasted.
 stall_next_ws_s = 0.0
 
 
