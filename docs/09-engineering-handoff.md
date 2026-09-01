@@ -126,7 +126,7 @@ enterprise/         the multi-user configuration
   manifests/        Redis, gateway, worker, KEDA, oauth-proxy, Routes
   test/             e2e suite: real Redis, stub ComfyUI, no cluster needed
 app/Containerfile   the single-user ComfyUI image
-docs/               01-08, plus this file
+docs/               ten documents — 01-08, this file, and the roadmap
 .env                24 variables; the only configuration surface
 ```
 
@@ -218,9 +218,9 @@ no cluster and reads no manifest — so if you are about to argue with a lint
 failure naming one of them, read its row above first. The check exists
 precisely because the edit looks harmless.
 
-Six more shapes are pinned there for the opposite reason: they are in the
+Seven more shapes are pinned there for the opposite reason: they are in the
 Python and the shell the suite *does* run, and the suite still cannot see
-five of them. `make lint` fails on a retry counter written by anything other
+six of them. `make lint` fails on a retry counter written by anything other
 than `HINCRBY` — whose failure mode needs the two gateway replicas
 `01-gateway.yaml` runs and `enterprise/test/run.sh` starts one — and on a
 `TERMINAL_TYPES` that gained a member, which `check-30-sigkill.py` would also
@@ -255,7 +255,7 @@ are both invisible to a suite that runs for a minute against ten of them,
 which is exactly why the accumulator's row above is enforced here rather than
 there.
 
-Q5's quota breaker added the nineteenth, and it is the only row here whose
+Q5's quota breaker added the twentieth, and it is the only row here whose
 failure mode is caused by the safety feature itself: `make lint` fails if
 anything reachable from `readyz()` — transitively, not just its own body —
 mentions the quota, and if `quota_refusal()` is called from anywhere other
@@ -314,8 +314,10 @@ a failed assertion — `run.sh` reads both, so a check that keeps printing its
 drops the `sys.exit(1)`, a failures list nothing reads any more) cannot leave
 the suite, or CI, green over its own output. And when you add or change an
 assertion, break the behaviour it is about and watch it fail before you believe
-it: four assertions have shipped here unable to fail, each found only by
-someone deliberately breaking the feature and noticing nothing went red.
+it: six assertions have shipped here unable to fail, each found only by someone
+deliberately breaking the feature and noticing nothing went red. They are
+listed, with what replaced each one, in the README under *"The assertions that
+could not fail"*.
 
 Then, when you want a cluster:
 
@@ -394,10 +396,10 @@ Ordered by likelihood. Full detail in `docs/05-troubleshooting.md`.
 | Queue grows, workers idle or absent | KEDA cannot reach Redis, or the pool cannot scale | `oc get scaledobject,hpa`; the scaler dials from `openshift-keda`, so the Redis address must be fully qualified. |
 | Everything works, generation is slow | Model loading over EFS, or the wrong instance type | `docs/05-troubleshooting.md`; also idea 3 in the README. |
 
-Set the alert before you need it: the gateway exports `comfy_queue_depth` and
-`comfy_workers_registered`, `setup.sh` applies a ServiceMonitor, and *"queue
-deeper than N for 30 minutes"* is the alert that catches a wedged pool before a
-human does.
+Set the alert before you need it: the gateway exports `comfy_queue_depth`,
+`comfy_workers_registered` and `comfy_estimated_wait_seconds`, `setup.sh`
+applies a ServiceMonitor, and *"queue deeper than N for 30 minutes"* is the
+alert that catches a wedged pool before a human does.
 
 ---
 

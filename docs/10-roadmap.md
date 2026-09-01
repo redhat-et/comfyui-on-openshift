@@ -5,8 +5,11 @@ what each one actually touches, what proves it, what order they can safely land
 in, and which of them cannot be finished without spending money on a real
 cluster.
 
-All three foundations have landed — F3, F1 and F2, in that order. Nothing else
-here is implemented. This document exists so that the next person to
+All four foundations have landed — F3, F1 and F2 in that order, then F4 after
+the queue lane — and so has the whole queue lane: Q1, Q2, Q3, Q6, Q4 and Q5.
+What is left is the infra and supply lanes — I1, I2, I3, I4, I7, S1 and S2 —
+none of which is implemented, plus I5, which is an unscoped spike, and I6,
+which is decided against. This document exists so that the next person to
 pick up a line item does not have to re-derive its blast radius, and so that
 several of them can be worked in parallel without three people editing
 `hub.py` at once.
@@ -17,36 +20,48 @@ a full read of the code; where it corrects the README's framing, it says so.
 
 ## What decides the order
 
-**Seven items contend on `hub.py`, five on `worker_agent.py`.** Not the same
+This section is the plan as it was drawn, before the queue lane landed. It is
+kept because it is the record of *why* the work landed in the order it did, and
+the correction is written in line wherever a fact has since changed.
+
+**Seven items contended on `hub.py`, five on `worker_agent.py`.** Not the same
 five: Q5's entire contact with the queue path is one precondition in
 `generate()`, and it never touches the worker. The collisions are also finer
 than "the same file" — three regions are hot, `generate()`, the reaper pair,
 and `gather_stats()`/`metrics()` — which is why worktrees do not help. The
-queue work is a sequence.
+queue work is a sequence. (What the six queue items actually touched, measured
+from the commits: five of them edited `hub.py` — Q3 did not — and three edited
+`worker_agent.py`.)
 
-**The most contended file in the plan does not exist yet.** All six queue items
-propose creating `enterprise/test/check4.py`, and all six must edit
-`enterprise/test/run.sh`, which has **no check discovery**: `run.sh` copies
-`*.py` into the work directory by glob but invokes checks by hardcoded name, and
-threads their exit codes by hand. A botched merge there **fails open** — the new
-check is copied, never run, and the suite is green. That is why F3 below comes
-before any queue work.
+**The most contended file in the plan did not exist yet.** All six queue items
+proposed creating `enterprise/test/check4.py`, and all six would have had to
+edit `enterprise/test/run.sh`, which had **no check discovery**: `run.sh`
+copied `*.py` into the work directory by glob but invoked checks by hardcoded
+name, and threaded their exit codes by hand. A botched merge there **fails
+open** — the new check is copied, never run, and the suite is green. That is
+why F3 landed before any queue work. It now discovers every `check*.py`, and
+the seventeen check files are named under the convention F3 settled
+(`enterprise/test/README.md`); `check4.py` was never written.
 
 **There is a hard verification boundary.** `make test` and `make lint` prove the
 queue, the gateway, path handling, signal handling and image UID hygiene with no
 cluster, no GPU and no AWS account, in about a minute. KEDA actually scaling, a
 machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
-nothing until there is a cluster at ~$2.04/hour. Only five items are
-cluster-only for a failing assertion; ten have a laptop half.
+nothing until there is a cluster at ~$2.04/hour. Only three of the seventeen
+items are cluster-only for a failing assertion — I3, I4 and I7, whose "proven
+by" column reads *cluster day* and nothing else. The other fourteen have a
+laptop half.
 
-**Nineteen invariants are load-bearing** — `docs/09-engineering-handoff.md`
+**Twenty-three invariants are load-bearing** — `docs/09-engineering-handoff.md`
 §3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth,
-Q3 the seventeenth, Q4 the eighteenth and Q5 the nineteenth, which is what
-"changes an invariant" looks like in practice.)
-Thirteen of the items touch at least one, so "the risky ones get a second
-reviewer" is not a useful filter. The filter that *is* useful: an item is
-high-risk if it **changes** an invariant rather than merely working near one.
-Three do — Q2, Q3 and F1.
+Q3 the seventeenth, Q1 the eighteenth, Q4 the nineteenth and Q5 the twentieth,
+and the cross-wave sweep the last three — the worker's per-process identity,
+F4's keepalive-and-fence, and reap durability. That is what "changes an
+invariant" looks like in practice.)
+Touching an invariant is not a useful filter, because nearly every item does.
+The filter that *is* useful: an item is high-risk if it **changes** an
+invariant rather than merely working near one. Four have — F1, Q2, Q3 and F4,
+and each of the four added a row to §3.
 
 ## Decisions already made
 
@@ -95,14 +110,16 @@ gateway out of service and kill the WebSockets reporting in-flight jobs.
 
 ## Foundations — these land first
 
-Three items that are not in the README's list, that several later items
-silently assume, and that are each worth doing on their own merits.
+Four items that are not in the README's list, that several later items
+silently assume, and that are each worth doing on their own merits. F1, F2 and
+F3 landed ahead of the queue lane; F4 is the exception — it was found *by* the
+queue lane, in the door Q2's narrowing did not look at, and landed after it.
 
 | ID | Change | Effort | Risk | Proven by |
 |---|---|---|---|---|
 | F1 | Worker resource sizing — **landed** | Small | **High** | A unit assertion that requests and limits are internally consistent and fit the target instance type — `scripts/unit-tests.sh` runs the real `scripts/lint.sh` against a fixture with the old shape |
 | F2 | Versioned queue payload envelope — **landed** | Small | Low | `enterprise/test/check-40-envelope.py`: the reserved fields are on the wire with their defaults, an old-shape payload still completes, and an unknown field is not fatal — plus a lint check that the two copies of the envelope have not diverged |
-| F3 | Test harness convention + manifest shape assertions | Small | Low | A deliberately broken manifest fails `make lint`; a new check is discovered without editing two places |
+| F3 | Test harness convention + manifest shape assertions — **landed** | Small | Low | A deliberately broken manifest fails `make lint`; a new check is discovered without editing two places |
 | F4 | Heartbeat keepalive + job ownership fence — **landed** | Small | **High** | `enterprise/test/check-36-live-worker-fencing.py`, which kills nothing: a live worker parked past `HEARTBEAT_TTL` in `run_job()`'s prologue keeps its heartbeat armed and its job (zero writes to `comfy:queue`, one handoff to ComfyUI, one terminal event), and a live worker whose job IS requeued under it — its heartbeat deleted out from under it until the reaper acts — abandons rather than submitting the workflow beside the retry |
 
 **F1 — worker resource sizing.** The diagnosis above held on inspection and
@@ -182,11 +199,13 @@ What landed:
 check is a file and not also an edit in two hardcoded places, and settle the
 naming convention before six items each create their own `check4.py`. Then
 extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
-assertions. Eleven of the eighteen §3 invariants are properties of files rather
-than of a running system — a missing toleration, a Service that regained a
-port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
-— and the e2e suite structurally cannot see any of them. This is also what
-turns the infra gate below from a request for vigilance into a check.
+assertions. Ten of §3's twenty-three invariants name a manifest, a
+Containerfile or a shell script in their "where" column rather than a line of
+Python — a missing toleration, a Service that regained a port, a dropped Route
+annotation, a Containerfile that lost its `chgrp 0` block — and the e2e suite
+structurally cannot see any of them. This is also what turns the infra gate
+below from a request for vigilance into a check. `scripts/lint.sh` now holds
+twelve of those file shapes as greps, beside the manifest checks.
 
 **F4 — the un-heartbeated window, and the fence under it.** Q2 narrowed retry
 to deaths that happened before ComfyUI was handed the workflow, and left one
@@ -569,7 +588,7 @@ own configuration is a worse outage than the spend it guards against.
 
 **It is nowhere near `readyz()`, and that is enforced structurally.** The
 roadmap's own sentence — "It must not be wired into `readyz()`" — is now the
-nineteenth §3 invariant and a `scripts/lint.sh` rule that walks `hub.py`'s
+twentieth §3 invariant and a `scripts/lint.sh` rule that walks `hub.py`'s
 call graph: nothing reachable from `readyz()`, transitively, may mention the
 quota, and `quota_refusal()` must be called from `generate()` and nothing
 else. The rule also fails if the breaker is deleted, since every other clause
@@ -590,6 +609,29 @@ workflow nobody has run yet, and a reconciliation that has to survive the
 reaper. The roadmap chose one accounting path; the overshoot is bounded by
 `MAX_QUEUE_DEPTH` and by the pool size, and the budget alarm remains the
 backstop.
+
+### Found by the cross-wave sweep, and landed without an item
+
+Two fixes shipped that were on no list here, and they are recorded so that the
+statuses above are the whole of what changed. Both are §3 rows and both are
+pinned by `scripts/lint.sh`; neither is a roadmap item, because neither was a
+feature.
+
+**The worker's Redis identity names the process, not the pod.** The heartbeat
+key and the processing list are now suffixed with a nonce chosen at process
+start rather than with `HOSTNAME` alone. `restartPolicy: Always` restarts a
+container *inside* its pod, so an identity taken from `HOSTNAME` is handed back
+to the next incarnation, whose first heartbeat then answers the reaper's
+liveness question on the dead one's behalf and hides its stranded job for as
+long as the pod keeps restarting. `check-32-worker-restart.py` is the same
+death as `check-30-sigkill.py`'s scenario B with the name reused.
+
+**A failed reap leaves the job recoverable, and is bounded.** The reaper's loop
+read the entry off the processing list before reaping it, so anything that
+raised in the body destroyed the only record that the job had been queued. It
+now removes the entry only after the reap returns, retries a reap that raised
+on a later tick, and sets aside an entry that can never be reaped on a capped,
+expiring list. `check-37-reap-durability.py` injects one fault per scenario.
 
 ### Found by the cross-wave sweep, not yet done
 
@@ -657,16 +699,24 @@ Foundations first, then the infra items that touch neither Python file, then
 the queue lane in sequence, then the cluster-only work. `I5` is a spike run
 alongside; `I6` is not scheduled.
 
+What actually happened, since the plan and the record are worth telling apart:
+F3 → F1 → F2, then Q1 → Q2 → Q3, then Q6 → Q4 → Q5, then F4 — which did not
+exist when this order was drawn — and the sweep fixes beside it. The infra and
+supply items were not started, so I1, S1, I2 and S2 are still ahead of the
+queue lane in the plan and behind it in the history.
+
 ## Three lanes
 
-**Queue lane — sequential.** All six items edit `hub.py` and five of them also
-edit `worker_agent.py`, whose key shapes must change together or not at all.
-All are laptop-verifiable except Q3's arbitrary-UID half. The loop: write the
+**Queue lane — sequential, and landed.** The plan expected all six items to
+edit `hub.py` and five of them to also edit `worker_agent.py`, whose key shapes
+must change together or not at all; measured from the commits, five edited
+`hub.py` (Q3 did not) and three edited `worker_agent.py`. All were
+laptop-verifiable except Q3's arbitrary-UID half. The loop was: write the
 assertion that fails on HEAD, implement until it passes, run `make test && make
 lint`, hand the merged tree on.
 
 **Infra lane — parallel, with three exceptions.** Seven items touch
-`enterprise/setup.sh` (559 lines), but they hit mostly disjoint regions and can
+`enterprise/setup.sh` (591 lines), but they hit mostly disjoint regions and can
 be worked in branches or worktrees. The exceptions must be sequenced: I2 before
 S2 (both rewrite the image build and its call sites), I2 before its CI job, and
 I1 with I3 only after the min-replicas ownership conflict above is settled.
@@ -686,7 +736,7 @@ adjacently so one review settles whether that list should shrink.
 | Every item | The new check is **actually invoked** and its status reaches the suite's exit code — a check that is copied but never run leaves the suite green |
 | Queue lane | An existing assertion may be **replaced** only by one that is strictly stronger, in the same commit, with old and new both shown in review. Two items require this: Q2 must rewrite the assertion that a hard-killed job ends `failed`, which is the behaviour it changes, and Q3 must rewrite the pinned flat output URL. Neither touches the path-traversal assertion, which must survive untouched. |
 | Infra lane | No manifest lost a GPU toleration, a Route timeout annotation, or a Service port restriction — enforced by F3, not by hoping |
-| Invariant-changing items (F1, Q2, Q3) | A second reviewer who has read `docs/09` §3, checking specifically that the change survives a hard kill mid-job, two gateway replicas racing, and its dependency being unreachable |
+| Invariant-changing items (F1, Q2, Q3, F4) | A second reviewer who has read `docs/09` §3, checking specifically that the change survives a hard kill mid-job, two gateway replicas racing, and its dependency being unreachable |
 | Cluster items | Verified on a real cluster, in one batched session |
 
 ## The cluster day

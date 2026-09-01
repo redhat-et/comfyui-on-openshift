@@ -20,16 +20,20 @@ Install from the requirements file rather than a bare `pip install redis` —
 the `redis<7` pin is load-bearing (redis-py 8 breaks blocking reads; the
 requirements file says why).
 
-31 assertions, about a minute. `enterprise/test/README.md` explains what each
-one is defending against and why. Run it before sending a change to `hub.py`
-or `worker_agent.py`.
+289 assertions — 29 shell unit, 260 end-to-end across 17 check files — in
+about a minute. `enterprise/test/README.md` explains what each one is
+defending against and why. Run it before sending a change to `hub.py` or
+`worker_agent.py`.
 
 Adding an assertion means adding a file: `run.sh` discovers every
 `enterprise/test/check*.py`, so a new check needs no second edit anywhere. The
 naming convention — and the two things a check may assume — are in
-`enterprise/test/README.md`. One of the shell unit tests proves that discovery
-by running the e2e suite with a deliberately broken check dropped into it, so
-`make test` costs about two e2e runs rather than one.
+`enterprise/test/README.md`. Two of the shell unit tests prove that discovery
+by running the real e2e suite with a deliberately broken check dropped into it
+— one fixture per fold, because a fixture that breaks both rules at once
+cannot say which one caught it. Both are named `check-00-*` so they sort ahead
+of every real check and the suite they spawn stops at the first one, which
+costs a suite startup and a single check rather than a full pass.
 
 ## Linting
 
@@ -43,8 +47,13 @@ compilation, and the manifest and file shape checks — the logic lives in
 load-bearing invariants in `docs/09-engineering-handoff.md` section 3 is held:
 a worker that lost its GPU toleration, a Route that lost `timeout-tunnel`, a
 Service that regained the gateway's own port, a Containerfile that lost its
-`chgrp 0` block. The e2e suite runs no cluster and reads no manifest, so it
-cannot see any of them.
+`chgrp 0` block, a GPU pod whose memory limit no longer fits the smallest
+supported instance. The e2e suite runs no cluster and reads no manifest, so it
+cannot see any of them. `scripts/lint.sh` also pins shapes in the Python and
+shell the suite *does* run but cannot see the failure of — the twelve rules
+under "load-bearing file shapes", plus the retry counter, the fair-queueing
+insert, the showback accumulator and the quota breaker's distance from
+`readyz()`.
 CI (`.github/workflows/ci.yaml`) runs exactly `make lint` and `make test` on
 every pull request — a red check on those means the same command fails for
 you locally — plus two jobs that need more than a laptop usually has lying

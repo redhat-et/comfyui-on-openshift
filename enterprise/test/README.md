@@ -7,8 +7,14 @@ stub ComfyUI, on your laptop. No cluster, no GPU, no AWS.
 ./enterprise/test/run.sh
 ```
 
-Needs `redis-server` on PATH and `pip install redis websocket-client fastapi
-'uvicorn[standard]'`.
+Needs `redis-server` on PATH and
+`pip install -r enterprise/gateway/requirements.txt websocket-client`.
+
+Install from the requirements file rather than naming the packages: the
+`redis<7` ceiling in it is load-bearing — redis-py 8 defaults `socket_timeout`
+to 5 seconds, which makes every blocking `BLMOVE`/`XREAD` longer than that
+raise instead of waiting, and the blocking paths are most of what this suite
+asserts. `CONTRIBUTING.md` says the same thing; the requirements file says why.
 
 ## What it measures, separately
 
@@ -230,9 +236,10 @@ same `{out_0001.png, ""}` for every job it is ever given, so the returned URLs
 can only differ if the submitter's identity actually changed where the output
 went (docs/10-roadmap.md, Q3). The rest of `check-60-user-workspaces.py` is
 hostile-input testing, because the identity it names a directory from is a
-request header: a username of `../../../../tmp/evil`, of `/etc/passwd`, empty,
-and 2000 characters long must each either be refused at submit or produce only
-a confined, namespaced, servable output — and, in the other direction, an
+request header: a username of `../../../../../../../../tmp/evil`, of
+`/etc/passwd`, empty, and 2000 characters long must each either be refused at
+submit or produce only a confined, namespaced, servable output — and, in the
+other direction, an
 ordinary `alice.smith@example.com` must still get a real workspace, since
 sanitizing so hard that real usernames break is its own failure. What this
 cannot see is the directory *mode*: it runs one agent as one UID, and the bug
