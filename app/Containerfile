@@ -21,8 +21,29 @@ FROM nvcr.io/nvidia/cuda:12.6.2-base-ubi9
 # Kept in sync with COMFYUI_REF in .env.example; scripts/05-deploy.sh passes
 # the .env value through as a build arg. Pinned here too so a local
 # `podman build` with no args builds the same thing the cluster does.
+#
+# TORCH_VERSION/TORCHVISION_VERSION/TORCHAUDIO_VERSION are one set —
+# torchvision and torchaudio each build against a single torch release, so
+# bumping one alone breaks at import, not at build.
+#
+# 2.8.0 is not a preference, it is the line below which COMFYUI_REF quietly
+# degrades. ComfyUI v0.32.0 enables DynamicVRAM by default on NVIDIA and
+# nothing in the CMD at the bottom of this file opts out (enables_dynamic_vram
+# in comfy/cli_args.py); main.py then gates it at torch >= 2.8, and below that
+# logs "Unsupported Pytorch detected" and falls back to the legacy
+# ModelPatcher. cu128 is the lowest index carrying 2.8 — cu124 stops at 2.6.0
+# and never got a 2.7+ wheel — which is why the index moved with the pin.
+#
+# Note the failure mode that justifies pinning at all: it is silence, not a
+# crash. Unpinned on cu124 pip resolved 2.6.0, ComfyUI booted fine, and the
+# whole symptom was one log line. Bump all four together, and re-read ComfyUI's
+# version gates when you do — the floor belongs to COMFYUI_REF, not to torch.
 ARG COMFYUI_REF=v0.32.0
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_VERSION=2.8.0
+ARG TORCHVISION_VERSION=0.23.0
+ARG TORCHAUDIO_VERSION=2.8.0
+ARG MANAGER_REF=4.2.2
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -56,7 +77,9 @@ WORKDIR ${APP_ROOT}
 
 RUN python3 -m pip install --upgrade pip setuptools wheel \
     && python3 -m pip install --index-url ${TORCH_INDEX} \
-        torch torchvision torchaudio
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION}
 
 RUN git clone --depth 1 --branch ${COMFYUI_REF} \
         https://github.com/comfyanonymous/ComfyUI.git . \
@@ -83,8 +106,14 @@ RUN git clone --depth 1 --branch ${COMFYUI_REF} \
 
 ARG ENABLE_MANAGER=false
 
+# Pinned to MANAGER_REF (declared above, alongside COMFYUI_REF) — an
+# unpinned clone here means "install nodes and download models" behavior
+# can change on a rebuild with nobody touching this file. ltdrdata/ moved to
+# Comfy-Org/ upstream; the old URL still redirects, but point at the current
+# one so a redirect going away later doesn't silently break builds.
 RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
-        git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
+        git clone --depth 1 --branch ${MANAGER_REF} \
+            https://github.com/Comfy-Org/ComfyUI-Manager.git \
             custom_nodes/ComfyUI-Manager && \
         python3 -m pip install -r custom_nodes/ComfyUI-Manager/requirements.txt; \
     fi

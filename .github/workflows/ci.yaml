@@ -74,6 +74,17 @@ jobs:
       - name: build the gateway image
         run: docker build -t gateway-uid-test -f enterprise/gateway/Containerfile enterprise/gateway
 
+      # Cheap here because the image is already built above. The GPU images
+      # are scanned nightly instead (nightly.yaml) — they are too large to
+      # pull and scan on every PR.
+      - name: scan the gateway image for known CVEs
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: gateway-uid-test
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
       - name: serve as an arbitrary UID
         run: |
           docker run -d --name gw --user 1000670000:0 -p 8000:8000 gateway-uid-test

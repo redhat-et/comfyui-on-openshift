@@ -1,0 +1,70 @@
+# What ci.yaml deliberately does not cover, because it is too large/slow for
+# every PR: the actual GPU image. ci.yaml's image-uid job proves arbitrary-UID
+# compatibility on the small gateway image only; ci-smoke-comfyui.sh proves
+# the --models-directory contract by building ComfyUI from source, not from
+# app/Containerfile. Neither ever builds and boots the image that actually
+# ships. This workflow does, once a day, so a Containerfile regression is
+# caught within 24 hours instead of on someone's `make deploy`.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  # Same proof as ci.yaml's image-uid job, on the image that job's own comment
+  # says is "too large for per-PR builds" — the GPU image. --cpu forces boot
+  # without a GPU (GitHub-hosted runners have none), which is enough to prove
+  # the chgrp/chmod section actually works: if it does not, ComfyUI fails to
+  # write its own cache under the arbitrary UID before it ever gets to /.
+  gpu-image-uid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the GPU worker image
+        run: docker build -t gpu-uid-test -f app/Containerfile app/
+
+      - name: serve as an arbitrary UID, CPU-forced
+        run: |
+          docker run -d --name gpu --user 1000670000:0 -p 8188:8188 \
+            -v /tmp/models:/models -v /tmp/output:/output \
+            gpu-uid-test --cpu \
+              --listen 0.0.0.0 --port 8188 \
+              --models-directory /models --output-directory /output \
+              --temp-directory /tmp
+
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8188/system_stats; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          echo
+
+          if [ -z "$ok" ]; then
+            docker logs gpu
+            echo "GPU worker image did not serve /system_stats as an arbitrary UID with GID 0"
+            exit 1
+          fi
+
+  # Same image, scanned. Separated from the job above so a slow scan does not
+  # block the UID proof, and so either can be re-run independently.
+  gpu-image-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build the GPU worker image
+        run: docker build -t gpu-scan-test -f app/Containerfile app/
+
+      - name: scan for known CVEs
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: gpu-scan-test
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true

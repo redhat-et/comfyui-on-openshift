@@ -16,9 +16,22 @@
 # size is pull time is cold-start time — the number this whole design fights.
 FROM nvcr.io/nvidia/cuda:12.6.2-base-ubi9
 
+# TORCH_VERSION/TORCHVISION_VERSION/TORCHAUDIO_VERSION are one set —
+# torchvision and torchaudio each build against a single torch release, so
+# bumping one alone breaks at import, not at build. 2.8.0 is the line below
+# which COMFYUI_REF quietly degrades: v0.32.0 enables DynamicVRAM by default on
+# NVIDIA, start.sh passes nothing that opts out, and main.py gates it at
+# torch >= 2.8 — under that ComfyUI logs "Unsupported Pytorch detected" and
+# falls back to the legacy ModelPatcher. cu128 is the lowest index carrying
+# 2.8; cu124 stops at 2.6.0 and never got a 2.7+ wheel. Full argument in
+# app/Containerfile — bump all four together, in both files.
 ARG COMFYUI_REF=v0.32.0
 ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_VERSION=2.8.0
+ARG TORCHVISION_VERSION=0.23.0
+ARG TORCHAUDIO_VERSION=2.8.0
+ARG MANAGER_REF=4.2.2
 
 # ComfyUI-Manager lets any user with UI access install arbitrary Python from
 # the internet, which then runs in this pod — on a node with an instance role,
@@ -46,13 +59,20 @@ WORKDIR ${COMFY_ROOT}
 # torch first and alone: it is ~2.5 GB, and keeping it in its own layer means a
 # change to any other requirement does not re-pull it.
 RUN python3 -m pip install --upgrade pip setuptools wheel \
-    && python3 -m pip install --index-url ${TORCH_INDEX} torch torchvision torchaudio
+    && python3 -m pip install --index-url ${TORCH_INDEX} \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION}
 
 RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} . \
     && python3 -m pip install -r requirements.txt
 
+# Pinned to MANAGER_REF, and pointed at Comfy-Org/ (ltdrdata/ moved there
+# upstream; the old URL still redirects today, but don't depend on that
+# lasting). Same rationale as app/Containerfile.
 RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
-        git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
+        git clone --depth 1 --branch ${MANAGER_REF} \
+            https://github.com/Comfy-Org/ComfyUI-Manager.git \
             custom_nodes/ComfyUI-Manager && \
         python3 -m pip install -r custom_nodes/ComfyUI-Manager/requirements.txt; \
     fi
