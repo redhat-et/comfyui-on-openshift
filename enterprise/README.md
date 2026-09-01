@@ -106,8 +106,11 @@ authenticated username into the job state, so `GET /api/jobs/<id>` answers
 
 ## Custom nodes
 
-Put them in `app/src/custom_nodes/`. `setup.sh` copies that into the worker
-build context, so one copy serves both configurations.
+Put them in `app/src/custom_nodes/`, and their pip dependencies in
+`app/requirements-extra.txt`. `setup.sh` copies both into the worker build
+context, so one copy serves both configurations — a node pack that needs a pip
+package now behaves the same in the pool as it does single-user, instead of
+importing cleanly on one and failing on the other.
 
 Do not rely on installing them at runtime through ComfyUI-Manager: the worker
 pool scales to zero, so anything written to the container filesystem disappears

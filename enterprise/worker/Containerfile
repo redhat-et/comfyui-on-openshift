@@ -94,6 +94,24 @@ RUN chmod +x ${COMFY_ROOT}/start.sh
 # they are picked up here.
 COPY custom_nodes/ ${COMFY_ROOT}/custom_nodes/
 
+# And their pip dependencies, which app/Containerfile has always installed and
+# this image did not. Same staging directory, same setup.sh copy step: the
+# canonical file is app/requirements-extra.txt, and enterprise/setup.sh drops a
+# copy in beside the nodes it belongs to (it is gitignored there, like the nodes
+# themselves, so the two cannot drift).
+#
+# Without this, a node pack that imports one pip package works perfectly in the
+# single-user configuration and fails at IMPORT in the pool — which ComfyUI
+# reports by logging the traceback and carrying on without the node, so the
+# first sign is a workflow rejected for an unknown node type, on a GPU node that
+# has already been provisioned and paid for.
+#
+# -s, not -f: an empty file is the normal case, and `pip install -r` on one is a
+# wasted layer.
+RUN if [ -s ${COMFY_ROOT}/custom_nodes/requirements-extra.txt ]; then \
+        python3 -m pip install -r ${COMFY_ROOT}/custom_nodes/requirements-extra.txt; \
+    fi
+
 # ---------------------------------------------------------------------------
 # OpenShift arbitrary-UID compatibility
 #

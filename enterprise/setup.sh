@@ -310,9 +310,21 @@ EOF
 
 # Keep one copy of custom nodes. The single-user path reads app/src/custom_nodes;
 # copy it into the worker build context so both images carry the same nodes.
+mkdir -p "${ENTERPRISE_DIR}/worker/custom_nodes"
+
 if [[ -d "${REPO_ROOT}/app/src/custom_nodes" ]]; then
-    mkdir -p "${ENTERPRISE_DIR}/worker/custom_nodes"
     cp -r "${REPO_ROOT}/app/src/custom_nodes/." "${ENTERPRISE_DIR}/worker/custom_nodes/" 2>/dev/null || true
+fi
+
+# And one copy of their pip dependencies, for the same reason and by the same
+# route. app/Containerfile has always installed app/requirements-extra.txt; the
+# worker image never did, so a node pack that needs one pip package worked
+# single-user and failed at import in the pool — reported by ComfyUI as a
+# logged traceback and a missing node type, on a GPU node already provisioned
+# and paid for.
+if [[ -f "${REPO_ROOT}/app/requirements-extra.txt" ]]; then
+    cp "${REPO_ROOT}/app/requirements-extra.txt" \
+        "${ENTERPRISE_DIR}/worker/custom_nodes/requirements-extra.txt"
 fi
 
 GATEWAY_IMAGE="$(build_image comfy-gateway "${ENTERPRISE_DIR}/gateway")"
