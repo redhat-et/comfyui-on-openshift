@@ -1,10 +1,12 @@
 # What ci.yaml deliberately does not cover, because it is too large/slow for
-# every PR: the actual GPU image. ci.yaml's image-uid job proves arbitrary-UID
-# compatibility on the small gateway image only; ci-smoke-comfyui.sh proves
-# the --models-directory contract by building ComfyUI from source, not from
-# app/Containerfile. Neither ever builds and boots the image that actually
-# ships. This workflow does, once a day, so a Containerfile regression is
-# caught within 24 hours instead of on someone's `make deploy`.
+# every PR: the two actual GPU images. ci.yaml's image-uid job proves
+# arbitrary-UID compatibility on the small gateway image only;
+# ci-smoke-comfyui.sh proves the --models-directory contract by building
+# ComfyUI from source, not from either Containerfile. Neither ever builds and
+# boots the images that actually ship. This workflow does, once a day, so a
+# Containerfile regression is caught within 24 hours instead of on someone's
+# `make deploy` — one job per image, each building once, proving the
+# arbitrary-UID boot, then scanning.
 name: nightly
 
 on:
@@ -20,25 +22,52 @@ permissions:
   contents: read
 
 jobs:
-  # Same proof as ci.yaml's image-uid job, on the image that job's own comment
-  # says is "too large for per-PR builds" — the GPU image. --cpu forces boot
-  # without a GPU (GitHub-hosted runners have none), which is enough to prove
-  # the chgrp/chmod section actually works: if it does not, ComfyUI fails to
-  # write its own cache under the arbitrary UID before it ever gets to /.
-  gpu-image-uid:
+  # The single-user GPU image (app/Containerfile) — same proof as ci.yaml's
+  # image-uid job, on the image that job's own comment says is too large for
+  # per-PR builds. --cpu forces boot without a GPU (GitHub-hosted runners have
+  # none), which is enough to prove the chgrp/chmod section actually works:
+  # if it does not, ComfyUI fails to write its own cache under the arbitrary
+  # UID before it ever gets to /.
+  gpu-single-user-image:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: build the GPU worker image
-        run: docker build -t gpu-uid-test -f app/Containerfile app/
+      - name: reclaim disk space
+        run: |
+          # The cu128 torch wheel alone is 848 MB compressed, and with its
+          # nvidia-*-cu12 deps this image lands somewhere around 10-12 GB
+          # assembled. A stock ubuntu-latest runner only *guarantees* 14 GB
+          # free (commonly more, but "commonly" is not a bound to build
+          # against) — remove toolchains this repo never uses before the
+          # build, and print df -h on both sides so a future "runner ran out
+          # of disk" failure shows exactly what was available.
+          echo "--- disk before reclaim ---"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null || true
+          echo "--- disk after reclaim ---"
+          df -h /
+
+      - name: build the single-user GPU image
+        run: docker build -t gpu-single-user-uid-test -f app/Containerfile app/
 
       - name: serve as an arbitrary UID, CPU-forced
         run: |
+          # No -v /tmp/models:/models -v /tmp/output:/output (this job used
+          # to bind-mount both): a docker bind mount creates the host
+          # directory as root:root 0755, which masks exactly the two paths
+          # the Containerfile's `chgrp -R 0` / `chmod -R g=u` block prepares —
+          # the thing this step exists to prove. Letting the container write
+          # to its own baked-in /models and /output instead means the proof
+          # covers both halves of that block, not just the APP_ROOT half
+          # (ComfyUI's user/default/, which was the only part actually
+          # exercised while the mounts were in place).
           docker run -d --name gpu --user 1000670000:0 -p 8188:8188 \
-            -v /tmp/models:/models -v /tmp/output:/output \
-            gpu-uid-test --cpu \
+            gpu-single-user-uid-test --cpu \
               --listen 0.0.0.0 --port 8188 \
               --models-directory /models --output-directory /output \
               --temp-directory /tmp
@@ -55,22 +84,17 @@ jobs:
 
           if [ -z "$ok" ]; then
             docker logs gpu
-            echo "GPU worker image did not serve /system_stats as an arbitrary UID with GID 0"
+            echo "single-user GPU image did not serve /system_stats as an arbitrary UID with GID 0"
             exit 1
           fi
 
-  # Same image, scanned. Separated from the job above so a slow scan does not
-  # block the UID proof, and so either can be re-run independently.
-  gpu-image-scan:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: build the GPU worker image
-        run: docker build -t gpu-scan-test -f app/Containerfile app/
-
+      # if: always() so the scan still runs (and this job still reports a
+      # CVE finding) even if the boot proof above failed — one build serves
+      # both signals instead of the previous two-job, two-build split, whose
+      # stated reason ("so a slow scan does not block the UID proof") cost a
+      # full second ~10 GB build to buy.
       - name: scan for known CVEs
+        if: always()
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
         env:
           # Anonymous ghcr.io pulls of the trivy vulnerability DB are
@@ -78,7 +102,96 @@ jobs:
           # AWS-hosted mirror first.
           TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
         with:
-          image-ref: gpu-scan-test
+          image-ref: gpu-single-user-uid-test
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          cache: true
+
+  # The actual worker image the autoscaled pool runs (enterprise/worker/
+  # Containerfile) — distinct from app/Containerfile above: different
+  # entrypoint (start.sh, not a bare CMD), an extra ${COMFY_ROOT}/user in its
+  # chgrp set, and it starts a second process (the Redis agent) that
+  # app/Containerfile's image does not have at all. Before this job, this
+  # image had zero CI coverage.
+  #
+  # start.sh's normal job is to launch ComfyUI *and* worker_agent.py, and
+  # exit the container if either one dies — worker_agent.py needs Redis,
+  # which this runner does not have, so booting normally here would crash-
+  # loop on the agent half within seconds. This job depends on two things in
+  # enterprise/worker/start.sh that are not yet true as of this commit
+  # (tracked as platform-owner follow-up, not owned by this change):
+  #   1. the ComfyUI launch forwards "$@" (so `--cpu` below reaches
+  #      `python3 main.py`, the same fix that makes app/Containerfile's CMD
+  #      accept it);
+  #   2. an AGENT_DISABLED=1 environment variable causes start.sh to skip
+  #      launching worker_agent.py entirely and wait on ComfyUI's PID alone,
+  #      instead of `wait -n "$comfy_pid" "$agent_pid"` with an agent that
+  #      was never started.
+  # Without both, this job fails at the boot-proof step below with a clear
+  # curl-timeout, not a silent false pass — see CONTRIBUTING.md for how to
+  # reproduce locally.
+  gpu-worker-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: reclaim disk space
+        run: |
+          echo "--- disk before reclaim ---"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" 2>/dev/null || true
+          sudo docker image prune -af >/dev/null || true
+          echo "--- disk after reclaim ---"
+          df -h /
+
+      - name: build the worker image
+        run: |
+          docker build -t gpu-worker-uid-test \
+            --build-arg ENABLE_MANAGER=false \
+            -f enterprise/worker/Containerfile enterprise/worker
+
+      - name: serve as an arbitrary UID, CPU-forced, agent disabled
+        run: |
+          # COMFY_HOST=0.0.0.0: start.sh binds ComfyUI to 127.0.0.1 by design
+          # (docs/06 — the pod has no Service/Route, the agent in the same
+          # container is the only intended path in), which is exactly the
+          # isolation that makes it unreachable from outside the container
+          # for this proof too. Overriding it here is the documented escape
+          # hatch (start.sh already reads COMFY_HOST from the environment);
+          # AGENT_DISABLED and the trailing --cpu are the two start.sh
+          # behaviors this job depends on — see the job-level comment above.
+          docker run -d --name worker --user 1000670000:0 -p 8188:8188 \
+            -e COMFY_HOST=0.0.0.0 \
+            -e AGENT_DISABLED=1 \
+            gpu-worker-uid-test --cpu
+
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8188/system_stats; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          echo
+
+          if [ -z "$ok" ]; then
+            docker logs worker
+            echo "worker image did not serve /system_stats as an arbitrary UID with GID 0"
+            exit 1
+          fi
+
+      - name: scan for known CVEs
+        if: always()
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        env:
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
+        with:
+          image-ref: gpu-worker-uid-test
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true

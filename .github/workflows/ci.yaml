@@ -82,8 +82,9 @@ jobs:
   # will: as an arbitrary high UID with GID 0 supplementary, ignoring the
   # image's USER. This is the single most common way an image that works
   # under `docker run` breaks on OpenShift — tested here without a cluster.
-  # (The GPU images are too large for per-PR builds; their UID hygiene is the
-  # chgrp/chmod section reviewers guard in the Containerfiles.)
+  # (The two GPU images are too large to build on every PR; nightly.yaml
+  # builds and UID-tests both of them once a day instead — gpu-single-user-
+  # image and gpu-worker-image.)
   image-uid:
     runs-on: ubuntu-latest
     timeout-minutes: 60
