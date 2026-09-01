@@ -121,10 +121,36 @@ RUN if [ -s ${COMFY_ROOT}/custom_nodes/requirements-extra.txt ]; then \
 # crash-loops on a permission error that reads like a storage problem.
 # ---------------------------------------------------------------------------
 
-RUN mkdir -p /models /output ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
-    && chgrp -R 0 ${COMFY_ROOT} /models /output \
-    && chmod -R g=u ${COMFY_ROOT} /models /output \
-    && find ${COMFY_ROOT} /models /output -type d -exec chmod g+s {} \;
+RUN mkdir -p /models /output \
+        ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user
+
+# Group root EVERYWHERE, group-writable only where the process actually writes.
+#
+# The chmod used to be recursive over ${COMFY_ROOT} entire, and in THIS image
+# that is the sharper edge of the two: the thing running here is arbitrary
+# custom-node Python on a GPU node inside your VPC. GID 0 is a supplementary
+# group of whatever UID OpenShift picks, so g+w over the whole tree let a node
+# rewrite main.py, comfy/, worker_agent.py — the agent holding the Redis
+# credentials — or another node beside it, and the rewrite survived every
+# restart of that container. Nothing needs it: ComfyUI reads its own source and
+# writes only the paths named below.
+#
+# ${COMFY_ROOT} ITSELF stays group-writable, one level, and that is not an
+# oversight — ComfyUI creates directories directly under its base directory at
+# boot, and a read-only parent turns that into a permission error at start.
+# custom_nodes is in the writable set for the same reason it is in
+# app/Containerfile's, so ENABLE_MANAGER=true still boots; that flag is a
+# documented hazard here for reasons this permission narrowing does not change.
+#
+# The setgid bit on directories is the other half: files created later inherit
+# GID 0 rather than the creating process's group.
+RUN chgrp -R 0 ${COMFY_ROOT} /models /output \
+    && chmod g=u,g+s ${COMFY_ROOT} \
+    && chmod -R g=u ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
+                    ${COMFY_ROOT}/custom_nodes /models /output \
+    && find ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
+            ${COMFY_ROOT}/custom_nodes /models /output \
+            -type d -exec chmod g+s {} \;
 
 USER 1001
 

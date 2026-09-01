@@ -143,14 +143,38 @@ RUN if [ -s ${APP_ROOT}/requirements-extra.txt ]; then \
 # ---------------------------------------------------------------------------
 
 # Model and output dirs are mount points for PVCs. They must exist and be
-# group-writable so the arbitrary UID can write through the mount.
-RUN mkdir -p /models /output ${APP_ROOT}/temp ${APP_ROOT}/input
+# group-writable so the arbitrary UID can write through the mount. user/ is
+# ComfyUI's own — settings, logs and saved workflows land there on first boot —
+# and creating it here rather than letting ComfyUI create it is what lets the
+# permissions below name it explicitly.
+RUN mkdir -p /models /output \
+        ${APP_ROOT}/temp ${APP_ROOT}/input ${APP_ROOT}/user
 
-# Group root, group-writable, and the setgid bit on directories so anything
-# created later inherits the group.
+# Group root EVERYWHERE, group-writable only where the process actually writes.
+#
+# The chmod used to be recursive over ${APP_ROOT} entire, which handed the
+# running container write access to main.py, comfy/ and every node beside them.
+# GID 0 is a supplementary group of whatever UID OpenShift picks, so g+w on the
+# whole tree means anything that can run Python in this container can rewrite
+# the application it is running inside, and the rewrite survives every restart
+# of that container. Nothing needs it: ComfyUI reads its own source and writes
+# only the paths named below.
+#
+# ${APP_ROOT} ITSELF stays group-writable, one level, and that is not an
+# oversight — ComfyUI creates directories directly under its base directory at
+# boot, and a read-only parent turns that into a permission error at start.
+# custom_nodes is in the writable set because ComfyUI-Manager writes its config
+# and cache there, which the Manager section above promises it can.
+#
+# The setgid bit on directories is the other half: files created later inherit
+# GID 0 rather than the creating process's group.
 RUN chgrp -R 0 ${APP_ROOT} /models /output \
-    && chmod -R g=u ${APP_ROOT} /models /output \
-    && find ${APP_ROOT} /models /output -type d -exec chmod g+s {} \;
+    && chmod g=u,g+s ${APP_ROOT} \
+    && chmod -R g=u ${APP_ROOT}/temp ${APP_ROOT}/input ${APP_ROOT}/user \
+                    ${APP_ROOT}/custom_nodes /models /output \
+    && find ${APP_ROOT}/temp ${APP_ROOT}/input ${APP_ROOT}/user \
+            ${APP_ROOT}/custom_nodes /models /output \
+            -type d -exec chmod g+s {} \;
 
 # Declared for local `podman run` clarity. OpenShift overrides it, which is
 # fine — the permissions above are what make that safe.
