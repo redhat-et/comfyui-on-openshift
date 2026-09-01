@@ -645,9 +645,26 @@ at all.
    still needs a cluster is the directory mode: an arbitrary, unstable UID
    means a workspace one pod creates must be group-writable and setgid for the
    next one.)*
-7. **Showback from the data you already collect.** Job attribution plus GPU
-   seconds is a monthly "who spent the card" report. In most organisations this
-   changes behaviour faster than any technical control. *(Small.)*
+7. ~~**Showback from the data you already collect.**~~ **Shipped** —
+   `GET /api/showback` reports one UTC month's GPU seconds per submitter, from
+   the attribution the queue envelope was already carrying
+   (`docs/10-roadmap.md`, Q4). Three things are worth knowing about the number
+   before you put it in front of anyone. A **GPU second is one second a worker
+   held the card** — wall clock between `running` and the job's terminal
+   state, which includes the checkpoint load and any time the agent spent
+   parked, and bills a job that failed after twenty minutes for twenty
+   minutes. That over-count is deliberate: the pool runs one job per pod on a
+   dedicated card, so nobody else could have used it, and an honest over-count
+   that says what it includes beats a precise number nobody can reproduce.
+   Time from jobs whose **worker died holding the card** is recorded but not
+   billed to the submitter — it lands in `excluded_gpu_seconds`, because the
+   gateway knows only when it *noticed* the death, not when it happened, and
+   that number is inflated by the detection lag; kept visible, it doubles as a
+   signal that workers are dying mid-generation. And the accumulator is one
+   Redis Hash per month with an expiry and a capped identity count, because
+   the name every total is keyed by is a client-supplied header. *(It lives in
+   Redis, whose PVC is gp3 — so it does **not** survive `make down`. Capture it
+   before a teardown; `docs/09-engineering-handoff.md` §5 has the two lines.)*
 8. ~~**Fair queueing.**~~ **Shipped** — one physical Redis list still, with each
    job spliced in at a fairness-computed position rather than always at the
    back, so `LLEN` still means "total jobs waiting", the KEDA trigger needed no

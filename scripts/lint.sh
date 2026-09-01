@@ -634,6 +634,161 @@ fi
 
 # ---------------------------------------------------------------------------
 
+log "the showback accumulator is mirrored, not diverged (docs/10-roadmap.md, Q4)"
+
+# The same argument as the queue envelope above, for a second contract the two
+# files must agree on. GPU time is written from TWO terminal paths in two
+# different images: worker_agent.py's finish(), and hub.py's reaper, which
+# never calls finish() at all. They must agree on the Redis key, the period,
+# the field names, the identity cap and the expiry, and there is nowhere to
+# import a shared definition from.
+#
+# Divergence here is silent in the specific way that matters for a REPORT: a
+# gateway and a worker computing different period strings, or different field
+# prefixes, both still run, every check still passes, and the monthly total is
+# quietly split across two keys or two fields. Nobody finds that until the
+# month is over and the numbers do not add up.
+
+if python3 - <<'EOF'
+import difflib, sys
+
+MARKERS = ("# BEGIN SHARED SHOWBACK", "# END SHARED SHOWBACK")
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+
+def block(path, begin, end):
+    lines = open(path).read().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(begin)]
+    ends = [i for i, line in enumerate(lines) if line.startswith(end)]
+
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        print(f"  {path}: expected exactly one {begin} ... {end} block, found "
+              f"{len(starts)} begin and {len(ends)} end marker(s) — the GPU-second "
+              "accumulator must be present in both files, delimited, and identical")
+        return None
+
+    return lines[starts[0]:ends[0] + 1]
+
+blocks = [block(path, *MARKERS) for path in FILES]
+
+if any(b is None for b in blocks):
+    sys.exit(1)
+
+if blocks[0] != blocks[1]:
+    print(f"  the shared showback block differs between {FILES[0]} and "
+          f"{FILES[1]} — change both or neither:")
+    for line in difflib.unified_diff(blocks[0], blocks[1], FILES[0], FILES[1],
+                                     lineterm="", n=1):
+        print(f"    {line}")
+    sys.exit(1)
+
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the showback accumulator is period-bucketed, expiring and capped (docs/10-roadmap.md, Q4)"
+
+# Three properties of SHOWBACK_ACCRUE_LUA that the e2e suite structurally
+# cannot see, against a Redis that is `maxmemory-policy noeviction` at
+# `--maxmemory 512mb` (00-redis.yaml), keyed off a header that is entirely
+# client-supplied whenever AUTH_MODE=none.
+#
+#   1. ONE KEY PER PERIOD. check-90-showback.py does assert the key count
+#      stays below the number of identities that fed it — but it drives nine
+#      identities through a suite that runs for a minute, so it cannot tell
+#      "one Hash per month" from "one key per identity, and this run was
+#      short". A key built from the SUBMITTER is the failure: an
+#      unauthenticated caller varying one header fills Redis, which presents
+#      as queued work vanishing at random.
+#
+#   2. THE KEY EXPIRES. Nothing in a one-minute suite can observe a TTL that
+#      is measured in months, so a bucket written with no expiry at all looks
+#      identical to a correct one for the whole life of the test. Under
+#      `noeviction` a key nothing deletes is a key forever.
+#
+#   3. THE FIELD COUNT IS CAPPED. Same blindness: the cap is a thousand
+#      identities and the suite drives ten. Without HLEN guarding a new
+#      field, the Hash itself is the unbounded thing and point 1 has only
+#      moved the problem down one level.
+
+if python3 - <<'EOF'
+import re, sys
+
+PATH = "enterprise/gateway/hub.py"
+source = open(PATH).read()
+
+problems = []
+
+match = re.search(r'SHOWBACK_ACCRUE_LUA = """(.*?)"""', source, re.S)
+
+if match is None:
+    print(f"  {PATH}: no SHOWBACK_ACCRUE_LUA script to check")
+    sys.exit(1)
+
+script = "\n".join(line for line in match.group(1).splitlines()
+                   if not line.lstrip().startswith("--"))
+
+for needed, why in (
+    ("HINCRBYFLOAT", "the accumulator must add into a FIELD of the period's "
+                     "Hash. A per-submitter key is unbounded growth from a "
+                     "client-supplied header"),
+    ("EXPIRE", "every accrual must re-arm the bucket's expiry. HINCRBYFLOAT "
+               "recreates a key that expired mid-flight, and a recreated key "
+               "has no TTL at all — so arming it once, at creation, is not "
+               "the same as arming it"),
+    ("HLEN", "a new submitter may only be given its own field while the "
+             "bucket is under the identity cap. Without this the Hash grows "
+             "one field per distinct header value, forever"),
+):
+    if needed not in script:
+        problems.append(f"the accrual script no longer calls {needed}: {why}")
+
+# Every Redis key this script touches must be one it was HANDED — the job's
+# state hash or the period bucket — never one it builds. A key computed
+# inside the script from a submitter is exactly the shape all three points
+# above exist to prevent.
+for command, key in re.findall(r"redis\.call\('([A-Z]+)',\s*([^,)]+)", script):
+    if key.strip() not in ("state", "bucket"):
+        problems.append(f"the accrual script calls {command} on `{key}`, which "
+                        "is not one of the two keys it is handed (KEYS[1], the "
+                        "job's state hash, and KEYS[2], the period bucket). "
+                        "This script must never address a key of its own "
+                        "making")
+
+# And the bucket key itself is named from the PERIOD and from nothing else.
+key_fn = re.search(r"def showback_key\(period: str\) -> str:(.*?)\n\n", source, re.S)
+
+if key_fn is None:
+    problems.append("showback_key(period) is gone — the accumulator's key must "
+                    "be built in one place, from the period")
+else:
+    # The fixed namespace prefix, plus the period, and nothing else.
+    fields = set(re.findall(r"\{([^}]*)\}", key_fn.group(1))) - {"SHOWBACK_KEY_PREFIX"}
+
+    if fields != {"period"}:
+        problems.append(f"showback_key() interpolates {sorted(fields)} beside "
+                        "the namespace prefix, rather than the period alone. "
+                        "One Hash per period is the bound: a key carrying the "
+                        "submitter is one Redis key per identity")
+
+for problem in problems:
+    print(f"  {PATH}: {problem}")
+
+sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then

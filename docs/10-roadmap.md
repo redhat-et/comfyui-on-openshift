@@ -39,10 +39,10 @@ machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
 nothing until there is a cluster at ~$2.04/hour. Only five items are
 cluster-only for a failing assertion; ten have a laptop half.
 
-**Seventeen invariants are load-bearing** — `docs/09-engineering-handoff.md`
-§3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth
-and Q3 the seventeenth, which is what "changes an invariant" looks like in
-practice.)
+**Eighteen invariants are load-bearing** — `docs/09-engineering-handoff.md`
+§3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth,
+Q3 the seventeenth and Q4 the eighteenth, which is what "changes an invariant"
+looks like in practice.)
 Thirteen of the items touch at least one, so "the risky ones get a second
 reviewer" is not a useful filter. The filter that *is* useful: an item is
 high-risk if it **changes** an invariant rather than merely working near one.
@@ -181,7 +181,7 @@ What landed:
 check is a file and not also an edit in two hardcoded places, and settle the
 naming convention before six items each create their own `check4.py`. Then
 extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
-assertions. Eleven of the seventeen §3 invariants are properties of files rather
+assertions. Eleven of the eighteen §3 invariants are properties of files rather
 than of a running system — a missing toleration, a Service that regained a
 port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
 — and the e2e suite structurally cannot see any of them. This is also what
@@ -199,7 +199,7 @@ was wrong.
 | Q2 | Phase breadcrumbs + retry only pre-execution deaths — **landed** | Medium | **High** | Queue | `enterprise/test/check-30-sigkill.py` and `check-35-retry-doors.py`: a worker killed before ComfyUI ever saw the workflow is requeued exactly once; a worker killed mid-execution gets one terminal `failed` naming the dead worker and is never requeued; the `phase` breadcrumb is durable *before* the `/prompt` POST returns, not after; and a job the user already cancelled is neither requeued by the reaper nor ever submitted by a worker that pops it |
 | Q3 | Per-user output workspaces — **landed**, laptop half | Medium | **High** | Queue + cluster | `enterprise/test/check-60-user-workspaces.py`: two submitters land in two places, a hostile username is confined rather than mangled or escaped, and an anonymous submission still works and does not alias onto a real user — plus lint shapes for the directory mode. The arbitrary-UID half is on the cluster-day list below |
 | Q6 | Estimated-wait metric — **landed** | Small | Low | Queue | `enterprise/test/check-80-estimated-wait.py`: `comfy_estimated_wait_seconds` is exposed on `/metrics` in proper gauge form, reads zero or absent only with an empty queue, and reflects a manufactured entry's real `submitted_at` (grows with wall-clock time, not with a constant or queue depth) — the scaler half is I4 |
-| Q4 | Showback report | Small | Low | Queue | e2e: GPU seconds attributed to the right user, with a bounded key set |
+| Q4 | Showback report — **landed** | Small | Low | Queue | `enterprise/test/check-90-showback.py`: `/api/showback` reports GPU seconds against the submitting user and tracks real wall-clock duration rather than a constant, two users' totals do not bleed into each other, an anonymous submission lands in its own explicit bucket, a *failed* job is still billed, a job whose worker was SIGKILLed is accounted rather than lost, and the `comfy:showback:*` key count stays below the number of identities that fed it — plus lint shapes for the expiry and the identity cap, which a one-minute suite cannot see |
 | Q5 | GPU-second quota breaker | Medium | Medium | Queue | e2e including quota exhausted and quota data missing (must fail open) |
 | I1 | Schedule the warm window | Small | Low | Infra | New unit test on a pure helper; behaviour on cluster day |
 | I2 | Split the worker image | Medium | Low | Infra | A new CI job — the existing one builds only the gateway image |
@@ -327,6 +327,116 @@ for "no data".
 
 None of the above is implemented. This section exists so I4 starts from a
 contract instead of re-deriving one from `hub.py`.
+
+### Q4 landed — the definition, the reaper decision, and the teardown
+
+Q4 is done: `GET /api/showback` reports one UTC calendar month's GPU seconds
+per submitter, read out of a single Redis Hash that both terminal paths write
+into. The four things that were open when the item was written are settled
+below, because a showback report is a document people argue with and every one
+of them is a question somebody will ask.
+
+**A GPU second is one second a worker held the card, and it over-counts the
+sampler on purpose.** The interval measured is wall-clock time between the
+instant a worker writes `running` on the job's state hash (`run_job()` in
+`worker_agent.py`) and the instant that job reaches a terminal state. Inside
+that number, deliberately: the checkpoint load — ~7 GB off EFS for an
+SDXL-class model, and the first job on a cold node pays for an empty page
+cache — the workspace `mkdir`, the ComfyUI WebSocket connect and the `/prompt`
+round trip, and any stretch the agent spent parked on a ComfyUI that had gone
+quiet. A job that *failed* after twenty minutes is billed twenty minutes.
+Queue time is not in it: nothing was held before a worker picked the job up.
+
+The alternative — "time actually spent inside ComfyUI's execution" — was
+rejected for two reasons rather than one. It is not measurable from here
+without trusting ComfyUI's own timings, and more importantly it would
+under-count the expensive part: this pool runs one job per pod on a dedicated
+card, so nobody else could have used the GPU while a checkpoint was loading,
+and a definition under which that time belongs to no one is a definition that
+does not add up to the bill. **An honest over-count that says what it includes
+beats a precise number nobody can reproduce**, and the definition is written
+into the code — `BEGIN SHARED SHOWBACK`, mirrored in both files — rather than
+only into this document, because the person who needs it is reading the
+accrual.
+
+**The reaper path was the real question, and it goes to `excluded`.** A worker
+that is SIGKILLed mid-generation (host-RAM OOM, node reclaim, spot) is
+terminated by `hub.py`'s `fail_orphaned_job()`, which never calls
+`worker_agent.py`'s `finish()` at all — so an implementation that instruments
+only `finish()` silently drops exactly the most expensive jobs in the system,
+the ones where a card was held and nothing came back. That time is therefore
+recorded. It is **not** billed to the submitter:
+
+- The gateway cannot know *when* the worker died, only when it noticed. The
+  interval it can compute is inflated by up to `HEARTBEAT_TTL +
+  REAPER_INTERVAL` — about 3.5 minutes on the defaults — and a figure that is
+  mostly detection lag is exactly the figure an operator cannot defend in the
+  meeting this report exists for.
+- The user got nothing for it. Charging them for the cluster's failure is a
+  policy choice dressed up as a measurement.
+- Kept visible rather than dropped, `excluded_gpu_seconds` doubles as a
+  cluster-health signal: it climbing is workers dying while holding cards.
+
+So every second in `users` is bracketed by two timestamps one worker wrote,
+which is what makes the column reproducible — and it is the column **Q5**
+should compute a quota from. `excluded_gpu_seconds` is real spend and belongs
+in a cost conversation; it does not belong in anyone's quota.
+
+A job the reaper *requeues* is not accrued at all: the only deaths it requeues
+are those before ComfyUI was handed the workflow (`RETRYABLE_PHASES`), which
+spent no GPU time by construction, and the attempt that eventually runs starts
+its own clock. An anonymous submission — no `X-Forwarded-User` at all, the
+ordinary `AUTH_MODE=none` shape — goes to `anonymous_gpu_seconds`, its own
+named line rather than a blank key an operator has to know to look for. Those
+buckets exist so that there is no fourth, silent possibility.
+
+**The key space is bounded three times over, and each bound is load-bearing.**
+Redis here is `maxmemory-policy noeviction` at `--maxmemory 512mb`, so a key
+nothing deletes is a key forever; and the identity every total is named from
+is an `X-Forwarded-User` header that is entirely client-supplied whenever
+`AUTH_MODE=none`. An accumulator taking one Redis key per submitter would let
+an unauthenticated caller fill Redis by varying one header — the same "work
+vanishing at random" the `noeviction` invariant exists to prevent, arriving by
+a door the policy does not cover. So: **one Hash per period**, one field per
+identity, `HINCRBYFLOAT` per job; **the Hash expires**, re-armed with `EXPIRE
+... NX` on *every* accrual because `HINCRBYFLOAT` recreates a key that expired
+mid-flight and a recreated key has no TTL at all; and **the field count is
+capped**, with accruals past `SHOWBACK_MAX_USERS` going to one shared `other`
+field that the report flags as `truncated: true`. Worst case is under a
+megabyte across every period live at once, and it does not grow with
+throughput. `check-90` asserts the key count from outside; `scripts/lint.sh`
+pins the expiry and the cap, because a one-minute test run cannot tell a TTL
+measured in months, or a cap of a thousand, from their absence.
+
+**It is deliberately not a Prometheus metric.** A per-user series is one label
+value per submitter, from a client-supplied header, and unbounded label
+cardinality is how a monitoring stack is taken down from outside. The Redis
+cap bounds this report; nothing bounds a metric's label set once it has been
+scraped. `/metrics` keeps its three pool-level gauges.
+
+**The report does not survive `make down` — capture it before the teardown.**
+The accumulator is in Redis, Redis's PVC is `gp3`
+(`enterprise/manifests/00-redis.yaml`), and gp3 dies with the cluster. On the
+nightly-teardown habit `docs/09-engineering-handoff.md` §5 recommends as the
+default — the one that takes the bill from ~$1,490/month to ~$370 — "last
+month's report" is gone every morning, and the first person to notice will be
+whoever asked for the report on the 1st. This is not fixable by moving the
+accumulator: EFS is the volume that survives a teardown, and putting the
+queue's Redis on it to save a monthly total would be a much worse trade. Make
+the capture part of the teardown instead:
+
+```bash
+oc exec deploy/comfy-gateway -c gateway -- \
+    curl -s localhost:8000/api/showback > "showback-$(date -u +%Y-%m).json"
+make down
+```
+
+`make park` is safe — the cluster and the volume stay — and `periods_available`
+in the response tells you what is actually still in Redis, which after a
+teardown is "this month only, from the moment the cluster came back". If the
+report matters monthly, that two-line habit is the whole fix; if it matters
+more than monthly, the next step is shipping the same JSON to S3 from a
+CronJob, which is a new item and not this one.
 
 ### Deferred, with reasons
 
