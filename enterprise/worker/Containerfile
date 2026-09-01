@@ -56,8 +56,13 @@ RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
 WORKDIR ${COMFY_ROOT}
 
-# torch first and alone: it is ~2.5 GB, and keeping it in its own layer means a
-# change to any other requirement does not re-pull it.
+# torch first and alone. On the cu128 index this layer is ~7 GB installed, not
+# the ~2.5 GB this comment used to claim — the wheel is about a gigabyte and
+# the nvidia-*-cu12 libraries it vendors (cuDNN, cuBLAS, cuSPARSE, cuFFT, NCCL,
+# nvrtc, triton) are the rest. That is most of the ~10 GB image and therefore
+# most of the cold-start pull, which is the number the whole autoscaled design
+# is fighting; its own layer means a change to any other requirement does not
+# re-pull it.
 RUN python3 -m pip install --upgrade pip setuptools wheel \
     && python3 -m pip install --index-url ${TORCH_INDEX} \
         torch==${TORCH_VERSION} \

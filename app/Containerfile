@@ -69,8 +69,13 @@ RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 # ---------------------------------------------------------------------------
 # ComfyUI and PyTorch
 #
-# Torch is installed first and separately so it lands in its own layer — it is
-# ~2.5 GB and you do not want to re-pull it every time a requirement changes.
+# Torch is installed first and separately so it lands in its own layer. On the
+# cu128 index that layer is ~7 GB installed, not the ~2.5 GB this comment used
+# to claim: the torch wheel is about a gigabyte and the nvidia-*-cu12 packages
+# it vendors — cuDNN, cuBLAS, cuSPARSE, cuFFT, NCCL, nvrtc, plus triton — are
+# the rest of it. That is most of the ~10 GB image, so it is also most of the
+# cold-start pull the scale-to-zero design is fighting; keeping it in its own
+# layer means a change to any other requirement does not re-pull it.
 # ---------------------------------------------------------------------------
 
 WORKDIR ${APP_ROOT}
