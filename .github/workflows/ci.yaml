@@ -38,6 +38,49 @@ jobs:
           sudo apt-get install -y -qq shellcheck
           python3 -m pip install --quiet pyyaml
 
+      - name: install kubeconform
+        run: |
+          # Pinned release binary rather than `go install`, so this job does
+          # not need a Go toolchain just to check manifest shapes. Checksum
+          # is the one published in the release's own CHECKSUMS file.
+          curl -sSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
+          tar xzf kubeconform.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          rm -f kubeconform.tar.gz kubeconform
+
+      - name: validate manifests against Kubernetes/OpenShift/KEDA schemas
+        run: |
+          # -ignore-missing-schemas: route.openshift.io/v1 Route and the core
+          # NetworkPolicy kind have no entry in kubeconform's default schema
+          # catalog, and this repo has no vendored OpenShift CRD schema to
+          # point at instead. KEDA's ScaledObject/TriggerAuthentication DO
+          # have a maintained schema catalog (datreeio/CRDs-catalog), so that
+          # is added as a second -schema-location rather than also ignored.
+          #
+          # enterprise/manifests/05-oauth-proxy-patch.yaml is a
+          # strategic-merge patch fragment (no kind/apiVersion of its own,
+          # applied by scripts/05-deploy.sh) rather than a standalone
+          # manifest; kubeconform has no notion of "not a full resource", so
+          # it is excluded by name instead of reported as a false failure.
+          kubeconform -strict -ignore-missing-schemas -summary \
+            -ignore-filename-pattern '.*05-oauth-proxy-patch\.yaml' \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            manifests/base enterprise/manifests
+
+      - name: kustomize build manifests/base
+        run: |
+          # kustomize ships preinstalled on the ubuntu-latest runner image
+          # (actions/runner-images), so no install step here. enterprise/
+          # manifests has no kustomization.yaml — those are applied directly,
+          # not through an overlay — so only manifests/base has a build to
+          # validate; the rendered output is fed back through kubeconform so
+          # a kustomize-only mistake (e.g. a patch producing something the
+          # raw files don't show) is still schema-checked.
+          kustomize build manifests/base | kubeconform -strict -ignore-missing-schemas -summary
+
       - name: make lint
         run: make lint
 
