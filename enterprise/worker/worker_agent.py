@@ -389,6 +389,310 @@ def with_workflow(record: dict, stored: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# BEGIN SHARED SHOWBACK — the GPU-second accumulator (docs/10-roadmap.md, Q4)
+#
+# WHAT A GPU SECOND IS HERE, written down in the code because a number nobody
+# can reproduce is worse than no number at all:
+#
+#     one GPU second is one second for which a worker held the card on this
+#     job — wall-clock time between the instant a worker wrote `running` on
+#     the job's state hash (run_job() in worker_agent.py) and the instant that
+#     job reached a terminal state.
+#
+# It is HELD time, not utilised time, and it is deliberately an OVER-COUNT of
+# the sampler. Everything below is inside the number:
+#
+#   - loading the checkpoint (~7 GB off EFS for an SDXL-class model, and the
+#     first job on a cold node pays for the page cache being empty),
+#   - the workspace mkdir, the ComfyUI WebSocket connect and the /prompt round
+#     trip, all of which happen after `running` is written,
+#   - any stretch the agent spends parked on a ComfyUI that has gone quiet,
+#     up to RECV_TIMEOUT at a time and JOB_TIMEOUT in total,
+#   - a job that failed or was cancelled part-way: it still held the card for
+#     as long as it held it.
+#
+# That is on purpose, and it is the only definition this system can actually
+# MEASURE. The alternative — "time spent inside ComfyUI's own execution" —
+# would under-count precisely the expensive part, because the pool runs one
+# job per pod on a dedicated card: nobody else could have used the GPU while
+# this job was loading a checkpoint, so somebody has to be shown as having
+# spent it. Queue time is NOT in the number: nothing was held before a worker
+# picked the job up.
+#
+# The reaper path is the one case where the measurement is not honest, and it
+# is bucketed separately rather than fudged — see SHOWBACK_TO_EXCLUDED below.
+#
+# WHY THIS BLOCK IS DUPLICATED. Two terminal paths write GPU time and they
+# live in different files: worker_agent.py's finish(), and hub.py's reaper
+# (fail_orphaned_job()/cancel_orphaned_job(), which never call finish() at
+# all). They must agree on the key, the period, the field names, the cap and
+# the expiry, and there is nowhere to import a shared definition from —
+# enterprise/setup.sh builds the two images from two different build contexts.
+# So this follows the rule the queue envelope already follows: MIRRORED
+# VERBATIM between enterprise/gateway/hub.py and
+# enterprise/worker/worker_agent.py, change both or neither, with
+# scripts/lint.sh diffing the two copies line for line. What is NOT in here is
+# the Redis call itself: hub.py is redis.asyncio and worker_agent.py is
+# synchronous redis, so each file runs the script below its own way.
+#
+# THE KEY SPACE IS BOUNDED THREE TIMES OVER, and each bound is load-bearing
+# against `maxmemory-policy noeviction` at `--maxmemory 512mb`
+# (00-redis.yaml): under `noeviction` a key nothing deletes is a key forever,
+# and the identity every field here is named from is an X-Forwarded-User
+# header that is entirely client-supplied whenever AUTH_MODE=none. An
+# accumulator that took one Redis key per submitter — or, worse, per job —
+# would let an unauthenticated caller fill Redis by varying one header, which
+# presents as queued work vanishing at random.
+#
+#   1. ONE KEY PER PERIOD, not per user. The whole report for a calendar
+#      month is a single Hash at comfy:showback:<YYYY-MM>, one field per
+#      identity, HINCRBYFLOAT per job. A year of traffic is at most twelve
+#      keys however many people submitted, and point 2 keeps only the last
+#      few of those.
+#   2. THE KEY EXPIRES. Every accrual re-arms an expiry with EXPIRE ... NX —
+#      NX so a bucket's lifetime is measured from its first write and a busy
+#      month cannot push its own deletion forward forever, and on every write
+#      rather than only the first because HINCRBYFLOAT recreates a key that
+#      expired mid-flight and a recreated key has no TTL at all. That is the
+#      same rule, for the same reason, as hub.py's arm_state_ttl().
+#   3. THE FIELD COUNT IS CAPPED. A new identity is only given its own field
+#      while the bucket holds fewer than SHOWBACK_MAX_USERS fields; past that
+#      it accrues to one shared overflow field. The report says so rather
+#      than pretending, so a report that hit the cap is visibly truncated
+#      instead of quietly wrong.
+#
+# Worst case is therefore SHOWBACK_MAX_USERS × (MAX_ENVELOPE_FIELD_CHARS + a
+# float) per period, times SHOWBACK_RETENTION_PERIODS periods live at once:
+# ~1000 × ~280 bytes × 3 ≈ 0.8 MB against a 512 MB instance, and it does not
+# grow with throughput.
+# ---------------------------------------------------------------------------
+
+# One Hash per period. The prefix is this item's namespace the way
+# comfy:worker:* and comfy:processing:* are the reaper's; enterprise/test/
+# check-90-showback.py scans it directly to assert the bound above.
+SHOWBACK_KEY_PREFIX = "comfy:showback:"
+
+# The period is a UTC calendar month. UTC and not local time because the two
+# gateway replicas, the workers and whoever reads the report are not
+# guaranteed to agree on a timezone, and a month boundary that moves per
+# reader is a report that does not add up.
+SHOWBACK_PERIOD_FORMAT = "%Y-%m"
+
+# How long a bucket lives, counted from its first write. Three periods keeps
+# the current month plus the two before it readable — enough to answer "what
+# did last month cost?" after last month ended — and then Redis deletes it
+# without anybody remembering to. 31 days is the period length used for the
+# TTL arithmetic: it must be the LONGEST month rather than the average, or a
+# bucket opened on the 1st of a 31-day month would expire before the same
+# calendar span had elapsed.
+SHOWBACK_RETENTION_PERIODS = max(1, int(os.environ.get("SHOWBACK_RETENTION_PERIODS", "3")))
+SHOWBACK_PERIOD_SECONDS = 31 * 24 * 3600
+
+# The ceiling on distinct fields in one period's Hash. Generous for any real
+# organisation — this is a pool of a few GPUs — and small enough that the
+# whole key stays under a megabyte in a Redis that must never fill up.
+SHOWBACK_MAX_USERS = max(1, int(os.environ.get("SHOWBACK_MAX_USERS", "1000")))
+
+# Field names inside that Hash. Every submitter's field is PREFIXED, which is
+# what makes the three reserved buckets un-collidable: a submitter who calls
+# themselves "anonymous" gets the field "u:anonymous" and cannot land on the
+# anonymous bucket by choosing a name. The identity itself is already clamped
+# to MAX_ENVELOPE_FIELD_CHARS on the way in (see the shared envelope block),
+# so a field name is bounded too.
+SHOWBACK_USER_PREFIX = "u:"
+
+# Submitted with no X-Forwarded-User at all — the ordinary AUTH_MODE=none,
+# no-proxy shape. Its own named bucket rather than an empty-string user,
+# because "explicit" means an operator reading the report sees the number
+# without having to know to look for a blank key.
+SHOWBACK_ANONYMOUS_FIELD = "anonymous"
+
+# GPU time that was really spent and is deliberately NOT billed to a
+# submitter. See SHOWBACK_TO_EXCLUDED.
+SHOWBACK_EXCLUDED_FIELD = "excluded"
+
+# Where accruals go once the field cap above is reached. Real seconds, real
+# users, no longer told apart.
+SHOWBACK_OTHER_FIELD = "other"
+
+# On the job's own state hash. hub.py's generate() writes the submitter here
+# at submit and writes NOTHING when there was no header — so "absent" is what
+# anonymous looks like, and the accrual below reads it rather than inventing a
+# second copy of the identity. Named once because three readers now depend on
+# the spelling.
+SHOWBACK_USER_FIELD = "user"
+
+# On the job's own state hash. started_at is written by the worker when the
+# job starts running and REMOVED by the accrual below, in the same atomic
+# script that reads it: it is both the clock's start and the claim on it, so
+# a job can be billed at most once however many terminal paths race for it —
+# which they do, whenever a worker's heartbeat lapses while the worker is in
+# fact alive and finishing. gpu_seconds is what it was billed, left on the
+# job so a line in the report can be traced back to the jobs behind it.
+STARTED_AT_FIELD = "started_at"
+GPU_SECONDS_FIELD = "gpu_seconds"
+
+# Where an accrual is sent, and the whole of the reaper-path decision.
+#
+#   SHOWBACK_TO_SUBMITTER  the job reached a terminal state through the
+#                          worker that was running it (worker_agent.py's
+#                          finish(), whatever the status: completed, failed
+#                          or cancelled). Both ends of the interval were
+#                          written by that worker, so the number is a
+#                          measurement and it is billed to the submitter —
+#                          or to the anonymous bucket if there was no
+#                          identity.
+#
+#   SHOWBACK_TO_EXCLUDED   the job was terminated by hub.py's reaper because
+#                          its worker's heartbeat lapsed (a SIGKILL, an OOM
+#                          kill, a node reclaim). The GPU time is real and
+#                          often the most expensive in the system, so it is
+#                          NOT dropped — but the gateway cannot know WHEN the
+#                          worker died, only when it noticed, so the interval
+#                          it can compute is inflated by up to
+#                          HEARTBEAT_TTL + REAPER_INTERVAL (~3.5 minutes on
+#                          the defaults). Billing a user for a number that is
+#                          mostly detection lag, for a job that produced
+#                          nothing, is the kind of figure an operator cannot
+#                          defend in the meeting the report exists for. It
+#                          goes to one visible line instead, where it doubles
+#                          as a cluster-health signal: excluded_gpu_seconds
+#                          climbing is workers dying while holding cards.
+#
+# A requeued job is not accrued at all: the reaper only requeues deaths that
+# happened BEFORE ComfyUI was handed the workflow (RETRYABLE_PHASES), which
+# by construction spent no GPU time, and the attempt that eventually runs
+# writes its own started_at over the old one.
+SHOWBACK_TO_SUBMITTER = "submitter"
+SHOWBACK_TO_EXCLUDED = "excluded"
+
+# One accrual, atomically: claim the job's clock, compute the interval, place
+# it in the right field of the right period's Hash, and re-arm the Hash's
+# expiry. Atomic because the claim and the increment must not be separable —
+# see STARTED_AT_FIELD above — and because "is this identity new, and is the
+# Hash full?" is a read the cap's decision is taken from.
+#
+# Returns {field, seconds} for the caller to log, or {"", "0"} when there was
+# nothing to bill: no clock on the job (it never ran, or it has already been
+# billed by whichever terminal path got there first).
+SHOWBACK_ACCRUE_LUA = """
+local state = KEYS[1]
+local bucket = KEYS[2]
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local max_users = tonumber(ARGV[3])
+local user_prefix = ARGV[4]
+local anonymous_field = ARGV[5]
+local excluded_field = ARGV[6]
+local other_field = ARGV[7]
+local destination = ARGV[8]
+local started_field = ARGV[9]
+local seconds_field = ARGV[10]
+local user_field = ARGV[11]
+local to_submitter = ARGV[12]
+
+-- The claim. HGET and HDEL in one script is what makes billing idempotent:
+-- a worker finishing a job whose heartbeat lapsed a moment earlier and the
+-- reaper failing that same job are two terminal paths racing, and exactly
+-- one of them can see a clock here.
+local started = redis.call('HGET', state, started_field)
+
+if not started then
+  return {'', '0'}
+end
+
+redis.call('HDEL', state, started_field)
+
+local began = tonumber(started)
+
+if not began then
+  return {'', '0'}
+end
+
+local seconds = now - began
+
+-- Clocks are not monotonic across two pods. A negative interval is not
+-- evidence of anything except skew, and must never be able to REDUCE a
+-- running total.
+if seconds < 0 then
+  seconds = 0
+end
+
+local field = excluded_field
+
+if destination == to_submitter then
+  local user = redis.call('HGET', state, user_field)
+
+  if user and user ~= '' then
+    field = user_prefix .. user
+  else
+    field = anonymous_field
+  end
+end
+
+-- The cap, checked only for submitter fields: the three reserved buckets are
+-- fixed in number and must always be reachable, or the overflow itself would
+-- be what stopped being recorded once the Hash filled up.
+if field ~= excluded_field and field ~= anonymous_field and field ~= other_field
+   and redis.call('HEXISTS', bucket, field) == 0
+   and redis.call('HLEN', bucket) >= max_users then
+  field = other_field
+end
+
+redis.call('HINCRBYFLOAT', bucket, field, seconds)
+
+-- NX, and on every write rather than only the first. See point 2 of the
+-- block comment above: this is what keeps a `noeviction` Redis from
+-- accumulating a Hash per month forever.
+redis.call('EXPIRE', bucket, ttl, 'NX')
+
+-- What this job was billed, left on the job itself so a report line can be
+-- traced back to the jobs behind it.
+redis.call('HSET', state, seconds_field, string.format('%.3f', seconds))
+
+return {field, string.format('%.3f', seconds)}
+"""
+
+
+def showback_period(now: float) -> str:
+    """The bucket a moment belongs to. UTC, see SHOWBACK_PERIOD_FORMAT."""
+    return time.strftime(SHOWBACK_PERIOD_FORMAT, time.gmtime(now))
+
+
+def showback_key(period: str) -> str:
+    """One Hash holds one period's whole report."""
+    return f"{SHOWBACK_KEY_PREFIX}{period}"
+
+
+def showback_ttl_seconds() -> int:
+    """How long a bucket lives from its first write. See point 2 above."""
+    return SHOWBACK_RETENTION_PERIODS * SHOWBACK_PERIOD_SECONDS
+
+
+def showback_accrue_call(state: str, destination: str,
+                         now: float | None = None) -> tuple[list, list]:
+    """
+    The keys and args for one accrual, in one place because there are three
+    call sites in two files — the worker's finish() and both of the reaper's
+    terminal paths — and an argument order remembered in three places is an
+    argument order that is wrong in one of them.
+    """
+    now = time.time() if now is None else now
+
+    return (
+        [state, showback_key(showback_period(now))],
+        [now, showback_ttl_seconds(), SHOWBACK_MAX_USERS,
+         SHOWBACK_USER_PREFIX, SHOWBACK_ANONYMOUS_FIELD,
+         SHOWBACK_EXCLUDED_FIELD, SHOWBACK_OTHER_FIELD, destination,
+         STARTED_AT_FIELD, GPU_SECONDS_FIELD, SHOWBACK_USER_FIELD,
+         SHOWBACK_TO_SUBMITTER],
+    )
+
+# END SHARED SHOWBACK
+# ---------------------------------------------------------------------------
+
+
 shutting_down = False
 
 
@@ -888,6 +1192,16 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             # would be read as "how far it got is unknown" and refused a retry
             # it had earned.
             PHASE_FIELD: PHASE_DISPATCHED,
+            # The GPU clock starts here (docs/10-roadmap.md, Q4), in the same
+            # HSET as `running` and for a stricter version of the same reason:
+            # this worker holds the card from this instant, and a clock
+            # started any later would silently stop charging for the
+            # checkpoint load — the most expensive part of a cold job. It is
+            # also the CLAIM on this job's billing, removed by whichever
+            # terminal path bills it first, so a worker finishing a job the
+            # reaper has already given up on cannot bill it twice. See
+            # BEGIN SHARED SHOWBACK.
+            STARTED_AT_FIELD: repr(time.time()),
         },
     )
     conn.expire(state_key(job_id), EVENT_STREAM_TTL)
@@ -1120,7 +1434,60 @@ def interrupt() -> None:
         pass
 
 
+_showback_script = None
+
+
+def showback_script(conn: redis.Redis):
+    """
+    The accrual script, registered once per process. register_script() only
+    computes a SHA1 client-side — no I/O — so this is cheap, and it is cached
+    anyway so there is exactly one Script object per agent.
+    """
+    global _showback_script
+
+    if _showback_script is None:
+        _showback_script = conn.register_script(SHOWBACK_ACCRUE_LUA)
+
+    return _showback_script
+
+
+def record_gpu_seconds(conn: redis.Redis, job_id: str, destination: str) -> None:
+    """
+    Bill this job's held-GPU time — see BEGIN SHARED SHOWBACK for what a GPU
+    second means here and where the number goes.
+
+    This is the worker's own terminal path, so both ends of the interval were
+    written by this process and the time is billed to the submitter.
+
+    It may never fail a job. The accounting is a report; the generation is the
+    product, and a Redis blip that costs one line of a monthly total must not
+    also cost the user a job that actually completed. The failure is logged
+    rather than swallowed silently, because a total that is quietly short is
+    exactly the kind of wrong a monthly report does not survive.
+    """
+    keys, args = showback_accrue_call(state_key(job_id), destination)
+
+    try:
+        field, seconds = showback_script(conn)(keys=keys, args=args)
+    except Exception as exc:  # noqa: BLE001 - never terminal for the job
+        log(f"job {job_id}: could not record GPU seconds ({exc})")
+        return
+
+    # An empty field is "there was no clock on this job": it never started, or
+    # some other terminal path already claimed it. Both are normal.
+    if field:
+        log(f"job {job_id} -> {seconds}s of GPU time recorded against {field}")
+
+
 def finish(conn: redis.Redis, job_id: str, status: str, payload: dict) -> None:
+    # Before the terminal status, not after it: the job's clock lives on the
+    # same state hash, and anything that reads `status` and then reads the
+    # report must not be able to see the first without the second. Every
+    # status goes through here — completed, failed and cancelled alike — which
+    # is the point: a job that failed after twenty minutes held the card for
+    # twenty minutes.
+    record_gpu_seconds(conn, job_id, SHOWBACK_TO_SUBMITTER)
+
     conn.hset(state_key(job_id), mapping={"status": status})
     conn.expire(state_key(job_id), EVENT_STREAM_TTL)
     emit(conn, job_id, {"type": status, "data": payload})

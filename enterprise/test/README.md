@@ -141,6 +141,54 @@ queue entry written by one vintage is always read by the other at some point
 during a rollout, and `docs/07-design-review.md` explains why the failure that
 matters there is a discarded entry rather than a crash.
 
+**GPU seconds land on the right line, including when nobody reported them.**
+`check-90-showback.py` (docs/10-roadmap.md, Q4) does not check that showback
+recorded *something* — it submits a deliberately slow job, measures the job's
+real wall-clock duration itself, and requires the recorded figure to track it,
+so a hardcoded constant, a per-job count and a definition that measures only
+ComfyUI's own execution all fail alongside zero. It then checks the three
+places the accounting can silently go missing. A second user's job must leave
+the first user's total **bit-for-bit** unchanged, which is what tells one
+counter shared by two submitters apart from two counters. A submission with no
+`X-Forwarded-User` at all must land in the explicit `anonymous_gpu_seconds`
+bucket rather than in a blank `users[""]` key. And a job whose worker was
+SIGKILLed mid-execution must still be accounted for — that death is terminated
+by `hub.py`'s `fail_orphaned_job()`, which never calls `worker_agent.py`'s
+`finish()`, so an implementation hooked only into `finish()` drops precisely
+the jobs where a card was held and nothing came back. The check reproduces
+that death the way `check-30` does, confirming with the stub that ComfyUI
+really had the workflow first, so "GPU time was actually spent" is asserted
+rather than assumed. Finally it drives nine distinct submitter identities —
+including a path-traversal string and a 300-character one — through the system
+and asserts `comfy:showback:*` holds *fewer keys than that*: the identity is a
+client-supplied header, and one Redis key per submitter is unbounded growth
+against a `noeviction` Redis. What this cannot see is the accumulator's
+expiry, which is measured in months, or its identity cap, which is a thousand;
+`scripts/lint.sh` pins both.
+
+**An over-quota submission never reaches the queue, and everything else
+still does.** `check-95-quota-breaker.py` (docs/10-roadmap.md, Q5) starts its
+own gateway on :8101 with `QUOTA_GPU_SECONDS` pinned to a value it chose —
+the same reason `check-30` starts its own agent with a shrunk
+`HEARTBEAT_TTL` — and seeds four synthetic submitters straight into the real
+showback Hash: one far over the ceiling, one under it, one with no field at
+all, and one whose field holds a non-numeric value. The refusal is proven as
+**zero writes to `comfy:queue`**, counted by a `QueueWriteWatcher` armed
+before the request, not by an `LLEN` afterwards — an implementation that
+rejects the response *after* enqueueing is worse than none, and a queue read
+after the fact cannot see the difference once the live agent has popped the
+job. The other three must each be queued exactly once and run to completion,
+which is the fail-open requirement stated as three separate fixtures: a
+missing field, an unreadable one, and a genuinely under-quota user are three
+different code paths, and a strict `float()` passes two of them. Finally
+`/readyz` must still read exactly `{"ok": true}` with the over-quota identity
+sent on the readyz request itself. That last one passes trivially today and is
+meant to: it is the regression guard against wiring the breaker into the
+readiness probe, which would turn one person's ceiling into a gateway-wide
+outage. What it cannot see is the *shape* of that separation — a health
+endpoint that reads the quota is green whenever its reader is under the cap —
+so `scripts/lint.sh` walks `hub.py`'s call graph for it.
+
 ## What it does not cover
 
 Anything requiring a real cluster: KEDA actually scaling, the machine pool

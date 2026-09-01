@@ -490,6 +490,91 @@ default that happens to work locally is precisely the kind of thing a later
 diff tidies away. The behaviour itself is on the cluster-day list in
 `docs/10-roadmap.md`: two pods, two UIDs, one EFS volume.
 
+### Q4 — showback, where every obvious version is wrong in a different place
+
+Showback reads as the smallest item on the list: the submitter is already on
+the job, so add up some seconds and serve them. Four of the five decisions in
+it are places where the obvious implementation is not merely imprecise but
+produces a number that is quietly, structurally short — and a report that is
+quietly short is worse than no report, because somebody takes it into a
+meeting.
+
+**Instrumenting `finish()` drops exactly the expensive jobs.** It is the
+natural hook: every terminal status goes through it, it is four lines, and the
+e2e suite goes green. But `worker_agent.py`'s `finish()` is the *worker's*
+terminal path, and the jobs that cost the most are precisely the ones that
+never reach it — a worker SIGKILLed mid-generation is ended by `hub.py`'s
+`fail_orphaned_job()`, which writes the status directly and never calls the
+worker at all. So the version that hooks only `finish()` bills every job
+except the ones where a card was held and nothing came back. That is the same
+shape as `check-30-sigkill.py`'s subject, arriving in a new item, and it is why
+the accrual is a mirrored block written from both files rather than a helper in
+one of them.
+
+**But billing that time to the user is also wrong, for a reason that is not
+generosity.** The reaper learns a job ended when a heartbeat lapses, which is
+up to `HEARTBEAT_TTL + REAPER_INTERVAL` after the worker actually died — about
+3.5 minutes on the defaults. The interval it can compute is therefore real GPU
+time plus an unknown amount of detection lag, and there is no second timestamp
+anywhere that would let anyone separate them. A column whose every entry is
+reproducible from two timestamps one worker wrote is a column you can defend;
+mixing in a number that is mostly a TTL is how the whole report stops being
+believed. So it is recorded in `excluded_gpu_seconds`, visible, where it
+doubles as the "workers are dying while holding cards" signal — and Q5's quota
+has an honest column to compute from.
+
+**`INCRBYFLOAT comfy:showback:<user>` is the natural accumulator and it is an
+unauthenticated Redis fill.** One key per submitter is the shape everybody
+writes first; it is also a client-supplied header (`AUTH_MODE=none`, and
+`hub.py` says so in three places) turned directly into Redis keys, in an
+instance that is `noeviction` at 512 MB precisely so that nothing quietly
+deletes queued work. Varying one header on every request is then a free denial
+of service that presents as jobs vanishing at random — the failure the
+`noeviction` invariant exists to prevent, arriving through a door the policy
+does not cover. One Hash per UTC month with `HINCRBYFLOAT` per field fixes the
+key count; it does *not* fix the field count, which is the same bug one level
+down, so a `HLEN` cap and a shared overflow field are part of the same
+decision rather than a refinement of it. And the bucket has to expire — with
+`EXPIRE ... NX` on **every** accrual, not once at creation, because
+`HINCRBYFLOAT` recreates a key that expired mid-flight and a recreated key has
+no TTL at all.
+
+**Two terminal paths race, so the clock has to be the claim.** A worker whose
+heartbeat lapses while it is in fact alive and finishing is a case the suite
+already exercises; with accounting in both paths it becomes a double-bill. The
+obvious guard — read the start time, then delete it — is a lost update between
+a gateway replica and a worker, the same shape as the retry counter Q2 had to
+make an `HINCRBY`. Reading and removing `started_at` inside the one Lua script
+that does the accrual makes "who bills this job" a question exactly one caller
+can answer, and makes a job that has already been billed a no-op rather than a
+second entry.
+
+**The definition is the part nobody can check for you.** GPU seconds here are
+wall-clock between `running` and the terminal state: it includes the
+checkpoint load, the workspace `mkdir` and any time the agent sat parked, and
+it bills a job that failed after twenty minutes for twenty minutes. The
+tempting refinement is to count only time inside ComfyUI's own execution,
+which sounds more precise and under-counts the expensive part — this pool runs
+one job per pod on a dedicated card, so nobody else could have used the GPU
+while a 7 GB checkpoint came off EFS, and time that belongs to no one is how a
+report stops adding up to the bill. The decision was to over-count honestly and
+write the definition into the code beside the accrual, where the person who
+needs it is standing, rather than only into a document. `check-90-showback.py`
+enforces it from the other side by measuring a deliberately slow job's real
+duration itself: a constant, a per-job count and an execution-only figure all
+fail the same assertion that zero fails.
+
+**And the last one is not a code decision at all.** The report lives in Redis,
+Redis's PVC is gp3, gp3 dies with the cluster, and `docs/09` recommends
+tearing the cluster down nightly as the default habit — so "last month's
+report" is gone every morning and the first person to notice is whoever asks
+for it on the 1st. Nothing in the accumulator can fix that; moving it to the
+volume that *does* survive would mean putting the queue's Redis on EFS, which
+is a far worse trade for a monthly total. The fix is a documented line in the
+teardown, in `docs/09` §5 and in the endpoint's own docstring, on the same
+principle as "before your first `make down`, know where the models live":
+state the surprise where the person about to be surprised is reading.
+
 ---
 
 ## What was right and worth keeping

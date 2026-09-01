@@ -171,6 +171,8 @@ miserable to reproduce.
 | The `chgrp 0` / `chmod g=u` block in both Containerfiles | `app/Containerfile`, `enterprise/worker/Containerfile` | OpenShift runs the container as an arbitrary high UID with GID 0. Without it, ComfyUI cannot write `temp/`, `input/`, `user/` and the pod crash-loops. This is the single most common OpenShift containerisation failure. |
 | GPU pods sized to fit the smallest supported instance, requests equal to limits | `enterprise/manifests/02-worker.yaml`, `manifests/base/deployment.yaml` | The 16 GiB of *host* RAM on a `g6.xlarge` is not the card's 24 GB of VRAM. A memory limit above what one pod can hold on that node is unreachable, so the real ceiling becomes node pressure: an eviction, or a kernel OOM kill of ComfyUI, instead of a clean container-level `OOMKilled`. Unequal requests and limits make the pod Burstable, which is evicted before Guaranteed pods and carries a far more attractive `oom_score_adj` — on a pod holding a GPU mid-generation. |
 | A per-submitter output workspace is **sanitized, then joined, then resolved, then verified inside `OUTPUT_ROOT`**, and created with an explicit group-writable setgid mode | `worker_agent.py`, note 7 / `scripts/lint.sh` | Two ways to break one mechanism. The header the workspace is named from is client-supplied under `AUTH_MODE=none`, so a join whose containment is never re-checked — or a `resolve()` done *before* the join, which proves nothing about the joined path — is an arbitrary filesystem write from an unauthenticated request. Separately, the mode is not cosmetic: OpenShift gives each pod an arbitrary high UID that is not stable across pods, so a directory created at runtime by one worker is unwritable by the next one without `g+w`, and the files ComfyUI writes inside it do not get GID 0 without `setgid`. `mkdir`'s own mode argument is masked by umask and yields `0755`, so this must be an explicit `chmod` — and it is invisible to `make test`, which runs one agent as one UID on a local filesystem where the creator owns everything. |
+| The showback accumulator is **one Hash per period, whose expiry every accrual re-arms, with a capped field count** | `hub.py` / `worker_agent.py`, `BEGIN SHARED SHOWBACK` / `scripts/lint.sh` | Three ways to break one mechanism, and all three end at the `noeviction` row above. The identity every GPU-second total is named from is the `X-Forwarded-User` header, which is entirely client-supplied under `AUTH_MODE=none` — so an accumulator that takes a new *Redis key* per submitter (or per job) lets an unauthenticated caller fill a 512 MB `noeviction` instance by varying one header, which presents as queued work vanishing at random. One Hash per UTC month, `HINCRBYFLOAT` per job, is what bounds it. The expiry is the second half: `HINCRBYFLOAT` recreates a key that expired mid-flight and a recreated key has **no TTL at all**, so arming the bucket once at creation is not the same as arming it, and `EXPIRE ... NX` on every accrual is what keeps a bucket's lifetime measured from its first write instead of pushed forward forever by a busy month. The cap is the third: without `HLEN` guarding a new field, the Hash grows one field per distinct header value and the problem has only moved down a level. `make test` can see none of this — it drives ten identities for one minute, where a TTL measured in months and a cap of a thousand look exactly like their own absence — so `scripts/lint.sh` pins the shape. Separately, the block is **mirrored verbatim** between the two files for the same reason the queue envelope is: GPU time is written from two terminal paths in two different images (the worker's `finish()`, and the reaper, which never calls it), and a gateway and a worker that disagree about the period string or the field prefix both keep running while the month's total quietly splits in two. |
+| The GPU-second quota breaker is **not reachable from `readyz()`**, and **fails open** | `hub.py`, `BEGIN QUOTA BREAKER` / `scripts/lint.sh` | Two ways to turn a cost control into the outage it exists to prevent. `/readyz` is the gateway's readiness probe (`01-gateway.yaml`): a quota read inside it — or inside anything it calls, which is why the lint rule walks the call graph rather than grepping one function — takes the whole gateway out of its Service the moment ONE submitter crosses their ceiling. Every browser WebSocket reporting an in-flight job is dropped, nobody can submit, and the GPU pool keeps running and keeps costing money. The breaker has exactly one caller, `generate()`, where the worst it can do is refuse one submission with a 429 that says when the quota resets. The other half is the direction it fails: Redis unreachable, the field missing, the value corrupt, the env var garbled — every one of those lets the submission through, because a breaker that trips on an unreachable dependency halts a cluster you are already paying for while the spend it guards against is slow. That is only defensible if it is *loud*, so every fail-open prints a line naming what it could not read; a control that stops enforcing silently has quietly stopped existing. `make test` sees the runtime half (`check-95-quota-breaker.py` asserts an over-quota submission produces zero writes to `comfy:queue`, and that `/readyz` stays healthy while that submitter is over); it cannot see the shape, because a health page that reads the quota is green on any gateway whose reader happens to be under the cap. |
 | `STORAGE_MODE=rwx` for the multi-user configuration | `enterprise/setup.sh` refuses otherwise | The gateway serves images off the volume the workers write to, and they are on different nodes by construction. gp3 is `ReadWriteOnce`. |
 
 The file-level half of this table is now mechanical. `make lint` fails on a
@@ -202,7 +204,7 @@ taking it from the same `OUTPUT_ROOT` the agent reads. Those three are
 the arbitrary-UID row above: one agent, one UID, one local filesystem is a
 configuration in which every one of them looks fine.
 
-The last two are the fair-queueing insert's row: `make lint` fails on a
+Two of them are the fair-queueing insert's row: `make lint` fails on a
 `FAIR_ENQUEUE_LUA` that stopped splicing with `LINSERT` or that calls anything
 destructive on the queue, and on a `fair_enqueue_call()` that stopped building
 the list entry with `queue_record()` — i.e. that put the workflow back in the
@@ -211,6 +213,26 @@ every reading of the code still looks right, because the suite's queue is
 three jobs deep and its workflows have two nodes. Their cost is a
 hundred-millisecond stall on every client in the cluster, and a window in
 which one error empties the whole queue.
+
+Q4's showback accumulator added two more, and they are the ones a one-minute
+run is least able to see: `make lint` fails on an accrual script that stopped
+re-arming the bucket's `EXPIRE`, stopped capping new fields with `HLEN`,
+stopped adding into a Hash field with `HINCRBYFLOAT`, or touched any Redis key
+other than the two it is handed — and on a `showback_key()` that names the key
+from anything except the period. It also diffs the `BEGIN SHARED SHOWBACK`
+block between `hub.py` and `worker_agent.py`, the way it already diffs the
+queue envelope. A TTL measured in months and a cap of a thousand identities
+are both invisible to a suite that runs for a minute against ten of them,
+which is exactly why the accumulator's row above is enforced here rather than
+there.
+
+Q5's quota breaker added the nineteenth, and it is the only row here whose
+failure mode is caused by the safety feature itself: `make lint` fails if
+anything reachable from `readyz()` — transitively, not just its own body —
+mentions the quota, and if `quota_refusal()` is called from anywhere other
+than `generate()`. It also fails if the breaker has been deleted outright,
+because every other clause in that rule is an absence, and an absence is
+trivially true of a file with nothing in it.
 
 `docs/07-design-review.md` is the long form: every one of these traces back to
 a specific bug in the design this was built from. Read it once, early. It is
@@ -278,6 +300,25 @@ the cluster; EFS and the S3 sync path survive it. `docs/03-storage.md`. A
 teardown that turns into a two-hour model re-download will stop you doing
 teardowns, which costs far more than the storage did.
 
+**The showback report does not survive a teardown either — capture it first.**
+`GET /api/showback` (docs/10-roadmap.md, Q4) answers "who spent the card this
+month" out of Redis, and Redis's PVC is gp3, so the *same* sentence applies:
+gp3 dies with the cluster. On the nightly-`down` habit this section
+recommends, last month's report is gone every morning, and the person who
+finds out is whoever asks for it on the 1st. Two lines, in that order, in
+whatever runs your teardown:
+
+```bash
+oc exec deploy/comfy-gateway -c gateway -- \
+    curl -s localhost:8000/api/showback > "showback-$(date -u +%Y-%m).json"
+make down
+```
+
+`make park` needs none of this — the cluster and the volume stay. The
+`periods_available` field in the response is the honest answer to "what is
+still in there", and after a teardown it is "this month, since the cluster
+came back".
+
 ---
 
 ## 6. The failure modes you will actually meet
@@ -312,6 +353,7 @@ Everything is in `.env`. The ones that change behaviour rather than naming:
 | `STORAGE_MODE` | `rwx` is mandatory for multi-user and is what lets models outlive `make down`. |
 | `COMFYUI_REF` | Pinned on purpose. Bumping it is a deliberate, reviewable act. |
 | `ENABLE_MANAGER` | Leave `false` on a shared cluster. It gives every UI user arbitrary code execution on a node with cloud credentials, and anything it writes disappears when the node is reclaimed anyway. |
+| `QUOTA_GPU_SECONDS` | Off by default. A per-user GPU-second ceiling per UTC month, computed from the showback accounting the cluster already keeps — the cheapest way to stop one person's batch script from being the whole month's bill. It fails open, so it is a guardrail and not a guarantee. |
 | `AUTH_MODE` | `none` exists for a solo test cluster. Route hostnames appear in certificate transparency logs within minutes, so `none` means anyone who looks can spend your GPU budget. |
 | `cooldownPeriod` (in `03-autoscale.yaml`) | 600s. The first number to tune if the economics feel wrong. |
 

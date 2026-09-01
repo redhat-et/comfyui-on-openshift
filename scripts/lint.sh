@@ -634,6 +634,297 @@ fi
 
 # ---------------------------------------------------------------------------
 
+log "the showback accumulator is mirrored, not diverged (docs/10-roadmap.md, Q4)"
+
+# The same argument as the queue envelope above, for a second contract the two
+# files must agree on. GPU time is written from TWO terminal paths in two
+# different images: worker_agent.py's finish(), and hub.py's reaper, which
+# never calls finish() at all. They must agree on the Redis key, the period,
+# the field names, the identity cap and the expiry, and there is nowhere to
+# import a shared definition from.
+#
+# Divergence here is silent in the specific way that matters for a REPORT: a
+# gateway and a worker computing different period strings, or different field
+# prefixes, both still run, every check still passes, and the monthly total is
+# quietly split across two keys or two fields. Nobody finds that until the
+# month is over and the numbers do not add up.
+
+if python3 - <<'EOF'
+import difflib, sys
+
+MARKERS = ("# BEGIN SHARED SHOWBACK", "# END SHARED SHOWBACK")
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+
+def block(path, begin, end):
+    lines = open(path).read().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(begin)]
+    ends = [i for i, line in enumerate(lines) if line.startswith(end)]
+
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        print(f"  {path}: expected exactly one {begin} ... {end} block, found "
+              f"{len(starts)} begin and {len(ends)} end marker(s) — the GPU-second "
+              "accumulator must be present in both files, delimited, and identical")
+        return None
+
+    return lines[starts[0]:ends[0] + 1]
+
+blocks = [block(path, *MARKERS) for path in FILES]
+
+if any(b is None for b in blocks):
+    sys.exit(1)
+
+if blocks[0] != blocks[1]:
+    print(f"  the shared showback block differs between {FILES[0]} and "
+          f"{FILES[1]} — change both or neither:")
+    for line in difflib.unified_diff(blocks[0], blocks[1], FILES[0], FILES[1],
+                                     lineterm="", n=1):
+        print(f"    {line}")
+    sys.exit(1)
+
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the showback accumulator is period-bucketed, expiring and capped (docs/10-roadmap.md, Q4)"
+
+# Three properties of SHOWBACK_ACCRUE_LUA that the e2e suite structurally
+# cannot see, against a Redis that is `maxmemory-policy noeviction` at
+# `--maxmemory 512mb` (00-redis.yaml), keyed off a header that is entirely
+# client-supplied whenever AUTH_MODE=none.
+#
+#   1. ONE KEY PER PERIOD. check-90-showback.py does assert the key count
+#      stays below the number of identities that fed it — but it drives nine
+#      identities through a suite that runs for a minute, so it cannot tell
+#      "one Hash per month" from "one key per identity, and this run was
+#      short". A key built from the SUBMITTER is the failure: an
+#      unauthenticated caller varying one header fills Redis, which presents
+#      as queued work vanishing at random.
+#
+#   2. THE KEY EXPIRES. Nothing in a one-minute suite can observe a TTL that
+#      is measured in months, so a bucket written with no expiry at all looks
+#      identical to a correct one for the whole life of the test. Under
+#      `noeviction` a key nothing deletes is a key forever.
+#
+#   3. THE FIELD COUNT IS CAPPED. Same blindness: the cap is a thousand
+#      identities and the suite drives ten. Without HLEN guarding a new
+#      field, the Hash itself is the unbounded thing and point 1 has only
+#      moved the problem down one level.
+
+if python3 - <<'EOF'
+import re, sys
+
+PATH = "enterprise/gateway/hub.py"
+source = open(PATH).read()
+
+problems = []
+
+match = re.search(r'SHOWBACK_ACCRUE_LUA = """(.*?)"""', source, re.S)
+
+if match is None:
+    print(f"  {PATH}: no SHOWBACK_ACCRUE_LUA script to check")
+    sys.exit(1)
+
+script = "\n".join(line for line in match.group(1).splitlines()
+                   if not line.lstrip().startswith("--"))
+
+for needed, why in (
+    ("HINCRBYFLOAT", "the accumulator must add into a FIELD of the period's "
+                     "Hash. A per-submitter key is unbounded growth from a "
+                     "client-supplied header"),
+    ("EXPIRE", "every accrual must re-arm the bucket's expiry. HINCRBYFLOAT "
+               "recreates a key that expired mid-flight, and a recreated key "
+               "has no TTL at all — so arming it once, at creation, is not "
+               "the same as arming it"),
+    ("HLEN", "a new submitter may only be given its own field while the "
+             "bucket is under the identity cap. Without this the Hash grows "
+             "one field per distinct header value, forever"),
+):
+    if needed not in script:
+        problems.append(f"the accrual script no longer calls {needed}: {why}")
+
+# Every Redis key this script touches must be one it was HANDED — the job's
+# state hash or the period bucket — never one it builds. A key computed
+# inside the script from a submitter is exactly the shape all three points
+# above exist to prevent.
+for command, key in re.findall(r"redis\.call\('([A-Z]+)',\s*([^,)]+)", script):
+    if key.strip() not in ("state", "bucket"):
+        problems.append(f"the accrual script calls {command} on `{key}`, which "
+                        "is not one of the two keys it is handed (KEYS[1], the "
+                        "job's state hash, and KEYS[2], the period bucket). "
+                        "This script must never address a key of its own "
+                        "making")
+
+# And the bucket key itself is named from the PERIOD and from nothing else.
+key_fn = re.search(r"def showback_key\(period: str\) -> str:(.*?)\n\n", source, re.S)
+
+if key_fn is None:
+    problems.append("showback_key(period) is gone — the accumulator's key must "
+                    "be built in one place, from the period")
+else:
+    # The fixed namespace prefix, plus the period, and nothing else.
+    fields = set(re.findall(r"\{([^}]*)\}", key_fn.group(1))) - {"SHOWBACK_KEY_PREFIX"}
+
+    if fields != {"period"}:
+        problems.append(f"showback_key() interpolates {sorted(fields)} beside "
+                        "the namespace prefix, rather than the period alone. "
+                        "One Hash per period is the bound: a key carrying the "
+                        "submitter is one Redis key per identity")
+
+for problem in problems:
+    print(f"  {PATH}: {problem}")
+
+sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the quota breaker is not reachable from readyz() (docs/10-roadmap.md, Q5)"
+
+# The one thing about Q5 that a green test run cannot tell you.
+#
+# /readyz is the gateway's readiness probe (enterprise/manifests/01-gateway.yaml).
+# A quota check inside it — or inside anything it calls — would take the whole
+# gateway out of its Service the moment ONE submitter went over their
+# GPU-second ceiling: every browser WebSocket reporting an in-flight job
+# dropped, no new submissions from anybody, on a GPU pool that is still
+# running work and still costing money. An outage caused by the control that
+# exists to prevent one, and the roadmap names it: "It must not be wired into
+# readyz()".
+#
+# enterprise/test/check-95-quota-breaker.py asserts /readyz stays healthy
+# while a submitter is over quota, which is the runtime half. It cannot see
+# the shape: a future edit that reads the quota inside a helper readyz()
+# happens to call — for a "one health page shows everything" dashboard, say —
+# passes that check on any gateway whose Redis is answering and whose reader
+# is under the cap, and fails in production, once, at the worst moment. So the
+# separation is held here as a property of the call graph instead.
+#
+# It is deliberately more than a grep for "quota" inside readyz's body: the
+# walk below follows every module-level function readyz reaches, transitively,
+# because "readyz calls health_summary() which calls quota_refusal()" is the
+# same outage with one more hop in it.
+
+if python3 - <<'EOF'
+import ast, sys
+
+PATH = "enterprise/gateway/hub.py"
+source = open(PATH).read()
+tree = ast.parse(source)
+
+problems = []
+
+# Every module-level def, sync or async, by name.
+functions = {node.name: node
+             for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def names_in(node):
+    """
+    Every name mentioned anywhere under a node: bare names, and the attribute
+    half of a dotted access. Names, not source text — a docstring that
+    discusses the quota is not a reference to it, and the point of this rule
+    is what the code REACHES.
+    """
+    found = set()
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            found.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            found.add(child.attr)
+
+    return found
+
+
+def quota_names(names):
+    """
+    The breaker's surface, recognised by name rather than by a list kept here:
+    QUOTA_GPU_SECONDS, quota_refusal(), and anything added to the block later
+    is covered without anybody remembering to come back and add it.
+    """
+    return sorted(name for name in names if "quota" in name.lower())
+
+
+# Vacuity guards. Every check below this point is an ABSENCE — "the readiness
+# path does not touch the breaker" — and an absence is trivially true of a
+# file with no breaker in it. These are what make the rule fail loudly if Q5
+# is deleted or renamed, instead of passing most completely.
+if "quota_refusal" not in functions:
+    problems.append("quota_refusal() is gone. The breaker must have exactly "
+                    "one entry point, or 'is the breaker in the readiness "
+                    "path?' stops being a question about one call")
+
+if "QUOTA_GPU_SECONDS" not in names_in(tree):
+    problems.append("QUOTA_GPU_SECONDS is not mentioned in this file at all — "
+                    "the per-user ceiling this rule keeps out of the "
+                    "readiness path does not exist, so the rule is guarding "
+                    "nothing")
+
+if "readyz" not in functions:
+    problems.append("readyz() is gone or has been renamed — this rule can no "
+                    "longer see the readiness path it is guarding")
+
+# The positive half: the breaker IS called, and only from the submit path.
+# Without this the rule below would pass most completely if Q5 were deleted.
+callers = {name for name, node in functions.items()
+           if "quota_refusal" in names_in(node)}
+
+if "quota_refusal" in functions and callers != {"generate"}:
+    problems.append(f"quota_refusal() is called from {sorted(callers) or 'nothing'}, "
+                    "not from generate() alone. The quota is admission "
+                    "control on submission: one caller, in the one place that "
+                    "can refuse before anything is written to the queue")
+
+# The negative half, transitively: nothing readyz() reaches may touch it.
+if "readyz" in functions:
+    reachable, pending = set(), ["readyz"]
+
+    while pending:
+        name = pending.pop()
+
+        if name in reachable or name not in functions:
+            continue
+
+        reachable.add(name)
+        pending.extend(names_in(functions[name]) & set(functions))
+
+    for name in sorted(reachable):
+        touched = quota_names(names_in(functions[name]))
+
+        if touched:
+            via = "" if name == "readyz" else f" (reached from readyz() via {name}())"
+            problems.append(f"{name}() references {touched}{via}. The quota "
+                            "breaker must not be reachable from the readiness "
+                            "probe: one submitter over their ceiling would "
+                            "otherwise pull the whole gateway out of service "
+                            "and drop every WebSocket reporting an in-flight "
+                            "job")
+
+for problem in problems:
+    print(f"  {PATH}: {problem}")
+
+sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then

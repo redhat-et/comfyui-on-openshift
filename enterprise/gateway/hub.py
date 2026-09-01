@@ -28,10 +28,12 @@ them. Streams are given a TTL so finished jobs do not accumulate.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import json
 import os
 import pathlib
+import re
 import time
 import uuid
 
@@ -92,6 +94,21 @@ MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "1"))
 # that.
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 STATIC_ROOT = pathlib.Path(__file__).parent / "static"
+
+
+def log(message: str) -> None:
+    """
+    One operator-visible line on the pod log, matching worker_agent.py's
+    `[agent]` prefix so `oc logs` reads the same on both sides.
+
+    Deliberately rare. Everything ordinary about this process is already in
+    uvicorn's access log, so a line printed here is one an operator is meant
+    to notice: today that is exactly the quota breaker announcing that it
+    could not read its own accounting and is therefore NOT enforcing
+    (BEGIN QUOTA BREAKER below). A control that stops existing silently is
+    the failure mode this exists for.
+    """
+    print(f"[gateway] {message}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +361,512 @@ def with_workflow(record: dict, stored: str) -> dict:
     return dict(record, workflow=json.loads(stored))
 
 # END SHARED ENVELOPE
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# BEGIN SHARED SHOWBACK — the GPU-second accumulator (docs/10-roadmap.md, Q4)
+#
+# WHAT A GPU SECOND IS HERE, written down in the code because a number nobody
+# can reproduce is worse than no number at all:
+#
+#     one GPU second is one second for which a worker held the card on this
+#     job — wall-clock time between the instant a worker wrote `running` on
+#     the job's state hash (run_job() in worker_agent.py) and the instant that
+#     job reached a terminal state.
+#
+# It is HELD time, not utilised time, and it is deliberately an OVER-COUNT of
+# the sampler. Everything below is inside the number:
+#
+#   - loading the checkpoint (~7 GB off EFS for an SDXL-class model, and the
+#     first job on a cold node pays for the page cache being empty),
+#   - the workspace mkdir, the ComfyUI WebSocket connect and the /prompt round
+#     trip, all of which happen after `running` is written,
+#   - any stretch the agent spends parked on a ComfyUI that has gone quiet,
+#     up to RECV_TIMEOUT at a time and JOB_TIMEOUT in total,
+#   - a job that failed or was cancelled part-way: it still held the card for
+#     as long as it held it.
+#
+# That is on purpose, and it is the only definition this system can actually
+# MEASURE. The alternative — "time spent inside ComfyUI's own execution" —
+# would under-count precisely the expensive part, because the pool runs one
+# job per pod on a dedicated card: nobody else could have used the GPU while
+# this job was loading a checkpoint, so somebody has to be shown as having
+# spent it. Queue time is NOT in the number: nothing was held before a worker
+# picked the job up.
+#
+# The reaper path is the one case where the measurement is not honest, and it
+# is bucketed separately rather than fudged — see SHOWBACK_TO_EXCLUDED below.
+#
+# WHY THIS BLOCK IS DUPLICATED. Two terminal paths write GPU time and they
+# live in different files: worker_agent.py's finish(), and hub.py's reaper
+# (fail_orphaned_job()/cancel_orphaned_job(), which never call finish() at
+# all). They must agree on the key, the period, the field names, the cap and
+# the expiry, and there is nowhere to import a shared definition from —
+# enterprise/setup.sh builds the two images from two different build contexts.
+# So this follows the rule the queue envelope already follows: MIRRORED
+# VERBATIM between enterprise/gateway/hub.py and
+# enterprise/worker/worker_agent.py, change both or neither, with
+# scripts/lint.sh diffing the two copies line for line. What is NOT in here is
+# the Redis call itself: hub.py is redis.asyncio and worker_agent.py is
+# synchronous redis, so each file runs the script below its own way.
+#
+# THE KEY SPACE IS BOUNDED THREE TIMES OVER, and each bound is load-bearing
+# against `maxmemory-policy noeviction` at `--maxmemory 512mb`
+# (00-redis.yaml): under `noeviction` a key nothing deletes is a key forever,
+# and the identity every field here is named from is an X-Forwarded-User
+# header that is entirely client-supplied whenever AUTH_MODE=none. An
+# accumulator that took one Redis key per submitter — or, worse, per job —
+# would let an unauthenticated caller fill Redis by varying one header, which
+# presents as queued work vanishing at random.
+#
+#   1. ONE KEY PER PERIOD, not per user. The whole report for a calendar
+#      month is a single Hash at comfy:showback:<YYYY-MM>, one field per
+#      identity, HINCRBYFLOAT per job. A year of traffic is at most twelve
+#      keys however many people submitted, and point 2 keeps only the last
+#      few of those.
+#   2. THE KEY EXPIRES. Every accrual re-arms an expiry with EXPIRE ... NX —
+#      NX so a bucket's lifetime is measured from its first write and a busy
+#      month cannot push its own deletion forward forever, and on every write
+#      rather than only the first because HINCRBYFLOAT recreates a key that
+#      expired mid-flight and a recreated key has no TTL at all. That is the
+#      same rule, for the same reason, as hub.py's arm_state_ttl().
+#   3. THE FIELD COUNT IS CAPPED. A new identity is only given its own field
+#      while the bucket holds fewer than SHOWBACK_MAX_USERS fields; past that
+#      it accrues to one shared overflow field. The report says so rather
+#      than pretending, so a report that hit the cap is visibly truncated
+#      instead of quietly wrong.
+#
+# Worst case is therefore SHOWBACK_MAX_USERS × (MAX_ENVELOPE_FIELD_CHARS + a
+# float) per period, times SHOWBACK_RETENTION_PERIODS periods live at once:
+# ~1000 × ~280 bytes × 3 ≈ 0.8 MB against a 512 MB instance, and it does not
+# grow with throughput.
+# ---------------------------------------------------------------------------
+
+# One Hash per period. The prefix is this item's namespace the way
+# comfy:worker:* and comfy:processing:* are the reaper's; enterprise/test/
+# check-90-showback.py scans it directly to assert the bound above.
+SHOWBACK_KEY_PREFIX = "comfy:showback:"
+
+# The period is a UTC calendar month. UTC and not local time because the two
+# gateway replicas, the workers and whoever reads the report are not
+# guaranteed to agree on a timezone, and a month boundary that moves per
+# reader is a report that does not add up.
+SHOWBACK_PERIOD_FORMAT = "%Y-%m"
+
+# How long a bucket lives, counted from its first write. Three periods keeps
+# the current month plus the two before it readable — enough to answer "what
+# did last month cost?" after last month ended — and then Redis deletes it
+# without anybody remembering to. 31 days is the period length used for the
+# TTL arithmetic: it must be the LONGEST month rather than the average, or a
+# bucket opened on the 1st of a 31-day month would expire before the same
+# calendar span had elapsed.
+SHOWBACK_RETENTION_PERIODS = max(1, int(os.environ.get("SHOWBACK_RETENTION_PERIODS", "3")))
+SHOWBACK_PERIOD_SECONDS = 31 * 24 * 3600
+
+# The ceiling on distinct fields in one period's Hash. Generous for any real
+# organisation — this is a pool of a few GPUs — and small enough that the
+# whole key stays under a megabyte in a Redis that must never fill up.
+SHOWBACK_MAX_USERS = max(1, int(os.environ.get("SHOWBACK_MAX_USERS", "1000")))
+
+# Field names inside that Hash. Every submitter's field is PREFIXED, which is
+# what makes the three reserved buckets un-collidable: a submitter who calls
+# themselves "anonymous" gets the field "u:anonymous" and cannot land on the
+# anonymous bucket by choosing a name. The identity itself is already clamped
+# to MAX_ENVELOPE_FIELD_CHARS on the way in (see the shared envelope block),
+# so a field name is bounded too.
+SHOWBACK_USER_PREFIX = "u:"
+
+# Submitted with no X-Forwarded-User at all — the ordinary AUTH_MODE=none,
+# no-proxy shape. Its own named bucket rather than an empty-string user,
+# because "explicit" means an operator reading the report sees the number
+# without having to know to look for a blank key.
+SHOWBACK_ANONYMOUS_FIELD = "anonymous"
+
+# GPU time that was really spent and is deliberately NOT billed to a
+# submitter. See SHOWBACK_TO_EXCLUDED.
+SHOWBACK_EXCLUDED_FIELD = "excluded"
+
+# Where accruals go once the field cap above is reached. Real seconds, real
+# users, no longer told apart.
+SHOWBACK_OTHER_FIELD = "other"
+
+# On the job's own state hash. hub.py's generate() writes the submitter here
+# at submit and writes NOTHING when there was no header — so "absent" is what
+# anonymous looks like, and the accrual below reads it rather than inventing a
+# second copy of the identity. Named once because three readers now depend on
+# the spelling.
+SHOWBACK_USER_FIELD = "user"
+
+# On the job's own state hash. started_at is written by the worker when the
+# job starts running and REMOVED by the accrual below, in the same atomic
+# script that reads it: it is both the clock's start and the claim on it, so
+# a job can be billed at most once however many terminal paths race for it —
+# which they do, whenever a worker's heartbeat lapses while the worker is in
+# fact alive and finishing. gpu_seconds is what it was billed, left on the
+# job so a line in the report can be traced back to the jobs behind it.
+STARTED_AT_FIELD = "started_at"
+GPU_SECONDS_FIELD = "gpu_seconds"
+
+# Where an accrual is sent, and the whole of the reaper-path decision.
+#
+#   SHOWBACK_TO_SUBMITTER  the job reached a terminal state through the
+#                          worker that was running it (worker_agent.py's
+#                          finish(), whatever the status: completed, failed
+#                          or cancelled). Both ends of the interval were
+#                          written by that worker, so the number is a
+#                          measurement and it is billed to the submitter —
+#                          or to the anonymous bucket if there was no
+#                          identity.
+#
+#   SHOWBACK_TO_EXCLUDED   the job was terminated by hub.py's reaper because
+#                          its worker's heartbeat lapsed (a SIGKILL, an OOM
+#                          kill, a node reclaim). The GPU time is real and
+#                          often the most expensive in the system, so it is
+#                          NOT dropped — but the gateway cannot know WHEN the
+#                          worker died, only when it noticed, so the interval
+#                          it can compute is inflated by up to
+#                          HEARTBEAT_TTL + REAPER_INTERVAL (~3.5 minutes on
+#                          the defaults). Billing a user for a number that is
+#                          mostly detection lag, for a job that produced
+#                          nothing, is the kind of figure an operator cannot
+#                          defend in the meeting the report exists for. It
+#                          goes to one visible line instead, where it doubles
+#                          as a cluster-health signal: excluded_gpu_seconds
+#                          climbing is workers dying while holding cards.
+#
+# A requeued job is not accrued at all: the reaper only requeues deaths that
+# happened BEFORE ComfyUI was handed the workflow (RETRYABLE_PHASES), which
+# by construction spent no GPU time, and the attempt that eventually runs
+# writes its own started_at over the old one.
+SHOWBACK_TO_SUBMITTER = "submitter"
+SHOWBACK_TO_EXCLUDED = "excluded"
+
+# One accrual, atomically: claim the job's clock, compute the interval, place
+# it in the right field of the right period's Hash, and re-arm the Hash's
+# expiry. Atomic because the claim and the increment must not be separable —
+# see STARTED_AT_FIELD above — and because "is this identity new, and is the
+# Hash full?" is a read the cap's decision is taken from.
+#
+# Returns {field, seconds} for the caller to log, or {"", "0"} when there was
+# nothing to bill: no clock on the job (it never ran, or it has already been
+# billed by whichever terminal path got there first).
+SHOWBACK_ACCRUE_LUA = """
+local state = KEYS[1]
+local bucket = KEYS[2]
+local now = tonumber(ARGV[1])
+local ttl = tonumber(ARGV[2])
+local max_users = tonumber(ARGV[3])
+local user_prefix = ARGV[4]
+local anonymous_field = ARGV[5]
+local excluded_field = ARGV[6]
+local other_field = ARGV[7]
+local destination = ARGV[8]
+local started_field = ARGV[9]
+local seconds_field = ARGV[10]
+local user_field = ARGV[11]
+local to_submitter = ARGV[12]
+
+-- The claim. HGET and HDEL in one script is what makes billing idempotent:
+-- a worker finishing a job whose heartbeat lapsed a moment earlier and the
+-- reaper failing that same job are two terminal paths racing, and exactly
+-- one of them can see a clock here.
+local started = redis.call('HGET', state, started_field)
+
+if not started then
+  return {'', '0'}
+end
+
+redis.call('HDEL', state, started_field)
+
+local began = tonumber(started)
+
+if not began then
+  return {'', '0'}
+end
+
+local seconds = now - began
+
+-- Clocks are not monotonic across two pods. A negative interval is not
+-- evidence of anything except skew, and must never be able to REDUCE a
+-- running total.
+if seconds < 0 then
+  seconds = 0
+end
+
+local field = excluded_field
+
+if destination == to_submitter then
+  local user = redis.call('HGET', state, user_field)
+
+  if user and user ~= '' then
+    field = user_prefix .. user
+  else
+    field = anonymous_field
+  end
+end
+
+-- The cap, checked only for submitter fields: the three reserved buckets are
+-- fixed in number and must always be reachable, or the overflow itself would
+-- be what stopped being recorded once the Hash filled up.
+if field ~= excluded_field and field ~= anonymous_field and field ~= other_field
+   and redis.call('HEXISTS', bucket, field) == 0
+   and redis.call('HLEN', bucket) >= max_users then
+  field = other_field
+end
+
+redis.call('HINCRBYFLOAT', bucket, field, seconds)
+
+-- NX, and on every write rather than only the first. See point 2 of the
+-- block comment above: this is what keeps a `noeviction` Redis from
+-- accumulating a Hash per month forever.
+redis.call('EXPIRE', bucket, ttl, 'NX')
+
+-- What this job was billed, left on the job itself so a report line can be
+-- traced back to the jobs behind it.
+redis.call('HSET', state, seconds_field, string.format('%.3f', seconds))
+
+return {field, string.format('%.3f', seconds)}
+"""
+
+
+def showback_period(now: float) -> str:
+    """The bucket a moment belongs to. UTC, see SHOWBACK_PERIOD_FORMAT."""
+    return time.strftime(SHOWBACK_PERIOD_FORMAT, time.gmtime(now))
+
+
+def showback_key(period: str) -> str:
+    """One Hash holds one period's whole report."""
+    return f"{SHOWBACK_KEY_PREFIX}{period}"
+
+
+def showback_ttl_seconds() -> int:
+    """How long a bucket lives from its first write. See point 2 above."""
+    return SHOWBACK_RETENTION_PERIODS * SHOWBACK_PERIOD_SECONDS
+
+
+def showback_accrue_call(state: str, destination: str,
+                         now: float | None = None) -> tuple[list, list]:
+    """
+    The keys and args for one accrual, in one place because there are three
+    call sites in two files — the worker's finish() and both of the reaper's
+    terminal paths — and an argument order remembered in three places is an
+    argument order that is wrong in one of them.
+    """
+    now = time.time() if now is None else now
+
+    return (
+        [state, showback_key(showback_period(now))],
+        [now, showback_ttl_seconds(), SHOWBACK_MAX_USERS,
+         SHOWBACK_USER_PREFIX, SHOWBACK_ANONYMOUS_FIELD,
+         SHOWBACK_EXCLUDED_FIELD, SHOWBACK_OTHER_FIELD, destination,
+         STARTED_AT_FIELD, GPU_SECONDS_FIELD, SHOWBACK_USER_FIELD,
+         SHOWBACK_TO_SUBMITTER],
+    )
+
+# END SHARED SHOWBACK
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# BEGIN QUOTA BREAKER (docs/10-roadmap.md, Q5)
+#
+# A ceiling on the GPU seconds one submitter may spend inside one showback
+# period, enforced in generate() before a job is placed on the queue. The
+# roadmap settled what this is and is not, and every line below is one of
+# those sentences:
+#
+#   1. IT IS A LOCAL QUOTA READ OUT OF Q4's ACCOUNTING, and there is no
+#      second accounting path. The number compared here is the same field
+#      SHOWBACK_ACCRUE_LUA writes and /api/showback reports — one Hash per
+#      period, one field per identity — so a user cannot be refused for
+#      seconds the report does not show, and an operator asked "why was I
+#      refused?" answers it from a URL. The alternative the roadmap rejected
+#      was an AWS budget lookup, which would put cloud credentials on the one
+#      pod docs/09 calls the entire public attack surface, to enforce a figure
+#      that lags real spend by hours.
+#
+#   2. IT FAILS OPEN, AND SAYS SO. Redis unreachable, the field missing, the
+#      value not a number, the env var not a number: every one of those
+#      proceeds with the submission. The asymmetry is the roadmap's — "a
+#      breaker that trips on an unreachable dependency halts a cluster you
+#      are already paying for, while the risk it guards against is slow". But
+#      a control that stops enforcing silently is a control that has quietly
+#      stopped existing, so every fail-open that is not simply "this
+#      submitter has spent nothing yet" prints a line naming what could not
+#      be read (see log() above). The budget alarm remains the backstop.
+#
+#   3. IT IS NOT WIRED INTO readyz(), NOT EVEN TRANSITIVELY. That endpoint is
+#      the gateway's readiness probe: a quota check inside it would take the
+#      whole gateway out of the Service the moment one submitter went over,
+#      dropping every WebSocket that is reporting an in-flight job, on a pool
+#      that is still running work. The outage would be caused by the control
+#      meant to prevent one. scripts/lint.sh holds that separation as a shape
+#      rule ("the quota breaker is not reachable from readyz()"), because it
+#      is a one-line edit to reintroduce and nothing in a test run of a
+#      healthy gateway would notice.
+#
+#   4. IT IS OFF BY DEFAULT — QUOTA_GPU_SECONDS unset, or <= 0, means every
+#      call below short-circuits before it touches Redis. A quota nobody
+#      chose is a support ticket on somebody else's cluster.
+#
+# What it does NOT do: interrupt work already queued or running. This is
+# admission control on new submissions only, which is also why the refusal
+# says so — a user who is refused still has their in-flight jobs.
+# ---------------------------------------------------------------------------
+
+# The per-submitter ceiling, in GPU seconds per showback period, from the
+# environment (.env.example, wired into the Deployment by enterprise/setup.sh).
+# Parsed tolerantly on purpose, unlike MAX_QUEUE_DEPTH's int(): this is the
+# breaker, and the posture in point 2 above applies to its own configuration
+# too. A garbled value disables it loudly rather than crash-looping the
+# gateway, which is the failure that would take the cluster out.
+QUOTA_GPU_SECONDS_RAW = os.environ.get("QUOTA_GPU_SECONDS", "0")
+
+try:
+    QUOTA_GPU_SECONDS = float(QUOTA_GPU_SECONDS_RAW)
+except (TypeError, ValueError):
+    log(f"QUOTA_GPU_SECONDS={QUOTA_GPU_SECONDS_RAW!r} is not a number — the "
+        f"GPU-second quota breaker is OFF and no submission will be refused "
+        f"for quota (docs/10-roadmap.md, Q5)")
+    QUOTA_GPU_SECONDS = 0.0
+
+# How the refusal reads a period's end, for humans: the count restarts when
+# the period does, and the period is a UTC calendar month (see
+# SHOWBACK_PERIOD_FORMAT).
+QUOTA_RESET_FORMAT = "%Y-%m-%d %H:%M UTC"
+
+
+def quota_enabled() -> bool:
+    """Off unless somebody chose a positive ceiling. See point 4 above."""
+    return QUOTA_GPU_SECONDS > 0
+
+
+def quota_field(user: str) -> str:
+    """
+    The field in the period's Hash that holds THIS submitter's seconds.
+
+    It has to name the same field the accrual writes, or the breaker would
+    enforce against a number nobody accrues into: SHOWBACK_ACCRUE_LUA reads
+    the submitter off the job's state hash — which generate() writes from this
+    same X-Forwarded-User header — and prefixes it, or sends it to the
+    anonymous bucket when there was no header at all.
+
+    Anonymous submissions are therefore counted against the shared anonymous
+    bucket rather than exempted. Under AUTH_MODE=none that makes the quota a
+    single pool for every caller without a header, which is the honest reading
+    of "the header is client-supplied": exempting the no-header case would
+    turn the breaker off for exactly the deployment shape where anyone with
+    the URL can spend the GPU budget. It is not a security control either way
+    — varying a header buys a fresh quota — it is a cost guardrail, and the
+    identity it uses is the identity the report uses.
+    """
+    return f"{SHOWBACK_USER_PREFIX}{user}" if user else SHOWBACK_ANONYMOUS_FIELD
+
+
+def quota_period_reset(now: float) -> float:
+    """
+    When the count restarts: 00:00 UTC on the first of the next calendar
+    month, because the bucket read below is named from showback_period(now)
+    and the next period is a different, empty Hash.
+
+    Not a rolling window and not the Hash's TTL (which spans several periods
+    — see showback_ttl_seconds()). A refusal that quoted the TTL would tell
+    the user to come back months after their quota had in fact reset.
+    """
+    moment = time.gmtime(now)
+    year = moment.tm_year + (1 if moment.tm_mon == 12 else 0)
+    month = 1 if moment.tm_mon == 12 else moment.tm_mon + 1
+
+    return float(calendar.timegm((year, month, 1, 0, 0, 0, 0, 1, 0)))
+
+
+def quota_refusal_text(used: float, now: float) -> str:
+    """
+    What the caller is told. Three things, because "rejected" with no reason
+    is a support ticket: what happened, what the numbers were, and when it
+    resets — plus where to read the usage it was decided from.
+    """
+    return (f"GPU-second quota exhausted: {used:.1f} of {QUOTA_GPU_SECONDS:.1f} "
+            f"GPU seconds used in period {showback_period(now)}. This quota is "
+            f"per user, so other submitters are unaffected, and jobs you have "
+            f"already queued keep running. It resets at "
+            f"{time.strftime(QUOTA_RESET_FORMAT, time.gmtime(quota_period_reset(now)))}, "
+            f"when the next period begins. GET /api/showback for the usage "
+            f"this was decided from.")
+
+
+async def quota_gpu_seconds_used(conn: redis.Redis, user: str,
+                                 now: float) -> float | None:
+    """
+    This submitter's accrued GPU seconds in the current period, or None when
+    the answer is not knowable — Redis unreachable, or a value that is not a
+    number. None means FAIL OPEN, and every None here is logged.
+
+    A field that is simply ABSENT is 0.0 rather than None: a submitter who has
+    not spent anything this period is not an unreadable submitter, and logging
+    every first-ever submission as a fail-open would bury the lines that
+    matter under the ordinary case.
+
+    Tolerant parsing rather than a bare float() for the same reason
+    showback_report() is tolerant on the read side ("a value that is not a
+    number is skipped") — the breaker must not be stricter about Q4's data
+    than Q4 is.
+    """
+    key = showback_key(showback_period(now))
+    field = quota_field(user)
+
+    try:
+        raw = await conn.hget(key, field)
+    except Exception as exc:  # noqa: BLE001
+        log(f"QUOTA FAILING OPEN: could not read {key} field {field!r} "
+            f"({exc!r}). This submission is NOT being checked against the "
+            f"{QUOTA_GPU_SECONDS:.1f}s quota.")
+        return None
+
+    if raw is None:
+        return 0.0
+
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log(f"QUOTA FAILING OPEN: {key} field {field!r} holds {raw!r}, which "
+            f"is not a number. This submission is NOT being checked against "
+            f"the {QUOTA_GPU_SECONDS:.1f}s quota.")
+        return None
+
+
+async def quota_refusal(conn: redis.Redis, user: str) -> str | None:
+    """
+    The message to refuse this submitter with, or None to let the submission
+    through — which includes every case where the quota could not be decided.
+
+    ONE CALLER, generate(), and deliberately: the readiness probe must never
+    reach this. See point 3 above and the shape rule in scripts/lint.sh.
+    """
+    if not quota_enabled():
+        return None
+
+    now = time.time()
+    used = await quota_gpu_seconds_used(conn, user, now)
+
+    if used is None or used < QUOTA_GPU_SECONDS:
+        return None
+
+    return quota_refusal_text(used, now)
+
+
+def quota_headers(now: float | None = None) -> dict:
+    """
+    Retry-After on the refusal, in seconds, so a client that retries on a 429
+    does not do it every second until the month turns over. The same instant
+    the message names, in the form the HTTP spec defines.
+    """
+    now = time.time() if now is None else now
+
+    return {"Retry-After": str(max(1, int(quota_period_reset(now) - now)))}
+
+# END QUOTA BREAKER
 # ---------------------------------------------------------------------------
 
 
@@ -687,9 +1210,53 @@ async def arm_state_ttl(conn: redis.Redis, job_id: str) -> None:
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL, nx=True)
 
 
+_showback_script = None
+
+
+def showback_script():
+    """The accrual script, registered lazily against the shared connection —
+    the same cheap, cached pattern as fair_enqueue_script() above."""
+    global _showback_script
+
+    if _showback_script is None:
+        _showback_script = client().register_script(SHOWBACK_ACCRUE_LUA)
+
+    return _showback_script
+
+
+async def record_gpu_seconds(conn: redis.Redis, job_id: str, destination: str) -> None:
+    """
+    Bill a job's held-GPU time from the REAPER's side — see BEGIN SHARED
+    SHOWBACK for what a GPU second means and why this side's accruals go to
+    the excluded bucket rather than to the submitter.
+
+    This is the half an implementation that only instruments the worker
+    silently drops, and it is the expensive half: a worker that was SIGKILLed
+    mid-generation held a card for everything up to that moment, and
+    fail_orphaned_job()/cancel_orphaned_job() below are the only code that
+    ever learns those jobs ended. worker_agent.py's finish() is never called
+    for them at all.
+
+    Never allowed to fail a reap. A stranded job that is not marked terminal
+    is a browser on a progress bar that never moves; a missing line in a
+    monthly total is a missing line in a monthly total.
+    """
+    keys, args = showback_accrue_call(state_key(job_id), destination)
+
+    try:
+        await showback_script()(keys=keys, args=args)
+    except Exception:  # noqa: BLE001 - the reap must complete regardless
+        pass
+
+
 async def fail_orphaned_job(conn: redis.Redis, job_id: str, error: str) -> None:
     """Terminal. This is the last write on the job, so the TTL is re-armed
     outright rather than NX'd: there is nothing left to compound it."""
+    # Before the status, for the same reason as in worker_agent.py's finish():
+    # the job's clock is on this same hash and a reader must never be able to
+    # see the terminal status without the accounting that goes with it.
+    await record_gpu_seconds(conn, job_id, SHOWBACK_TO_EXCLUDED)
+
     await conn.hset(state_key(job_id), mapping={"status": "failed"})
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
@@ -718,6 +1285,11 @@ async def cancel_orphaned_job(conn: redis.Redis, job_id: str) -> None:
     that is what actually happened to it and what the user asked for — and it
     is equally terminal, so a tailing browser stops here either way.
     """
+    # Same as fail_orphaned_job(): the worker died holding the card, and how
+    # long it held it before dying is not something this side can measure
+    # honestly. See BEGIN SHARED SHOWBACK, SHOWBACK_TO_EXCLUDED.
+    await record_gpu_seconds(conn, job_id, SHOWBACK_TO_EXCLUDED)
+
     await conn.hset(state_key(job_id), mapping={"status": "cancelled"})
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
@@ -959,8 +1531,6 @@ async def generate(request: Request):
     if depth >= MAX_QUEUE_DEPTH:
         raise HTTPException(503, f"queue is full ({depth} jobs). Try again shortly.")
 
-    job_id = str(uuid.uuid4())
-
     # Who spent the GPU, and — since Q1 — whose fair-queueing lane this job
     # belongs to. oauth-proxy sets X-Forwarded-User for the authenticated user
     # (its pass-user-headers default); recording it answers "whose job is
@@ -971,6 +1541,29 @@ async def generate(request: Request):
     # all going to run regardless, and claiming someone else's identity only
     # shares their slots. See BEGIN FAIR QUEUEING above.
     user = request.headers.get("x-forwarded-user", "")
+
+    # Q5's quota breaker, and the only place it is consulted. 429 rather than
+    # the 503 above, because this is one caller's ceiling and not the pool's:
+    # a second submitter is unaffected, and a client that treats 503 as "the
+    # service is down" would be told the wrong thing.
+    #
+    # HERE, before the job_id exists and before anything is written, because
+    # the only refusal worth having is one that leaves nothing behind. A check
+    # placed after fair_enqueue_call() would answer the browser with a
+    # rejection while a worker spent a GPU on the job anyway — worse than no
+    # breaker, since the user is told nothing ran. enterprise/test/
+    # check-95-quota-breaker.py asserts exactly that, by counting the writes
+    # to comfy:queue rather than by reading the response.
+    #
+    # quota_refusal() returns None whenever the answer is not knowable, so
+    # every failure of this read is a submission that proceeds. See
+    # BEGIN QUOTA BREAKER.
+    refusal = await quota_refusal(conn, user)
+
+    if refusal:
+        raise HTTPException(429, refusal, headers=quota_headers())
+
+    job_id = str(uuid.uuid4())
 
     # The envelope, not a hand-rolled dict: every reserved field is written
     # here with its default, so the worker never has to ask whether a key is
@@ -1204,6 +1797,55 @@ async def readyz():
     return {"ok": True}
 
 
+async def estimated_wait_seconds(conn: redis.Redis) -> float | None:
+    """
+    Q6 (docs/10-roadmap.md) — how long has the job about to be served already
+    been waiting, derived from the `submitted_at` F2 already reserved on the
+    envelope. No second time field, no service-time model.
+
+    Which entry: LMOVE pops `src="RIGHT"` (worker_agent.py's BLMOVE), so the
+    tail — index -1 — is always the entry served next, whatever fair queueing
+    (BEGIN FAIR QUEUEING above) did to the rest of the list. Its age is the
+    queue-side latency a caller submitting right now would be waiting behind,
+    the same "age of the oldest thing in line" a queueing system reports when
+    it has no per-item service-time estimate to build a forecast from (the SQS
+    ApproximateAgeOfOldestMessage shape) — a fact read off one entry, not a
+    depth-based guess.
+
+    An empty queue reads as LINDEX returning None: 0.0, not "unknown" — there
+    is nothing to be waiting on. A malformed or pre-F2 entry (no
+    `submitted_at` at all) reads as None — "unknown" — rather than a
+    fabricated 0, the same "absence is a distinct value from zero" rule
+    check-80's `gauge_value()` relies on.
+
+    Scale-to-zero (`workers_registered == 0`) is the case the roadmap item
+    calls out by name, and it is deliberately NOT special-cased into
+    "unknown" here: unlike a depth × average-service-time forecast — which has
+    no service-time sample to build from when nothing has ever finished, and
+    would be a genuinely fabricated number at zero workers — this is a
+    directly measured elapsed time that stays true, and keeps growing, with
+    no worker running at all. Making it absent at zero workers would blind the
+    one signal I4's Prometheus scaler needs in order to scale the pool up FROM
+    zero in the first place (see docs/10-roadmap.md's deferred_to_cluster note
+    for I4's trigger contract) — the exact case an "honest unknown" would be
+    most tempting, and least affordable, to report.
+    """
+    raw = await conn.lindex(QUEUE_KEY, -1)
+
+    if raw is None:
+        return 0.0
+
+    try:
+        submitted_at = json.loads(raw).get("submitted_at")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None
+
+    if isinstance(submitted_at, bool) or not isinstance(submitted_at, (int, float)):
+        return None
+
+    return max(0.0, time.time() - submitted_at)
+
+
 async def gather_stats() -> dict:
     conn = client()
 
@@ -1217,6 +1859,7 @@ async def gather_stats() -> dict:
     return {
         "queue_depth": await conn.llen(QUEUE_KEY),
         "workers_registered": workers,
+        "estimated_wait_seconds": await estimated_wait_seconds(conn),
     }
 
 
@@ -1225,17 +1868,145 @@ async def stats():
     return await gather_stats()
 
 
+# ---------------------------------------------------------------------------
+# Showback — who spent the card (docs/10-roadmap.md, Q4)
+#
+# The report side of the accumulator defined in BEGIN SHARED SHOWBACK, which
+# is where the definition of a GPU second, what it over-counts, the reaper
+# decision and the three key-space bounds all live. This end only reads.
+#
+# Deliberately NOT a Prometheus gauge beside comfy_queue_depth. A per-user
+# series is one label value per submitter, the submitter is an
+# X-Forwarded-User header that is client-supplied under AUTH_MODE=none, and
+# unbounded label cardinality is how a monitoring stack is taken down from
+# outside. The Redis-side cap bounds this report; nothing bounds a metric's
+# label set once it has been scraped. `/metrics` therefore keeps its three
+# pool-level gauges and this stays a JSON read.
+# ---------------------------------------------------------------------------
+
+# What a caller may name as a period. The read below is an HGETALL of one
+# exact key rather than a pattern match, so this is not what stands between a
+# caller and somebody else's keys — but a 400 is a more useful answer than an
+# empty report for a period that could never have existed.
+SHOWBACK_PERIOD_PATTERN = re.compile(r"^\d{4}-\d{2}$")
+
+
+async def showback_report(period: str) -> dict:
+    """
+    One period's whole report, read out of the single Hash that holds it.
+
+    Tolerant of anything unexpected in that Hash rather than strict: a field
+    this version does not recognise, or a value that is not a number, is
+    skipped. A monthly report is read by a person who wants a number today,
+    and a newer gateway's extra field is not a reason to give them a 500.
+    """
+    conn = client()
+
+    totals = await conn.hgetall(showback_key(period))
+
+    users = {}
+    buckets = {SHOWBACK_ANONYMOUS_FIELD: 0.0,
+               SHOWBACK_EXCLUDED_FIELD: 0.0,
+               SHOWBACK_OTHER_FIELD: 0.0}
+
+    for field, value in (totals or {}).items():
+        try:
+            # Rounded because HINCRBYFLOAT accumulates binary float error over
+            # thousands of jobs and a report showing 41.30000000000001 seconds
+            # invites the reader to distrust the whole column. Milliseconds is
+            # already far finer than anything this measures.
+            seconds = round(float(value), 3)
+        except (TypeError, ValueError):
+            continue
+
+        if field.startswith(SHOWBACK_USER_PREFIX):
+            users[field[len(SHOWBACK_USER_PREFIX):]] = seconds
+        elif field in buckets:
+            buckets[field] = seconds
+
+    # Which periods are still in Redis at all. Cheap — the key space is
+    # bounded to SHOWBACK_RETENTION_PERIODS by construction — and it is the
+    # thing an operator actually needs to know before a teardown, since the
+    # answer after `make down` is "none": see this endpoint's docstring.
+    periods = []
+
+    async for key in conn.scan_iter(match=f"{SHOWBACK_KEY_PREFIX}*"):
+        periods.append(key[len(SHOWBACK_KEY_PREFIX):])
+
+    return {
+        "period": period,
+        "users": users,
+        "anonymous_gpu_seconds": buckets[SHOWBACK_ANONYMOUS_FIELD],
+        "excluded_gpu_seconds": buckets[SHOWBACK_EXCLUDED_FIELD],
+        "other_gpu_seconds": buckets[SHOWBACK_OTHER_FIELD],
+        # True once the identity cap has sent at least one submitter's seconds
+        # into the shared overflow field. Reported rather than hidden: a
+        # truncated report that does not say so is a wrong report.
+        "truncated": buckets[SHOWBACK_OTHER_FIELD] > 0,
+        "periods_available": sorted(periods),
+    }
+
+
+@app.get("/api/showback")
+async def showback(period: str | None = None):
+    """
+    Who spent the card this period, in GPU seconds.
+
+        {"period": "2026-08",
+         "users": {"alice@example.com": 4102.5, ...},
+         "anonymous_gpu_seconds": 0.0,
+         "excluded_gpu_seconds": 0.0,
+         "other_gpu_seconds": 0.0,
+         "truncated": false,
+         "periods_available": ["2026-06", "2026-07", "2026-08"]}
+
+    `period` is a UTC calendar month, defaulting to the current one. A GPU
+    second is one second for which a worker held the card on that job — see
+    BEGIN SHARED SHOWBACK for the full definition, including what it
+    deliberately over-counts. `excluded_gpu_seconds` is time that was really
+    spent but is not billed to anybody, and `other_gpu_seconds` is time from
+    submitters past the identity cap; the two exist so that there is no
+    fourth, silent possibility.
+
+    THIS DOES NOT SURVIVE `make down`. The accumulator is in Redis, Redis's
+    PVC is gp3 (`enterprise/manifests/00-redis.yaml`), and gp3 dies with the
+    cluster — so on the nightly-teardown habit docs/09 recommends as the
+    default, "last month's report" is gone every morning. Capture it before
+    the teardown rather than discovering this on the 1st:
+
+        oc exec deploy/comfy-gateway -c gateway -- \\
+            curl -s localhost:8000/api/showback > showback-$(date -u +%Y-%m).json
+
+    `make park` is safe — the cluster stays and so does the volume. See
+    docs/09-engineering-handoff.md section 5.
+
+    Reads are not caller-scoped, deliberately and on the same terms as Q3's
+    output workspaces: under AUTH_MODE=oauth the whole gateway is behind the
+    proxy, and under AUTH_MODE=none the identity this would scope by is a
+    header the caller sets on themselves, so a guarantee that evaporates in
+    one of the two modes is worse than a documented absence. What this exposes
+    beyond /api/jobs/<id> is the LIST of submitters, which is why it is a
+    report an operator reads rather than something linked from the UI.
+    """
+    period = period or showback_period(time.time())
+
+    if not SHOWBACK_PERIOD_PATTERN.match(period):
+        raise HTTPException(400, "period must be a UTC calendar month, e.g. 2026-08")
+
+    return await showback_report(period)
+
+
 @app.get("/metrics", response_class=PlainTextResponse)
 async def metrics():
     """
-    Prometheus text format, hand-rolled — two gauges do not justify a client
+    Prometheus text format, hand-rolled — three gauges do not justify a client
     library dependency. OpenShift's user-workload monitoring scrapes this via
     the ServiceMonitor enterprise/setup.sh applies, which is what makes
     "queue deeper than N for 30 minutes" an alert instead of a support ticket.
     """
     data = await gather_stats()
 
-    return (
+    text = (
         "# HELP comfy_queue_depth Jobs waiting in the Redis queue.\n"
         "# TYPE comfy_queue_depth gauge\n"
         f"comfy_queue_depth {data['queue_depth']}\n"
@@ -1243,6 +2014,23 @@ async def metrics():
         "# TYPE comfy_workers_registered gauge\n"
         f"comfy_workers_registered {data['workers_registered']}\n"
     )
+
+    # Absent, not zero, when estimated_wait_seconds() could not read a real
+    # submitted_at off the next entry to serve (see its docstring) — an
+    # omitted sample is Prometheus's own way of saying "no data" instead of
+    # a fabricated number a dashboard would plot as if it meant something.
+    wait = data["estimated_wait_seconds"]
+
+    if wait is not None:
+        text += (
+            "# HELP comfy_estimated_wait_seconds Age of the queue entry "
+            "served next, i.e. how long a job submitted right now would "
+            "wait behind it.\n"
+            "# TYPE comfy_estimated_wait_seconds gauge\n"
+            f"comfy_estimated_wait_seconds {wait:.3f}\n"
+        )
+
+    return text
 
 
 @app.get("/", response_class=HTMLResponse)
