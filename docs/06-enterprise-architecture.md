@@ -319,8 +319,10 @@ format rather than behind a button in a shared UI.
   Two things follow. The retry is announced as a non-terminal `retry` event, so
   a browser tailing the job reads past it into the second attempt rather than
   stopping; and the attempt counter is a Redis `HINCRBY` whose return value the
-  decision is taken from, because the gateway runs two replicas and "RPOP is
-  atomic" bounds failing a job once without bounding requeueing it once. What
+  decision is taken from, because the gateway runs two replicas and the
+  reaper's per-entry claim — which is what a stranded entry is handed to
+  exactly one reaper by, now that the entry is read rather than popped —
+  bounds failing a job once without bounding requeueing it once. What
   is still deliberately absent is retry as a general policy — nothing retries a
   workflow that has been anywhere near a GPU. The ambiguity that argument rests
   on is also no longer total for the *operator*: since the worker is sized

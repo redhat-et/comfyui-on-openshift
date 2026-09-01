@@ -514,8 +514,10 @@ log "the retry counter moves only by HINCRBY (docs/10-roadmap.md, Q2)"
 # cannot reach: enterprise/test/run.sh starts ONE gateway, and
 # enterprise/manifests/01-gateway.yaml runs two, each with its own reaper.
 #
-# "RPOP is atomic, so two reapers each take different entries" is what bounds
-# FAILING a stranded job to once. It does not bound REQUEUEING one to once: a
+# "only one reaper can be holding a given entry" is what bounds FAILING a
+# stranded job to once — RPOP's atomicity once, and since the reap stopped
+# destroying the entry it was reaping, the per-entry claim in
+# reap_processing_list(). It does not bound REQUEUEING one to once: a
 # requeued job goes back on the queue, is picked up by another worker, and can
 # be stranded a second time — a different entry, a different processing list,
 # quite possibly the other replica's reaper. "Is this the first attempt?" is

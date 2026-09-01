@@ -139,6 +139,26 @@ event stream via `XRANGE`) and is read only after the system has gone idle: on
 a broken implementation the second run starts *after* the terminal event a
 browser stops at, so counting at the terminal event reads 1 either way.
 
+**A reap that fails leaves the job recoverable, and is bounded**
+(`check-37-reap-durability.py`). The reaper is the only code that ever writes a
+terminal event for a job whose worker died, and its loop used to `RPOP`: the
+entry left the processing list *before* the reap ran, so a reap that raised
+anywhere in its body destroyed the only record that the job existed, and the
+`except Exception: pass` above it promised a next tick that had nothing left to
+retry. The check fabricates a stranded entry rather than killing anything —
+what is under test is the reaper's own bookkeeping, not any particular way of
+dying — and injects exactly one fault per scenario. Scenario A replaces the
+job's event stream with a plain string so the terminal `XADD` raises
+`WRONGTYPE`, asserts the reap failed *at that write and nowhere earlier* (the
+terminal status is already on the hash, the stream is still a string), asserts
+the entry is still on the processing list, then lifts the fault and requires
+one terminal event on a later tick. Scenario B replaces the job's state hash
+with a string, so every reap of that entry raises on its first write forever:
+it must be given up on after a bounded number of attempts — more than one, or
+scenario A could never recover either — and set aside on the capped, expiring
+`comfy:reap:undeliverable` list rather than destroyed. Every count comes from
+an observer armed before the reaper could act.
+
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
 
