@@ -12,6 +12,13 @@ on:
     - cron: "0 7 * * *"   # 07:00 UTC daily
   workflow_dispatch: {}
 
+# No concurrency group here (unlike ci.yaml): this runs once a day plus the
+# occasional manual workflow_dispatch, never stacks up behind a fast-moving
+# PR branch, and cancelling a scheduled run because someone dispatched one by
+# hand would be a surprising way to lose a night's coverage.
+permissions:
+  contents: read
+
 jobs:
   # Same proof as ci.yaml's image-uid job, on the image that job's own comment
   # says is "too large for per-PR builds" — the GPU image. --cpu forces boot
@@ -20,6 +27,7 @@ jobs:
   # write its own cache under the arbitrary UID before it ever gets to /.
   gpu-image-uid:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +63,7 @@ jobs:
   # block the UID proof, and so either can be re-run independently.
   gpu-image-scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 

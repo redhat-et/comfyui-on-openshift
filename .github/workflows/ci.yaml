@@ -1,8 +1,10 @@
 # The checks CONTRIBUTING.md asks for, enforced instead of trusted.
 #
-# Both jobs delegate to the same make targets a contributor runs locally
-# (`make lint`, `make test`), so the local and CI invocations cannot drift —
-# the logic lives in scripts/lint.sh and enterprise/test/run.sh.
+# The lint and e2e jobs delegate to the same make targets a contributor runs
+# locally (`make lint`, `make test`), so the local and CI invocations cannot
+# drift — the logic lives in scripts/lint.sh and enterprise/test/run.sh. Two
+# more jobs (comfyui-smoke, image-uid) cover things a laptop `make` run does
+# not: the real pinned ComfyUI booting, and arbitrary-UID compatibility.
 name: ci
 
 on:
@@ -10,9 +12,23 @@ on:
     branches: [master]
   pull_request:
 
+# A new push to the same PR (or branch) supersedes the in-flight run instead
+# of queueing behind it — these jobs build Docker images and are not free,
+# and only the latest commit's result matters for a PR check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default GITHUB_TOKEN scope on pull_request is otherwise whatever the org
+# default is (can be write); none of these jobs need more than reading the
+# repo.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +43,7 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +66,7 @@ jobs:
   # <base>/custom_nodes) and the assertions fail besides.
   comfyui-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -68,6 +86,7 @@ jobs:
   # chgrp/chmod section reviewers guard in the Containerfiles.)
   image-uid:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
