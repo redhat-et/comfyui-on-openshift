@@ -71,6 +71,75 @@ designer needs a GPU for a small fraction of their working day, so ten designers
 do not need ten GPUs. They need one pool, a queue, and a card that turns off in
 between.
 
+## One GPU, ten people
+
+The sharpest number here, using this repo's own rates.
+
+A `g6.xlarge` worker node is **$0.976/hour all-in** — $0.805 to AWS for the
+card, $0.171 to Red Hat for its vCPUs. A pod per person means a card per
+person, because a GPU is indivisible under Kubernetes:
+
+| Ten users | GPU line, per month |
+|---|---:|
+| A pod per person, running | ~$7,100 |
+| One autoscaled pool, ~4 GPU-hours/day of real generation | ~$120 |
+
+That second row assumes about **0.4 GPU-hours per person per day** — roughly a
+dozen two-minute generations each. A designer iterating hard is closer to 1.3,
+which is three times the GPU line and still nowhere near a card each. The
+assumption is stated because it drives the number.
+
+That is not a discount, it is a structural consequence of separating the thing
+users touch from the thing that costs money. The ratio moves with your
+utilization; the direction does not.
+
+## The numbers, briefly
+
+The smallest useful cluster — one ComfyUI pod on an L4, us-east-2, on-demand:
+
+| State | $/hour | Getting back |
+|---|---:|---|
+| Running | ~2.04 | — |
+| GPU parked (`make park`) | ~1.06 | ~5 min |
+| Cluster torn down (`make down`) | ~0.05 | ~15 min |
+
+```mermaid
+stateDiagram-v2
+    Running: Running · ~$2.04/hr
+    Parked: GPU parked · ~$1.06/hr
+    Down: Cluster deleted · ~$0.05/hr
+    Gone: Everything deleted · $0
+
+    [*] --> Running: make up
+    Running --> Parked: make park
+    Parked --> Running: back in ~5 min
+    Running --> Down: make down
+    Down --> Running: back in ~15 min
+    Down --> Gone: make destroy
+```
+
+| Habit | Monthly |
+|---|---:|
+| Left running 24/7 | ~$1,490 |
+| Weekdays 9–6, `make park` nightly | ~$800 |
+| Weekdays 9–6, `make down` nightly | ~$370 |
+| Up one day a week | ~$85 |
+
+**A single cron line is a 75% cut.** Not a migration and not a rewrite — a
+scheduled `make down` and a Monday-morning `make up`, with models on EFS or S3
+so the rebuild costs nothing but time you were asleep for. Three things to do
+about cost:
+
+1. **`make account` first.** A new AWS account has a GPU quota of exactly
+   zero, and the increase is the one step with a lead time measured in days.
+2. **Set `BUDGET_ALERT_EMAIL` in `.env`.** The budget alarm is free and it is
+   the guardrail between you and a four-figure surprise.
+3. **Park at lunch, down overnight.** `make park` and `make down` — and
+   `docs/02-cost.md` has crontab lines that make the habit automatic.
+
+The full accounting — every fee, the monthly patterns, and where money leaks
+— is in `docs/02-cost.md`.
+
 ## How it fits together
 
 One pod and one GPU for a single person. For a team, a FastAPI gateway on cheap
@@ -418,70 +487,6 @@ flowchart TD
 
 </details>
 
-## One GPU, ten people
-
-The sharpest number here, using this repo's own rates.
-
-A `g6.xlarge` worker node is **$0.976/hour all-in** — $0.805 to AWS for the
-card, $0.171 to Red Hat for its vCPUs. A pod per person means a card per
-person, because a GPU is indivisible under Kubernetes:
-
-| Ten users | GPU line, per month |
-|---|---:|
-| A pod per person, running | ~$7,100 |
-| One autoscaled pool, ~4 GPU-hours/day of real generation | ~$120 |
-
-That is not a discount, it is a structural consequence of separating the thing
-users touch from the thing that costs money. The ratio moves with your
-utilization; the direction does not.
-
-## The numbers, briefly
-
-The smallest useful cluster — one ComfyUI pod on an L4, us-east-2, on-demand:
-
-| State | $/hour | Getting back |
-|---|---:|---|
-| Running | ~2.04 | — |
-| GPU parked (`make park`) | ~1.06 | ~5 min |
-| Cluster torn down (`make down`) | ~0.05 | ~15 min |
-
-```mermaid
-stateDiagram-v2
-    Running: Running · ~$2.04/hr
-    Parked: GPU parked · ~$1.06/hr
-    Down: Cluster deleted · ~$0.05/hr
-    Gone: Everything deleted · $0
-
-    [*] --> Running: make up
-    Running --> Parked: make park
-    Parked --> Running: back in ~5 min
-    Running --> Down: make down
-    Down --> Running: back in ~15 min
-    Down --> Gone: make destroy
-```
-
-| Habit | Monthly |
-|---|---:|
-| Left running 24/7 | ~$1,490 |
-| Weekdays 9–6, `make park` nightly | ~$800 |
-| Weekdays 9–6, `make down` nightly | ~$370 |
-| Up one day a week | ~$85 |
-
-**A single cron line is a 75% cut.** Not a migration and not a rewrite — a
-scheduled `make down` and a Monday-morning `make up`, with models on EFS or S3
-so the rebuild costs nothing but time you were asleep for. Three things to do
-about cost:
-
-1. **`make account` first.** A new AWS account has a GPU quota of exactly
-   zero, and the increase is the one step with a lead time measured in days.
-2. **Set `BUDGET_ALERT_EMAIL` in `.env`.** The budget alarm is free and it is
-   the guardrail between you and a four-figure surprise.
-3. **Park at lunch, down overnight.** `make park` and `make down` — and
-   `docs/02-cost.md` has crontab lines that make the habit automatic.
-
-The full accounting — every fee, the monthly patterns, and where money leaks
-— is in `docs/02-cost.md`.
-
 ## Where this loses, and what to do about it
 
 Both boundaries are narrow, both are priced, and both have a flag that changes
@@ -587,9 +592,107 @@ warm resident GPU and suffers under scale-to-zero; this workload is bursty and
 depends on it. They also draw on the same GPU quota, which is the constraint
 that bites first — `make preflight` checks it, and it is a multi-day fix.
 
+## How far this scales
+
+Roughly a hundred designers on the architecture as it stands, and the limit is
+not the one people expect.
+
+The economics are worth stating first, because they run backwards from the
+intuition: **this is expensive per person for a small team and cheap for a large
+one.** The cluster floor — control plane, base workers, NAT gateway — is about
+$1.06/hour whether one person uses it or a hundred. Across five designers that
+is over $150 each per month before a single image is generated; across a hundred
+it is under $8. If your team is small, the honest comparison is not against
+dedicated cloud GPUs, it is against the workstations they already have.
+
+### Why it is cheap, which is not the reason people assume
+
+Not "we remember to turn the cluster off". A designer needs a GPU for roughly
+**14% of their working day** — call it 1.3 GPU-hours out of nine. Finding a
+template, chasing the models it wants, wiring the graph and fixing what it
+reports back is the other 86%, and none of it touches a card. The inference is
+a couple of minutes at the end of a long setup.
+
+So a dedicated GPU sits idle about **six of every seven working hours**, not
+through carelessness but because that is the shape of the work. Splitting the
+saving for thirty designers, GPU line only:
+
+| Arrangement | Card-hours/month | |
+|---|---:|---|
+| A card each, running 24/7 | 21,900 | — |
+| A card each, off outside work hours | 5,940 | **3.7×** — just turning it off |
+| Pooled, scaling with demand | 1,257 | **4.7× more** — recovering the setup time |
+
+The first factor is not architectural: anyone disciplined enough to shut
+instances down nightly gets it without a cluster. The second is, and it is the
+one worth defending. **The queue does not create a saving; it converts one
+person's setup time into another person's inference capacity.** You can turn a
+card off overnight. You cannot turn it off for the forty minutes somebody
+spends wiring a graph and have it back the instant they press run — not without
+a pool and a queue.
+
+That also explains the `SCALE_TO_ZERO`, `cooldownPeriod` and warm-worker knobs:
+each is a decision about how much of that recovered idleness to hand back in
+exchange for latency.
+
+**The bottleneck is storage, not GPUs.** Every cold worker reads a 7 GB
+checkpoint over NFS, and a pool that scales means "this node does not have that
+model yet" is the normal case rather than the exception. More designers means
+more distinct models, which means more first-loads. The queue, the gateway, the
+reaper and the security model are all nowhere near their limits.
+
+The reason is a design detail worth naming: **models and outputs have opposite
+requirements and share one volume.** Models are read-only, huge, identical
+across pods, and perfectly cacheable — a per-node copy is ideal. Outputs are
+written by one pod and read by another, which is the *only* reason this design
+requires `ReadWriteMany`. EFS exists to solve outputs; models were put on it
+because it was already there.
+
+### Five changes, cheapest first
+
+1. **Bake the hot model set into the worker image.** If five checkpoints cover
+   most jobs, ship them in the image — the node pulls it anyway, so the
+   container runtime becomes the cache. A day's work, and the right thing to
+   price before building anything cleverer.
+2. **Managed multi-AZ Redis.** Redis is the queue, the progress log and the job
+   state, currently one pod that survives a restart but not a zone. ElastiCache
+   removes that single point of failure with no application change at all —
+   same protocol. The highest ratio of risk removed to work done here.
+3. **Outputs to S3, with presigned URLs.** Workers write results straight to
+   object storage and the gateway returns a URL rather than serving bytes off a
+   mount. This is the one that removes the `ReadWriteMany` requirement outright.
+4. **Models to S3, hot copies on node-local NVMe — then group them.** Stage on
+   first use so every later load is local. Then cache hit rate becomes a
+   placement problem: group models by family, give each family a machine pool,
+   pre-warm it, route by declared model. Blocked on a real unknown — ROSA HCP
+   exposes no MachineSet, so how instance store is attached at all is
+   unanswered. That is the spike in `docs/10-roadmap.md`.
+5. **Kueue for scheduling, MIG on the big cards.** The fair-queueing here is
+   correct and measured, and it is also a small scheduler written by hand;
+   Kueue is the Kubernetes-native one, with quota-aware queueing and fair
+   sharing across teams. And on A100/H100 — unlike L4 — MIG partitions a card
+   in hardware with genuinely isolated memory, which is the property
+   time-slicing lacks and the reason time-slicing is rejected above. Only worth
+   it at hundreds of GPUs.
+
+With those, this design reaches several hundred designers and low hundreds of
+GPUs without a rewrite; the shape stays the same. Past that it is multi-cluster
+with a federated queue, and the hard problems stop being technical.
+
+### One thing to know about the big cards
+
+You cannot buy three H100s. AWS sells them as `p5.48xlarge` — eight of them,
+192 vCPU, one node — so the smallest unit you can scale to is eight, the ROSA
+service fee alone is about $8.21/hour on that node before EC2, and the worker
+sizing in `enterprise/manifests/02-worker.yaml` is calibrated for a 4-vCPU
+16 GiB machine and would need rework. Going up the range is a decision about
+VRAM, not throughput: it buys the workflows that do not fit at all. If the queue
+is simply long, two L4s beat one L40S at about the same price.
+
 ## Ideas worth doing next
 
-Ordered by payoff per unit of work. Four have landed, along with three
+Ordered by payoff per unit of work. Five have landed, and half of a sixth,
+along with three
 foundation items that were never on this list — worker resource sizing, a
 versioned queue payload, and test-harness discovery. **Struck items stay here:
 shipped ones because a roadmap that never visibly moves is a wish list, and
