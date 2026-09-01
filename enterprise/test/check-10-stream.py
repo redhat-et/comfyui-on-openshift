@@ -63,8 +63,46 @@ progress = [e for e in events if e["type"] == "progress"]
 check("progress was filtered by prompt_id (no foreign events)",
       all(e["data"].get("prompt_id") != "other-prompt" for e in progress),
       [e["data"].get("prompt_id") for e in progress])
-check("foreign terminal event did NOT end the job early",
-      len(progress) >= 3, f"{len(progress)} progress events")
+
+# The filter is ONE line in worker_agent.py's recv loop and it covers every
+# event type, terminal ones included. That second half needs saying out loud,
+# because the stub's foreign terminal event (`executing`, node=None,
+# prompt_id="other-prompt") arrives AFTER all three of this job's own progress
+# events: an agent that filters progress but not terminals ends the job on
+# somebody else's completion, reports success on work still running, and still
+# shows three progress events here. "len(progress) >= 3" was the assertion
+# that stood here, and it passes on exactly that agent.
+#
+# The stream is the whole record of the job rather than a snapshot taken
+# afterwards -- Redis Streams keep every event from `queued` onwards, which is
+# what the late-subscriber assertions above rely on -- so these are exact
+# counts over a complete history, not an absence checked after the fact.
+own_prompt = next((e["data"].get("prompt_id") for e in events
+                   if e["type"] == "accepted" and isinstance(e.get("data"), dict)), None)
+
+check("fixture: the job's own prompt_id is on the stream and is not the "
+      "stub's foreign one, so 'foreign' below means something",
+      bool(own_prompt) and own_prompt != "other-prompt", own_prompt)
+
+foreign = [e for e in events
+           if isinstance(e.get("data"), dict)
+           and e["data"].get("prompt_id") not in (None, own_prompt)]
+check("not one event belonging to another prompt reached this job's stream — "
+      "terminal events included, which is the half a progress-only filter "
+      "still gets wrong",
+      len(foreign) == 0, foreign)
+
+own_terminal = [e for e in events
+                if isinstance(e.get("data"), dict)
+                and e["data"].get("prompt_id") == own_prompt
+                and (e["type"] == "execution_success"
+                     or (e["type"] == "executing" and e["data"].get("node") is None))]
+check("the job ended on exactly one terminal event, and it was its OWN: the "
+      "foreign terminal event the stub sends first ended nothing",
+      len(own_terminal) == 1, [e["type"] for e in events])
+
+check("all three of this job's progress events survived the filter",
+      len(progress) == 3, f"{len(progress)} progress events")
 
 images = (terminal or {}).get("data", {}).get("images", [])
 check("completion carried the output manifest", len(images) == 1, images)

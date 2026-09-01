@@ -274,6 +274,16 @@ naming the dead worker, failures carry ComfyUI's own message, and
 That is your regression net. If you change `hub.py` or `worker_agent.py`, this
 suite is what tells you whether you broke an invariant from section 3.
 
+Two things about how it reports, because a regression net you cannot trust is
+worse than none. A check fails the suite by exiting non-zero **or** by printing
+a failed assertion — `run.sh` reads both, so a check that keeps printing its
+`FAIL` lines while its exit status quietly stops reflecting them (an edit that
+drops the `sys.exit(1)`, a failures list nothing reads any more) cannot leave
+the suite, or CI, green over its own output. And when you add or change an
+assertion, break the behaviour it is about and watch it fail before you believe
+it: four assertions have shipped here unable to fail, each found only by
+someone deliberately breaking the feature and noticing nothing went red.
+
 Then, when you want a cluster:
 
 ```bash

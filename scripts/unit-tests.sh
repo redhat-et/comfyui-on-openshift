@@ -96,54 +96,118 @@ expect_output "registry port plus a real tag still resolves the tag" \
 
 # ---------------------------------------------------------------------------
 
-log "enterprise/test/run.sh — check discovery (F3, docs/10-roadmap.md)"
+log "enterprise/test/run.sh — a check's failure reaches the suite's exit code"
 
-# run.sh copies every enterprise/test/*.py into its work directory by glob
-# (line 6), but invokes checks by hardcoded name around lines 69 and 85,
-# threading only check.py/check2.py/check3.py's exit codes into RC by hand.
-# A check added as a file but never wired into those two lines is copied and
-# silently never run — the suite still exits 0. Prove it: drop an
-# always-failing check into the suite's own discovery path (enterprise/test/,
-# the directory run.sh's `cp *.py` reads) and assert the suite's own exit
-# code goes non-zero.
+# TWO independent folds, and one fixture each, because a fixture that breaks
+# both rules at once cannot say which one caught it — which is precisely how
+# the second fold below stayed missing for so long. The old fixture here both
+# printed a FAIL line and exited 1; only the exit code was ever folded, so the
+# printed half was decoration and nobody could tell.
 #
-# This runs the real e2e suite — real Redis, stub ComfyUI, real
-# hub.py/worker_agent.py — so it needs the same dependencies `make test`
-# already needs (see enterprise/test/README.md) and takes as long as one
-# normal run.sh pass.
+#   1. EXIT STATUS. run.sh discovers checks by glob rather than by name (F3,
+#      docs/10-roadmap.md): a check that is dropped into enterprise/test/ and
+#      mentioned nowhere else must still run, and its non-zero exit must still
+#      become the suite's. Before F3 the files were copied by a glob but
+#      invoked by hardcoded name, so a new check was copied, never run, and
+#      the suite stayed green.
+#
+#   2. A PRINTED FAILURE. Exit status is a contract a check can hold up to and
+#      still lie: every check prints its assertions through the same check()
+#      helper and turns the collected failures into its exit code in its last
+#      few lines. Lose those lines and the check prints its FAIL lines exactly
+#      as loudly as ever, exits 0, and the suite — and CI, which reads the same
+#      status — stays green over output that says otherwise. run.sh therefore
+#      reads each check's output for the helper's own line format as well.
+#
+# Both fixtures are named check-00-* so they sort AHEAD of every real check.
+# run.sh stops at the first failing check, so each run here costs the suite's
+# startup and one check rather than a full pass — and discovery is proven just
+# as well, since nothing in run.sh names either file.
+#
+# These two run the real e2e suite — real Redis, stub ComfyUI, real
+# hub.py/worker_agent.py — so they need the same dependencies `make test`
+# already needs (see enterprise/test/README.md).
 
 RUN_SH="$REPO_ROOT/enterprise/test/run.sh"
-DISCOVERY_CHECK="$REPO_ROOT/enterprise/test/checkzz_always_fails.py"
+EXIT_STATUS_CHECK="$REPO_ROOT/enterprise/test/check-00-zz-exit-status.py"
+PRINTED_FAIL_CHECK="$REPO_ROOT/enterprise/test/check-00-zz-printed-fail.py"
 DISCOVERY_LOG="$(mktemp -t comfy-run-sh-discovery.XXXXXX)"
 
-cleanup_discovery_check()
+cleanup_discovery_checks()
 {
-    rm -f "$DISCOVERY_CHECK" "$DISCOVERY_LOG"
+    rm -f "$EXIT_STATUS_CHECK" "$PRINTED_FAIL_CHECK" "$DISCOVERY_LOG"
 }
-trap cleanup_discovery_check EXIT
+trap cleanup_discovery_checks EXIT
 
-cat > "$DISCOVERY_CHECK" <<'CHECKEOF'
-# Deliberately-broken check dropped into enterprise/test/ (run.sh's `cp *.py`
-# discovery path) by scripts/unit-tests.sh, to prove run.sh has no check
-# discovery: this file is copied into the work directory but nothing in
-# run.sh calls it by name, so its failure must not, by itself, change the
-# suite's exit code.
-import sys
-print("  FAIL  checkzz_always_fails is deliberately broken")
-sys.exit(1)
-CHECKEOF
-
-suite_fails_on_an_unwired_broken_check()
+suite_fails()
 {
     local rc=0
     "$RUN_SH" > "$DISCOVERY_LOG" 2>&1 || rc=$?
     (( rc != 0 ))
 }
 
-expect_true "a check dropped into enterprise/test/ but never wired into run.sh still fails the suite" \
-    suite_fails_on_an_unwired_broken_check
+# Fixture 1: a non-zero exit and NOT ONE printed FAIL line, so the only fold
+# that can catch it is the exit status.
+cat > "$EXIT_STATUS_CHECK" <<'CHECKEOF'
+# Deliberately-failing check written into enterprise/test/ (run.sh's `cp *.py`
+# discovery path) by scripts/unit-tests.sh and removed again immediately.
+# It exits non-zero and prints NO failure line, so it isolates one fold: a
+# suite that still exits 0 with this file present has no check discovery.
+import sys
+print("  this check exits non-zero and deliberately prints no failure line")
+sys.exit(1)
+CHECKEOF
 
-cleanup_discovery_check
+expect_true "a check dropped into enterprise/test/ but never wired into run.sh still fails the suite when it exits non-zero" \
+    suite_fails
+
+rm -f "$EXIT_STATUS_CHECK"
+
+# Fixture 2: a printed FAIL line and a CLEAN exit, so the only fold that can
+# catch it is the one that reads the output.
+cat > "$PRINTED_FAIL_CHECK" <<'CHECKEOF'
+# The other half, written and removed by scripts/unit-tests.sh: a check that
+# reports a failed assertion in the format every check in this directory
+# reports one, and then exits 0 — a check whose exit status has stopped
+# reporting what its own assertions found. The suite must not be green.
+import sys
+print("  FAIL  a printed failure that exits 0 must still fail the suite")
+sys.exit(0)
+CHECKEOF
+
+expect_true "a check that prints a FAIL line and exits 0 anyway still fails the suite" \
+    suite_fails
+
+rm -f "$PRINTED_FAIL_CHECK"
+
+# And the marker that fold uses, read out of run.sh itself rather than
+# restated here: a marker widened to a bare search for the word would fail a
+# suite on its own checks' prose, which is a green suite's opposite failure
+# mode and just as bad. Sub-millisecond, so every one of these is a separate
+# case rather than one line of alternation.
+FAIL_MARKER="$(sed -n "s/^FAIL_MARKER='\(.*\)'\$/\1/p" "$RUN_SH")"
+
+matches_fail_marker()
+{
+    printf '%s\n' "$1" | grep -q "$FAIL_MARKER"
+}
+
+expect_true  "run.sh names the printed-failure marker in one place, where this can read it" \
+    test -n "$FAIL_MARKER"
+expect_true  "the marker fires on the check() helper's own failure line" \
+    matches_fail_marker "  FAIL  the assertion name"
+expect_false "the marker ignores the helper's PASS line" \
+    matches_fail_marker "  PASS  the assertion name"
+expect_false "the marker ignores the 'N FAILED: [...]' summary every check prints" \
+    matches_fail_marker "3 FAILED: ['one', 'two', 'three']"
+expect_false "the marker ignores an assertion NAME that merely contains the word" \
+    matches_fail_marker "  PASS  a wedged ComfyUI must FAIL the job rather than park on it"
+expect_false "the marker ignores a FAIL echoed back in a detail field" \
+    matches_fail_marker "  PASS  job state  {'status': 'FAILED', 'phase': 'executing'}"
+expect_false "the marker ignores run.sh's own indented progress lines" \
+    matches_fail_marker "    check-10-stream.py FAILED (rc 1, 2 printed FAIL line(s))"
+
+cleanup_discovery_checks
 trap - EXIT
 
 # ---------------------------------------------------------------------------
