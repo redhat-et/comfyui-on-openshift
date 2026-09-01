@@ -73,6 +73,12 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 # running in a per-worker processing list. The reaper below fails jobs whose
 # worker's heartbeat is gone — without it, a worker OOM-kill or node death
 # leaves the browser on a progress bar that never moves.
+#
+# What follows either prefix is a worker INCARNATION id, not a pod name:
+# worker_agent.py's BEGIN WORKER IDENTITY explains why the distinction is
+# load-bearing here specifically, since the reaper's entire liveness test is
+# pairing one of these keys with the other by that suffix. Nothing on this
+# side parses the suffix; it only has to stay opaque and stay matched.
 WORKER_KEY_PREFIX = "comfy:worker:"
 PROCESSING_KEY_PREFIX = "comfy:processing:"
 REAPER_INTERVAL = int(os.environ.get("REAPER_INTERVAL", "30"))
@@ -1466,9 +1472,19 @@ async def reap_orphaned_jobs() -> None:
             conn = client()
 
             async for key in conn.scan_iter(match=f"{PROCESSING_KEY_PREFIX}*"):
-                worker_id = key[len(PROCESSING_KEY_PREFIX):]
+                # The suffix is an INCARNATION — one running worker process —
+                # and this one line is the whole liveness test, so it is only
+                # as true as that. Named from a pod instead, a container
+                # restarted inside its pod (restartPolicy: Always, which is how
+                # an OOM-killed worker comes back) heartbeats under the id its
+                # predecessor died holding, this `continue` fires forever, and
+                # the predecessor's stranded job never reaches a terminal state
+                # at all. worker_agent.py's BEGIN WORKER IDENTITY is the other
+                # half of this; enterprise/test/check-32-worker-restart.py is
+                # what fails if either half is undone.
+                incarnation = key[len(PROCESSING_KEY_PREFIX):]
 
-                if await conn.exists(f"{WORKER_KEY_PREFIX}{worker_id}"):
+                if await conn.exists(f"{WORKER_KEY_PREFIX}{incarnation}"):
                     continue
 
                 while (raw := await conn.rpop(key)) is not None:
@@ -1851,6 +1867,14 @@ async def gather_stats() -> dict:
 
     # Count heartbeat keys, not a set: keys expire on their own, so a worker
     # that was SIGKILLed stops being counted instead of inflating this forever.
+    #
+    # One key is one live INCARNATION, so a pod that has just restarted is
+    # counted twice until its predecessor's key lapses (at most HEARTBEAT_TTL).
+    # Deliberately not deduplicated by pod name: expiry already bounds it, a
+    # replaced POD has always over-counted the same way for the same window,
+    # and the alternative is this gauge growing an opinion about the shape of
+    # an id the reaper is careful to treat as opaque. The consequence is an
+    # estimated wait that is briefly optimistic after a crash-restart.
     workers = 0
 
     async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*"):

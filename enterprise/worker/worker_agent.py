@@ -6,7 +6,7 @@ Runs alongside ComfyUI in the GPU pod. ComfyUI binds 127.0.0.1 only, so this
 agent is the sole path in or out — no user can reach the GPU pod directly, and
 the pod needs no Service, no Route, and no ingress rules.
 
-Eight things here that the obvious version of this script gets wrong, each of
+Nine things here that the obvious version of this script gets wrong, each of
 which produces an intermittent bug that is miserable to diagnose in a cluster:
 
   1. Connect the WebSocket BEFORE submitting the prompt. ComfyUI starts emitting
@@ -32,7 +32,9 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      BLMOVE parks the in-flight job in a per-worker processing list and a
      TTL'd heartbeat key marks this worker alive; when the heartbeat lapses,
      the gateway's reaper acts on the stranded job loudly instead of letting
-     it disappear.
+     it disappear. Both keys are named from the INCARNATION and not from the
+     pod — see point 9, which is the whole of what "this worker" has to mean
+     for that pairing to be a liveness test at all.
 
   6. Write down HOW FAR the job got, before doing the thing. The reaper above
      can see that a worker died and cannot see what killed it, so what it is
@@ -70,6 +72,19 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      confinement of the path. A `filename` that is not a single bare path
      component (is_bare_filename() below) is refused outright, the same way
      a hostile `filename_prefix` is refused rather than merely sanitized.
+
+  9. Name the heartbeat and the processing list after this INCARNATION, not
+     after the pod. Point 5's pair is a claim of the form "the process holding
+     THIS list is still alive", and the gateway's reaper tests it by pairing
+     the two keys by name — so whatever the name identifies is what "alive"
+     ends up meaning. HOSTNAME identifies the POD, and `restartPolicy: Always`
+     restarts a container inside its pod: an OOM-killed worker comes back with
+     the identity it died with, its first heartbeat answers the reaper's
+     question on the dead incarnation's behalf, and the reaper skips that
+     incarnation's processing list — not for a while, but for as long as the
+     pod keeps restarting. A boot nonce makes the identity name the process,
+     which is what the pair was always asserting about. See BEGIN WORKER
+     IDENTITY below.
 """
 
 from __future__ import annotations
@@ -118,7 +133,60 @@ BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
 # where an output SHOULD be from paths ComfyUI reports relative to it.
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 
+# ---------------------------------------------------------------------------
+# BEGIN WORKER IDENTITY — point 9
+#
+# Two identities, because the two questions asked of "which worker is this?"
+# have different right answers, and the failure that made this a pair was the
+# single id being used for both.
+#
+#   WORKER_ID          what a HUMAN is told. The pod name, so the string in a
+#                      failure message ("worker comfy-worker-8s4qd died") is
+#                      the one an operator pastes into `oc describe pod` /
+#                      `oc logs` — which is precisely what DESCRIBE_HINT in
+#                      hub.py sends them off to do. It goes on the job's state
+#                      hash and into the `started` event, and nowhere else.
+#
+#   WORKER_INCARNATION what REDIS is told. The pod name plus a nonce chosen
+#                      once, here, at process start — so it names THIS RUNNING
+#                      PROCESS rather than the pod that happens to be hosting
+#                      it. The heartbeat key and the processing list are both
+#                      named from it, and from nothing else.
+#
+# Why the second one has to exist. The heartbeat/processing pair (point 5) is
+# a claim of the form "the process holding THIS list is still alive", and the
+# gateway's reaper tests it by pairing the two keys BY NAME: it scans
+# comfy:processing:*, takes the suffix, and skips the list if
+# comfy:worker:<suffix> exists. So whatever that suffix identifies is what the
+# reaper's word "alive" ends up meaning.
+#
+# HOSTNAME identifies the POD. A container restart — `restartPolicy: Always`,
+# which is how an OOM-killed worker comes back, and the common path rather
+# than an exotic one — replaces the container inside the same pod and keeps
+# it. Named from HOSTNAME alone, the new incarnation's very first heartbeat
+# therefore answers the reaper's liveness question on behalf of the DEAD
+# incarnation, whose stranded job the reaper then skips for as long as the pod
+# keeps restarting: no terminal event (a progress bar that never moves), no
+# GPU seconds in either bucket, and a processing entry with no TTL left in a
+# `noeviction` Redis. enterprise/test/check-32-worker-restart.py reproduces
+# exactly that.
+#
+# The nonce closes it by construction rather than by procedure: two
+# incarnations cannot collide because they do not share a key, so there is no
+# startup step to get right, to skip on a Redis blip, or to remove later. The
+# cost is one line of readability in a place nobody reads — the KEY names —
+# and none at all in the messages, which still carry WORKER_ID.
+#
+# The separator is not a character a Kubernetes pod name can contain (RFC 1123
+# labels are lowercase alphanumerics and '-'), so a display id can always be
+# recovered as everything before the first one, and a glob on an identity can
+# never straddle two of them. enterprise/test/worker_ids.py relies on that.
+# ---------------------------------------------------------------------------
+INCARNATION_SEP = "#"
+
 WORKER_ID = os.environ.get("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
+WORKER_INCARNATION = f"{WORKER_ID}{INCARNATION_SEP}{uuid.uuid4().hex[:8]}"
+
 CLIENT_ID = str(uuid.uuid4())
 
 # The heartbeat is how the gateway distinguishes a busy worker from a dead one.
@@ -127,13 +195,17 @@ CLIENT_ID = str(uuid.uuid4())
 # this process legitimately goes without touching Redis.
 HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
 
-WORKER_KEY = f"comfy:worker:{WORKER_ID}"
+WORKER_KEY = f"comfy:worker:{WORKER_INCARNATION}"
 
 # The job currently being executed lives in this list (moved there from the
 # queue by BLMOVE, removed on any terminal state). If this process dies without
 # removing it, the gateway's reaper fails the job loudly instead of letting it
-# vanish. Key shape is shared with hub.py — change both or neither.
-PROCESSING_KEY = f"comfy:processing:{WORKER_ID}"
+# vanish. Key shape is shared with hub.py — change both or neither — and it is
+# named from the INCARNATION, not from WORKER_ID: the reaper pairs this key
+# with WORKER_KEY above by name, so the two must name the same thing, and that
+# thing must be this process. See BEGIN WORKER IDENTITY.
+PROCESSING_KEY = f"comfy:processing:{WORKER_INCARNATION}"
+# END WORKER IDENTITY
 
 
 # ---------------------------------------------------------------------------
@@ -1505,7 +1577,11 @@ def main() -> int:
     conn = connect_redis()
     heartbeat(conn)
 
-    log(f"worker {WORKER_ID} ready, polling {QUEUE_KEY}")
+    # Both identities, once, at the one moment an operator reading a restart
+    # loop needs to tell two incarnations of one pod apart: same WORKER_ID,
+    # different key suffix. See BEGIN WORKER IDENTITY.
+    log(f"worker {WORKER_ID} (incarnation {WORKER_INCARNATION}) "
+        f"ready, polling {QUEUE_KEY}")
 
     try:
         while not shutting_down:

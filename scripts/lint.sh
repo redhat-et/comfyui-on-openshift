@@ -472,6 +472,32 @@ shape_require enterprise/worker/worker_agent.py \
     'os\.chmod\(path, WORKSPACE_DIR_MODE\)' \
     "the mode above must be applied EXPLICITLY. mkdir's own mode argument is masked by umask (022 in this image, which yields 0755 — group-readable, not group-writable), so a workspace created without this chmod looks correct locally and is unwritable by the next pod on the cluster"
 
+# The worker's two identities (worker_agent.py, note 9 / BEGIN WORKER IDENTITY).
+# The heartbeat key and the processing list must both be named from the
+# INCARNATION — HOSTNAME plus a nonce chosen at process start — because the
+# gateway's reaper's entire liveness test is pairing those two keys by that
+# suffix, and `restartPolicy: Always` restarts a container inside its pod with
+# HOSTNAME unchanged. Named from HOSTNAME alone, a restarted worker heartbeats
+# under the id its predecessor died holding and hides that predecessor's
+# stranded job from the reaper for as long as the pod keeps restarting.
+#
+# enterprise/test/check-32-worker-restart.py DOES catch this, and it is pinned
+# anyway for the same reason TERMINAL_TYPES is: "the nonce makes the key names
+# noisy, and HOSTNAME is already unique per pod" is a true-sounding sentence
+# that arrives inside a diff about something else, and the row in
+# docs/09-engineering-handoff.md section 3 says what it costs.
+shape_require enterprise/worker/worker_agent.py \
+    '^WORKER_INCARNATION = f"\{WORKER_ID\}\{INCARNATION_SEP\}\{uuid\.uuid4\(\)\.hex\[:8\]\}"$' \
+    "the worker's Redis identity must carry a nonce chosen at process start. HOSTNAME identifies the POD, and a container restarted inside its pod keeps it — so an identity taken from HOSTNAME alone is reused by the next incarnation, whose heartbeat then answers the reaper's liveness question on behalf of the dead one and strands its job with no terminal event, no GPU seconds in either bucket, and a processing entry with no TTL in a noeviction Redis"
+
+shape_require enterprise/worker/worker_agent.py \
+    '^WORKER_KEY = f"comfy:worker:\{WORKER_INCARNATION\}"$' \
+    "the heartbeat key is named from the incarnation, not from WORKER_ID. WORKER_ID is the display identity — the pod name a failure message shows an operator so they can describe that pod — and it is deliberately NOT unique across restarts"
+
+shape_require enterprise/worker/worker_agent.py \
+    '^PROCESSING_KEY = f"comfy:processing:\{WORKER_INCARNATION\}"$' \
+    "the processing list is named from the same incarnation as the heartbeat key above. The reaper pairs the two BY NAME, so a pair naming two different things is not a liveness test at all — and the half that would be wrong here is the one holding the stranded job"
+
 # The pattern deliberately starts after the leading dashes: shape_require hands
 # it straight to `grep -qE`, which would read "--output-directory..." as flags.
 shape_require enterprise/worker/start.sh \

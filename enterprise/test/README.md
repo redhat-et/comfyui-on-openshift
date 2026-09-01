@@ -83,6 +83,27 @@ OOM-kill whichever worker it was requeued onto next. The stub records every
 workflow it is handed, so "ComfyUI had not seen it" is asserted rather than
 assumed on both sides of that line.
 
+**A worker that restarts cannot hide its own stranded job**
+(`check-32-worker-restart.py`). Everything above proves the reaper acts on a
+worker that died and stayed dead, under a replacement with a different name.
+This is the case underneath it. The heartbeat key and the processing list are
+named from the worker's *incarnation* rather than from `HOSTNAME`, because
+`restartPolicy: Always` restarts a container inside its pod and hands it back
+the identity it died with — and the reaper's entire liveness test is pairing
+those two keys by name, so a reused id lets the new incarnation vouch for the
+dead one and the stranded job is skipped for as long as the pod keeps
+restarting. The check SIGKILLs a worker mid-execution and brings a second one
+up under the same `HOSTNAME` inside `HEARTBEAT_TTL`, then asserts the job
+still reaches a terminal state. Three things about the fixture are asserted
+rather than assumed, because each of them silently turns this into a
+different, easier test: the phase breadcrumb reads `executing` (so the
+terminal state can only have come from the reaper), the dead incarnation's
+entry is still parked and unreaped at the instant the replacement registers
+(so the reap did not simply happen first), and the replacement registered
+inside `HEARTBEAT_TTL` of the kill (so this is identity reuse and not an
+ordinary lapse-then-reap). `check-30-sigkill.py`'s scenario B, immediately
+before it, is the control: the same death without the reuse.
+
 **And the two doors into a replay stay shut** (`check-35-retry-doors.py`).
 The breadcrumb decides whether a death is retried, so it has to be true at
 every instant, and the retry has to be about work somebody still wants.

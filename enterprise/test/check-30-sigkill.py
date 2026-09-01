@@ -58,6 +58,7 @@ import redis
 import websocket
 
 from queue_watch import QueueWriteWatcher
+from worker_ids import heartbeat_keys
 
 # Line-buffer stdout explicitly, rather than trust the interpreter to pick
 # line buffering on its own. It only does that for a TTY; run.sh's stdout is
@@ -164,9 +165,14 @@ def drain(job_id, timeout=60):
 
 def start_extra_agent(hostname, timeout=30):
     """A second, independent worker agent, identified by a fixed HOSTNAME so
-    its heartbeat key is predictable rather than parsed off log output. Logs
+    its heartbeat key is findable rather than parsed off log output. Logs
     to its own file (run.sh dumps agent*.log on failure; this one is named
-    for what it is) rather than the log run.sh already tracks for argv[1]."""
+    for what it is) rather than the log run.sh already tracks for argv[1].
+
+    Findable, not predictable: the heartbeat key is named from the agent's
+    INCARNATION (worker_agent.py, note 9), which carries a nonce this process
+    cannot know, so readiness is a prefix match on the identity rather than an
+    EXISTS on a spelled-out key. See worker_ids.py."""
     env = dict(os.environ)
     env["HOSTNAME"] = hostname
     # Named to match run.sh's own "agent*.log" glob, so its failure-path
@@ -178,7 +184,7 @@ def start_extra_agent(hostname, timeout=30):
     )
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if r.exists(f"comfy:worker:{hostname}"):
+        if heartbeat_keys(r, hostname):
             return proc
         if proc.poll() is not None:
             return proc  # died on startup; later assertions will show it
