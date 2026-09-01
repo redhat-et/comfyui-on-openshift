@@ -15,7 +15,7 @@
 #   Pending for want of a GPU. This is where the ~$0.98/hour actually goes away.
 #
 # The cost of that is cold start. Node provision plus a ~10 GB image pull plus
-# CUDA init plus model load is realistically 8-15 minutes for the first job
+# CUDA init plus model load is realistically 8-17 minutes for the first job
 # after an idle period. The gateway tells the user this rather than leaving them
 # staring at a bar that has not moved. See docs/06-enterprise-architecture.md
 # for when that trade is worth taking and when it is not.

@@ -575,7 +575,7 @@ cat <<EOF
 
   Workers:  0 right now — they start when you queue something.
             The first job after an idle period waits for a GPU node to be
-            provisioned and a ~10 GB image to be pulled. Budget 10-15 minutes
+            provisioned and a ~10 GB image to be pulled. Budget 8-17 minutes
             for it; subsequent jobs start in seconds.
 
   Watch it happen:
