@@ -94,9 +94,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq redis-server
-          # Gateway deps cover the worker's redis; websocket-client is the
-          # worker's other dep and what the checks use to talk to the gateway.
-          python3 -m pip install --quiet -r enterprise/gateway/requirements.txt websocket-client
+          # Both requirements files, not gateway's plus a hand-typed
+          # websocket-client: the worker's requirements.txt already declares
+          # websocket-client (what the checks use to talk to the gateway),
+          # and its own redis<7 pin, kept here as one file to edit instead of
+          # two places that can drift.
+          python3 -m pip install --quiet \
+            -r enterprise/gateway/requirements.txt \
+            -r enterprise/worker/requirements.txt
 
       - name: make test
         run: make test
