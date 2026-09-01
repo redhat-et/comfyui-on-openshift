@@ -253,6 +253,18 @@ print("\n== A: a live worker parked past its heartbeat TTL keeps its job")
 # breadcrumb, after the workspace mkdir, and before ComfyUI has been sent
 # anything at all. worker_agent.py connects the ComfyUI WebSocket before it
 # submits (point 1), so stalling the stub's accept holds it exactly there.
+#
+# Timed from here, because this stall is the premise of everything below and
+# it has already failed silently once. A stub that abandons the handshake part
+# way through does not park the agent — it hands it a DEAD ComfyUI. The job
+# then fails inside ws.connect() before a workflow is ever submitted, and
+# every count below reports a fencing failure for a job that never ran. That
+# is what uvicorn's websockets layer did here: it gave the whole opening
+# handshake, the stub's own sleep included, ten seconds, and STALL_S is
+# longer than that (fake_comfy.py, _lift_ws_handshake_timeout). The stub
+# cannot see the difference — an abandoned handshake still runs its endpoint
+# to completion — so the park is measured out here, by the clock.
+stall_armed_at = time.time()
 post("/__stall_next_ws__", {"seconds": STALL_S}, base=COMFY)
 
 probe_a = f"live-{uuid.uuid4().hex[:8]}"
@@ -290,6 +302,13 @@ check("and the worker really is alive to have armed it — it was never "
 
 kinds, terminal = drain(job_a)
 
+parked_for = time.time() - stall_armed_at
+check("the fixture held: nothing happened to this job until the stall it was "
+      "parked in had run its full length, so the agent was waiting on a SLOW "
+      "ComfyUI and not on a dropped connection",
+      parked_for >= STALL_S,
+      {"parked_for": round(parked_for, 2), "stall_s": STALL_S})
+
 check("the job reached a terminal state", terminal is not None, kinds)
 check("and it completed", terminal and terminal["type"] == "completed",
       terminal["type"] if terminal else None)
@@ -320,6 +339,7 @@ check("the worker survived the whole scenario", alive(agent_pid), agent_pid)
 print("\n== B: a live worker whose job IS requeued under it abandons rather "
       "than running it twice")
 
+stall_armed_at = time.time()
 post("/__stall_next_ws__", {"seconds": STALL_S}, base=COMFY)
 
 probe_b = f"fence-{uuid.uuid4().hex[:8]}"
@@ -362,6 +382,19 @@ check("and the worker whose job was taken is still alive — nothing here "
       alive(agent_pid), agent_pid)
 
 kinds, terminal = drain(job_b)
+
+# The same fixture assertion as in (A), and it carries more here: the fence
+# under test is the one at the SUBMIT gate, and the reaped attempt only
+# reaches that gate if it is still parked in ws.connect() when the requeue
+# lands. An attempt that instead died in a dropped handshake never reaches
+# still_ours() at all — it is stopped by the later fence on `finish`, and the
+# counts below pass without the submit gate having been exercised once.
+parked_for = time.time() - stall_armed_at
+check("the fixture held: the reaped attempt was still parked in the stall "
+      "when the requeue happened, so it reached the ownership fence at the "
+      "submit gate rather than dying before it",
+      parked_for >= STALL_S,
+      {"parked_for": round(parked_for, 2), "stall_s": STALL_S})
 
 check("the job reached a terminal state", terminal is not None, kinds)
 check("and it completed — the requeued attempt ran it",
