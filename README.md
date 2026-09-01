@@ -417,7 +417,7 @@ handled alike. Knowing which one you hit is most of the diagnosis.
 | | What actually happens | What the user sees |
 |---|---|---|
 | **VRAM / CUDA OOM** — the common one: a resolution, batch size or model stack that does not fit the card | ComfyUI catches it and emits `execution_error`. The agent (`worker_agent.py:279`) turns that into a terminal `failed` carrying ComfyUI's own exception message. The worker stays healthy and takes the next job. | `failed: Allocation on device ...` — the real message, not a generic error. Nothing is retried, because the same workflow would fail the same way on any card. |
-| **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The container hits its own memory limit and the kernel kills ComfyUI inside that cgroup. `start.sh` waits on both children, so the pod exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses. At the queue level this is still indistinguishable from infrastructure death — but the pod is not: it terminates as `OOMKilled` and `oc describe pod` names the reason. |
+| **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The container hits its own memory limit and the kernel kills ComfyUI inside that cgroup. `start.sh` waits on both children, so the container exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run — `restartPolicy: Always` then restarts the container inside this same pod, which keeps its name and its `HOSTNAME`. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses — including across that restart, because the worker's identity is its pod name plus a nonce chosen at process start (`worker_agent.py`, note 9), not the pod name alone. At the queue level this is still indistinguishable from infrastructure death — but the container is not: it terminates as `OOMKilled` and `oc describe pod` names the reason. |
 | **Node-level pressure** — eviction rather than a container kill | The kubelet evicts with a grace period, so SIGTERM arrives first and the drain below applies. A GPU pod is Guaranteed QoS, so it is the last thing evicted, not the first. | Usually nothing: the job finishes before the pod goes. |
 
 That the second row says `OOMKilled` and not "the node decided" is a property of
@@ -437,8 +437,8 @@ flowchart TD
     V1 --> V2["failed, carrying ComfyUI's<br/>own message.<br/>Worker healthy, takes the next job."]
 
     H --> H1["Container hits its own limit,<br/>kernel kills ComfyUI"]
-    H1 --> H2["Pod exits OOMKilled —<br/>oc describe pod names the reason"]
-    H2 --> H3["Job stranded, then failed by the<br/>gateway's reaper once the<br/>heartbeat lapses"]
+    H1 --> H2["Container exits OOMKilled,<br/>restarted in the same pod —<br/>oc describe pod names the reason"]
+    H2 --> H3["Job stranded, then failed by the<br/>gateway's reaper once the<br/>heartbeat lapses, restart or not"]
 
     classDef clean fill:#e8eefc,stroke:#5b7bc4,color:#12233f
     classDef rough fill:#fde8e2,stroke:#d6552b,color:#4a1608

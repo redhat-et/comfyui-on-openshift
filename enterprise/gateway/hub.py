@@ -733,15 +733,30 @@ def showback_accrue_call(state: str, destination: str,
 #      pod docs/09 calls the entire public attack surface, to enforce a figure
 #      that lags real spend by hours.
 #
-#   2. IT FAILS OPEN, AND SAYS SO. Redis unreachable, the field missing, the
-#      value not a number, the env var not a number: every one of those
-#      proceeds with the submission. The asymmetry is the roadmap's — "a
-#      breaker that trips on an unreachable dependency halts a cluster you
-#      are already paying for, while the risk it guards against is slow". But
-#      a control that stops enforcing silently is a control that has quietly
-#      stopped existing, so every fail-open that is not simply "this
-#      submitter has spent nothing yet" prints a line naming what could not
-#      be read (see log() above). The budget alarm remains the backstop.
+#   2. IT FAILS OPEN, AND SAYS SO. The field missing, the value not a number,
+#      the env var not a number, or the read to fetch the field raising:
+#      every one of those proceeds with the submission, and
+#      quota_gpu_seconds_used() logs which one it was. The asymmetry is the
+#      roadmap's — "a breaker that trips on an unreachable dependency halts a
+#      cluster you are already paying for, while the risk it guards against
+#      is slow". But a control that stops enforcing silently is a control
+#      that has quietly stopped existing, so every fail-open that is not
+#      simply "this submitter has spent nothing yet" prints a line naming
+#      what could not be read (see log() above). The budget alarm remains the
+#      backstop.
+#
+#      "Redis unreachable" reaches this fail-open only when it fails between
+#      generate()'s two reads — this one and the backpressure `LLEN` above it
+#      in the function, which is NOT wrapped the same way and raises
+#      unhandled. For an outage that takes the whole instance down, that LLEN
+#      is what the submitter actually sees (a 500, not a quiet pass-through);
+#      it is deliberately not softened to match, because backpressure exists
+#      to protect Redis from an unbounded queue and "proceed when you cannot
+#      even read the depth" is the one answer that control must not give. The
+#      logged fail-open here is real and reachable — a read that fails on its
+#      own (a single flaky call, a differently-sharded key in a clustered
+#      Redis) — just not the "Redis is entirely down" case the phrase most
+#      readily suggests.
 #
 #   3. IT IS NOT WIRED INTO readyz(), NOT EVEN TRANSITIVELY. That endpoint is
 #      the gateway's readiness probe: a quota check inside it would take the
@@ -1883,6 +1898,14 @@ async def generate(request: Request):
     state = {"status": "queued", "queue_position_at_submit": position,
              PHASE_FIELD: PHASE_QUEUED}
 
+    # envelope["user"], not the raw header: envelope_text() already clamped it
+    # to MAX_ENVELOPE_FIELD_CHARS in build_envelope() above, and this value is
+    # what SHOWBACK_ACCRUE_LUA later reads back (user_field) to build a Hash
+    # FIELD NAME (quota_field()'s f"{SHOWBACK_USER_PREFIX}{user}"). Writing the
+    # raw header here put an unbounded, client-supplied string on that path —
+    # the showback key-space bound above ("THE FIELD COUNT IS CAPPED") caps
+    # the number of fields, not their size, so an uncapped field name is a
+    # second, uncounted way to grow that Hash against `noeviction` Redis.
     if user:
         state["user"] = user
 
@@ -2088,12 +2111,25 @@ async def estimated_wait_seconds(conn: redis.Redis) -> float | None:
 
     Which entry: LMOVE pops `src="RIGHT"` (worker_agent.py's BLMOVE), so the
     tail — index -1 — is always the entry served next, whatever fair queueing
-    (BEGIN FAIR QUEUEING above) did to the rest of the list. Its age is the
-    queue-side latency a caller submitting right now would be waiting behind,
-    the same "age of the oldest thing in line" a queueing system reports when
-    it has no per-item service-time estimate to build a forecast from (the SQS
-    ApproximateAgeOfOldestMessage shape) — a fact read off one entry, not a
-    depth-based guess.
+    (BEGIN FAIR QUEUEING above) did to the rest of the list. Its age is a
+    fact read off one entry, not a depth-based guess — the same "age of the
+    oldest thing in line" a queueing system reports when it has no per-item
+    service-time estimate to build a forecast from (the SQS
+    ApproximateAgeOfOldestMessage shape).
+
+    That shape holds cleanly for a job on its FIRST attempt: `submitted_at` is
+    when this caller actually started waiting, so the age is exactly the
+    queue-side latency they have been waiting behind. It does not hold as
+    cleanly once requeue_orphaned_job() has touched the entry —
+    `submitted_at` is carried over unchanged across a requeue (see that
+    function's comment: Q6 should measure from the original submission, not
+    restart every time the cluster loses a pod), so a retried job's age also
+    counts the time it spent dispatched to the worker that died and the
+    reaper's own detection lag (up to HEARTBEAT_TTL + REAPER_INTERVAL). If
+    that entry lands at the tail, the gauge reads a real elapsed time, but one
+    that overstates how long a caller submitting right now would actually
+    wait — it is no longer purely queue-side latency once part of it was
+    spent elsewhere.
 
     An empty queue reads as LINDEX returning None: 0.0, not "unknown" — there
     is nothing to be waiting on. A malformed or pre-F2 entry (no

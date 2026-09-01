@@ -307,15 +307,17 @@ was wrong.
 ### Found while writing the OOM checks
 
 **A closed ComfyUI socket does not shortcut the job deadline.** `check-70`
-kills the stub's connection mid-job; the agent does not treat the dropped
-connection as terminal, waits out `JOB_TIMEOUT`, and fails with the deadline as
-the reason. That is the bounded-deadline invariant working, and it is the only
-assertion in the suite that exercises it.
+kills the stub's connection mid-job (`__die__`, an abnormal close — code 1006);
+the agent does not treat the dropped connection as terminal, waits out
+`JOB_TIMEOUT`, and fails with the deadline as the reason. That is the
+bounded-deadline invariant working, and at the time it was the only assertion
+in the suite that exercised it.
 
 In production this is mostly hidden: if the ComfyUI *process* dies, `start.sh`
-waits on both children, so the pod ends and the gateway's reaper handles the
-stranded job in seconds. The exposure is the narrower case — a socket that
-closes while ComfyUI is still alive — where a worker holds a GPU for the full
+waits on both children, so the container ends (restarted in the same pod by
+`restartPolicy: Always`) and the gateway's reaper handles the stranded job in
+seconds regardless. The exposure is the narrower case — a socket that closes
+while ComfyUI is still alive — where a worker holds a GPU for the full
 `JOB_TIMEOUT`, **1800 seconds by default**, doing nothing.
 
 **Fixed.** A closed socket now re-checks `/history` once — the prompt may have
@@ -323,10 +325,28 @@ landed in the instant before the process went — and otherwise fails immediatel
 with a reason naming the lost connection. Measured in `check-70`: 65.0s to 0.2s.
 The deadline stays as the backstop it was always meant to be.
 
-The root cause was worse than "waits for the deadline". A server-side close
-arrives as an *empty frame*, and `""` is a `str`, so it slipped past the
-binary-frame guard, failed to parse as JSON, and hit `continue` — spinning the
-receive loop at full speed for the whole of `JOB_TIMEOUT` while holding a card.
+**Correction, found later: the root cause was not what this entry first said.**
+`__die__`'s abnormal close (1006) was never an empty frame — websocket-client
+raises `WebSocketConnectionClosedException` straight out of `recv()` for it,
+which is what the fix above catches. What actually cost `check-70` the full
+`JOB_TIMEOUT` before the fix was a bug in the *stub*: `ws.close(code=1006)` was
+called from the wrong asyncio task and silently failed to close anything, so
+the connection sat open and the agent's own `except
+WebSocketTimeoutException` branch — already correct — kept re-checking
+`/history` every `RECV_TIMEOUT` until the deadline. That stub bug is what the
+same commit fixed alongside the agent change (`dying_ws`, keyed on the socket
+and consumed from inside the endpoint coroutine that owns it).
+
+The *empty-frame* case this paragraph originally described — an ordinary
+close (1000/1001) that leaves the connection open, so `recv()` returns `""`
+once, a `str` that slips past the binary-frame guard, fails to parse, and
+hits `continue` — is real and is what the `if raw == ""` guard exists for,
+but no fixture reached it until `check-75-closed-socket.py`
+(`__empty_frame__`) was written afterward. And even there, "spinning...at
+full speed" overstates it: only the first failed parse is instant: nothing
+more arrives after an ordinary close, so every later `recv()` blocks for
+`RECV_TIMEOUT` and lands in the same timeout branch above, paced, not
+spinning — the cost is JOB_TIMEOUT of that pacing, not a busy loop.
 
 ### Q6 landed — the contract it owes I4
 
@@ -570,6 +590,26 @@ workflow nobody has run yet, and a reconciliation that has to survive the
 reaper. The roadmap chose one accounting path; the overshoot is bounded by
 `MAX_QUEUE_DEPTH` and by the pool size, and the budget alarm remains the
 backstop.
+
+### Found by the cross-wave sweep, not yet done
+
+**The showback hash FIELD is not clamped, so the documented key-space bound is
+too small.** `MAX_ENVELOPE_FIELD_CHARS` bounds the identity on the way into the
+envelope, but the field written into the showback hash is the raw one, so the
+per-period bound is larger than the comment claims.
+
+It is genuinely minor — the bound is still a bound, and `SHOWBACK_MAX_USERS`
+caps the field count regardless — but it is worth a note about how it was almost
+fixed. A documentation pass changed one line so the *write* side used the
+clamped identity, and left the quota *read* side using the raw one. That is a
+quota bypass reachable from a client-supplied header: charges land in one bucket
+while the check reads another. It was caught by the gate, reverted, and is
+recorded here because the lesson is more useful than the bug.
+
+Do it properly or not at all: clamp both sides together, in one change, with an
+assertion that a long identity is charged and checked under the *same* key, and
+a mutation proving that assertion fails if the two ever diverge. *(Small, and
+strictly a security-adjacent change rather than a tidy-up.)*
 
 ### Deferred, with reasons
 

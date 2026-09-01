@@ -1507,9 +1507,16 @@ def run_job(conn: redis.Redis, job: dict) -> None:
 
                 # A server-side close surfaces as an empty frame rather than an
                 # exception, and "" is a str, so it slips past the binary-frame
-                # guard below, fails to parse, and hits `continue` -- spinning
-                # this loop at full speed until the job deadline while holding a
-                # GPU. Treat it as what it is.
+                # guard below, fails to parse, and hits `continue`. That one
+                # iteration is cheap; what is not is what follows it. Nothing
+                # on the wire is coming after an ordinary close, so every
+                # later ws.recv() just blocks for RECV_TIMEOUT and lands in
+                # the WebSocketTimeoutException branch below -- which is
+                # already correct in isolation (it re-checks /history and
+                # keeps waiting), so this loop is paced, not spinning. The
+                # cost is JOB_TIMEOUT of that pacing to notice a connection
+                # that is never coming back, while holding a GPU. Treat the
+                # empty frame as what it is instead of waiting that out.
                 if raw == "":
                     raise websocket.WebSocketConnectionClosedException(
                         "ComfyUI closed the connection")
