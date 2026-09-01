@@ -28,6 +28,7 @@ them. Streams are given a TTL so finished jobs do not accumulate.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import json
 import os
@@ -93,6 +94,21 @@ MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "1"))
 # that.
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 STATIC_ROOT = pathlib.Path(__file__).parent / "static"
+
+
+def log(message: str) -> None:
+    """
+    One operator-visible line on the pod log, matching worker_agent.py's
+    `[agent]` prefix so `oc logs` reads the same on both sides.
+
+    Deliberately rare. Everything ordinary about this process is already in
+    uvicorn's access log, so a line printed here is one an operator is meant
+    to notice: today that is exactly the quota breaker announcing that it
+    could not read its own accounting and is therefore NOT enforcing
+    (BEGIN QUOTA BREAKER below). A control that stops existing silently is
+    the failure mode this exists for.
+    """
+    print(f"[gateway] {message}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +665,208 @@ def showback_accrue_call(state: str, destination: str,
     )
 
 # END SHARED SHOWBACK
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# BEGIN QUOTA BREAKER (docs/10-roadmap.md, Q5)
+#
+# A ceiling on the GPU seconds one submitter may spend inside one showback
+# period, enforced in generate() before a job is placed on the queue. The
+# roadmap settled what this is and is not, and every line below is one of
+# those sentences:
+#
+#   1. IT IS A LOCAL QUOTA READ OUT OF Q4's ACCOUNTING, and there is no
+#      second accounting path. The number compared here is the same field
+#      SHOWBACK_ACCRUE_LUA writes and /api/showback reports — one Hash per
+#      period, one field per identity — so a user cannot be refused for
+#      seconds the report does not show, and an operator asked "why was I
+#      refused?" answers it from a URL. The alternative the roadmap rejected
+#      was an AWS budget lookup, which would put cloud credentials on the one
+#      pod docs/09 calls the entire public attack surface, to enforce a figure
+#      that lags real spend by hours.
+#
+#   2. IT FAILS OPEN, AND SAYS SO. Redis unreachable, the field missing, the
+#      value not a number, the env var not a number: every one of those
+#      proceeds with the submission. The asymmetry is the roadmap's — "a
+#      breaker that trips on an unreachable dependency halts a cluster you
+#      are already paying for, while the risk it guards against is slow". But
+#      a control that stops enforcing silently is a control that has quietly
+#      stopped existing, so every fail-open that is not simply "this
+#      submitter has spent nothing yet" prints a line naming what could not
+#      be read (see log() above). The budget alarm remains the backstop.
+#
+#   3. IT IS NOT WIRED INTO readyz(), NOT EVEN TRANSITIVELY. That endpoint is
+#      the gateway's readiness probe: a quota check inside it would take the
+#      whole gateway out of the Service the moment one submitter went over,
+#      dropping every WebSocket that is reporting an in-flight job, on a pool
+#      that is still running work. The outage would be caused by the control
+#      meant to prevent one. scripts/lint.sh holds that separation as a shape
+#      rule ("the quota breaker is not reachable from readyz()"), because it
+#      is a one-line edit to reintroduce and nothing in a test run of a
+#      healthy gateway would notice.
+#
+#   4. IT IS OFF BY DEFAULT — QUOTA_GPU_SECONDS unset, or <= 0, means every
+#      call below short-circuits before it touches Redis. A quota nobody
+#      chose is a support ticket on somebody else's cluster.
+#
+# What it does NOT do: interrupt work already queued or running. This is
+# admission control on new submissions only, which is also why the refusal
+# says so — a user who is refused still has their in-flight jobs.
+# ---------------------------------------------------------------------------
+
+# The per-submitter ceiling, in GPU seconds per showback period, from the
+# environment (.env.example, wired into the Deployment by enterprise/setup.sh).
+# Parsed tolerantly on purpose, unlike MAX_QUEUE_DEPTH's int(): this is the
+# breaker, and the posture in point 2 above applies to its own configuration
+# too. A garbled value disables it loudly rather than crash-looping the
+# gateway, which is the failure that would take the cluster out.
+QUOTA_GPU_SECONDS_RAW = os.environ.get("QUOTA_GPU_SECONDS", "0")
+
+try:
+    QUOTA_GPU_SECONDS = float(QUOTA_GPU_SECONDS_RAW)
+except (TypeError, ValueError):
+    log(f"QUOTA_GPU_SECONDS={QUOTA_GPU_SECONDS_RAW!r} is not a number — the "
+        f"GPU-second quota breaker is OFF and no submission will be refused "
+        f"for quota (docs/10-roadmap.md, Q5)")
+    QUOTA_GPU_SECONDS = 0.0
+
+# How the refusal reads a period's end, for humans: the count restarts when
+# the period does, and the period is a UTC calendar month (see
+# SHOWBACK_PERIOD_FORMAT).
+QUOTA_RESET_FORMAT = "%Y-%m-%d %H:%M UTC"
+
+
+def quota_enabled() -> bool:
+    """Off unless somebody chose a positive ceiling. See point 4 above."""
+    return QUOTA_GPU_SECONDS > 0
+
+
+def quota_field(user: str) -> str:
+    """
+    The field in the period's Hash that holds THIS submitter's seconds.
+
+    It has to name the same field the accrual writes, or the breaker would
+    enforce against a number nobody accrues into: SHOWBACK_ACCRUE_LUA reads
+    the submitter off the job's state hash — which generate() writes from this
+    same X-Forwarded-User header — and prefixes it, or sends it to the
+    anonymous bucket when there was no header at all.
+
+    Anonymous submissions are therefore counted against the shared anonymous
+    bucket rather than exempted. Under AUTH_MODE=none that makes the quota a
+    single pool for every caller without a header, which is the honest reading
+    of "the header is client-supplied": exempting the no-header case would
+    turn the breaker off for exactly the deployment shape where anyone with
+    the URL can spend the GPU budget. It is not a security control either way
+    — varying a header buys a fresh quota — it is a cost guardrail, and the
+    identity it uses is the identity the report uses.
+    """
+    return f"{SHOWBACK_USER_PREFIX}{user}" if user else SHOWBACK_ANONYMOUS_FIELD
+
+
+def quota_period_reset(now: float) -> float:
+    """
+    When the count restarts: 00:00 UTC on the first of the next calendar
+    month, because the bucket read below is named from showback_period(now)
+    and the next period is a different, empty Hash.
+
+    Not a rolling window and not the Hash's TTL (which spans several periods
+    — see showback_ttl_seconds()). A refusal that quoted the TTL would tell
+    the user to come back months after their quota had in fact reset.
+    """
+    moment = time.gmtime(now)
+    year = moment.tm_year + (1 if moment.tm_mon == 12 else 0)
+    month = 1 if moment.tm_mon == 12 else moment.tm_mon + 1
+
+    return float(calendar.timegm((year, month, 1, 0, 0, 0, 0, 1, 0)))
+
+
+def quota_refusal_text(used: float, now: float) -> str:
+    """
+    What the caller is told. Three things, because "rejected" with no reason
+    is a support ticket: what happened, what the numbers were, and when it
+    resets — plus where to read the usage it was decided from.
+    """
+    return (f"GPU-second quota exhausted: {used:.1f} of {QUOTA_GPU_SECONDS:.1f} "
+            f"GPU seconds used in period {showback_period(now)}. This quota is "
+            f"per user, so other submitters are unaffected, and jobs you have "
+            f"already queued keep running. It resets at "
+            f"{time.strftime(QUOTA_RESET_FORMAT, time.gmtime(quota_period_reset(now)))}, "
+            f"when the next period begins. GET /api/showback for the usage "
+            f"this was decided from.")
+
+
+async def quota_gpu_seconds_used(conn: redis.Redis, user: str,
+                                 now: float) -> float | None:
+    """
+    This submitter's accrued GPU seconds in the current period, or None when
+    the answer is not knowable — Redis unreachable, or a value that is not a
+    number. None means FAIL OPEN, and every None here is logged.
+
+    A field that is simply ABSENT is 0.0 rather than None: a submitter who has
+    not spent anything this period is not an unreadable submitter, and logging
+    every first-ever submission as a fail-open would bury the lines that
+    matter under the ordinary case.
+
+    Tolerant parsing rather than a bare float() for the same reason
+    showback_report() is tolerant on the read side ("a value that is not a
+    number is skipped") — the breaker must not be stricter about Q4's data
+    than Q4 is.
+    """
+    key = showback_key(showback_period(now))
+    field = quota_field(user)
+
+    try:
+        raw = await conn.hget(key, field)
+    except Exception as exc:  # noqa: BLE001
+        log(f"QUOTA FAILING OPEN: could not read {key} field {field!r} "
+            f"({exc!r}). This submission is NOT being checked against the "
+            f"{QUOTA_GPU_SECONDS:.1f}s quota.")
+        return None
+
+    if raw is None:
+        return 0.0
+
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log(f"QUOTA FAILING OPEN: {key} field {field!r} holds {raw!r}, which "
+            f"is not a number. This submission is NOT being checked against "
+            f"the {QUOTA_GPU_SECONDS:.1f}s quota.")
+        return None
+
+
+async def quota_refusal(conn: redis.Redis, user: str) -> str | None:
+    """
+    The message to refuse this submitter with, or None to let the submission
+    through — which includes every case where the quota could not be decided.
+
+    ONE CALLER, generate(), and deliberately: the readiness probe must never
+    reach this. See point 3 above and the shape rule in scripts/lint.sh.
+    """
+    if not quota_enabled():
+        return None
+
+    now = time.time()
+    used = await quota_gpu_seconds_used(conn, user, now)
+
+    if used is None or used < QUOTA_GPU_SECONDS:
+        return None
+
+    return quota_refusal_text(used, now)
+
+
+def quota_headers(now: float | None = None) -> dict:
+    """
+    Retry-After on the refusal, in seconds, so a client that retries on a 429
+    does not do it every second until the month turns over. The same instant
+    the message names, in the form the HTTP spec defines.
+    """
+    now = time.time() if now is None else now
+
+    return {"Retry-After": str(max(1, int(quota_period_reset(now) - now)))}
+
+# END QUOTA BREAKER
 # ---------------------------------------------------------------------------
 
 
@@ -1313,8 +1531,6 @@ async def generate(request: Request):
     if depth >= MAX_QUEUE_DEPTH:
         raise HTTPException(503, f"queue is full ({depth} jobs). Try again shortly.")
 
-    job_id = str(uuid.uuid4())
-
     # Who spent the GPU, and — since Q1 — whose fair-queueing lane this job
     # belongs to. oauth-proxy sets X-Forwarded-User for the authenticated user
     # (its pass-user-headers default); recording it answers "whose job is
@@ -1325,6 +1541,29 @@ async def generate(request: Request):
     # all going to run regardless, and claiming someone else's identity only
     # shares their slots. See BEGIN FAIR QUEUEING above.
     user = request.headers.get("x-forwarded-user", "")
+
+    # Q5's quota breaker, and the only place it is consulted. 429 rather than
+    # the 503 above, because this is one caller's ceiling and not the pool's:
+    # a second submitter is unaffected, and a client that treats 503 as "the
+    # service is down" would be told the wrong thing.
+    #
+    # HERE, before the job_id exists and before anything is written, because
+    # the only refusal worth having is one that leaves nothing behind. A check
+    # placed after fair_enqueue_call() would answer the browser with a
+    # rejection while a worker spent a GPU on the job anyway — worse than no
+    # breaker, since the user is told nothing ran. enterprise/test/
+    # check-95-quota-breaker.py asserts exactly that, by counting the writes
+    # to comfy:queue rather than by reading the response.
+    #
+    # quota_refusal() returns None whenever the answer is not knowable, so
+    # every failure of this read is a submission that proceeds. See
+    # BEGIN QUOTA BREAKER.
+    refusal = await quota_refusal(conn, user)
+
+    if refusal:
+        raise HTTPException(429, refusal, headers=quota_headers())
+
+    job_id = str(uuid.uuid4())
 
     # The envelope, not a hand-rolled dict: every reserved field is written
     # here with its default, so the worker never has to ask whether a key is

@@ -39,10 +39,10 @@ machine pool provisioning a node, EFS, oauth-proxy and the GPU itself prove
 nothing until there is a cluster at ~$2.04/hour. Only five items are
 cluster-only for a failing assertion; ten have a laptop half.
 
-**Eighteen invariants are load-bearing** — `docs/09-engineering-handoff.md`
+**Nineteen invariants are load-bearing** — `docs/09-engineering-handoff.md`
 §3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth,
-Q3 the seventeenth and Q4 the eighteenth, which is what "changes an invariant"
-looks like in practice.)
+Q3 the seventeenth, Q4 the eighteenth and Q5 the nineteenth, which is what
+"changes an invariant" looks like in practice.)
 Thirteen of the items touch at least one, so "the risky ones get a second
 reviewer" is not a useful filter. The filter that *is* useful: an item is
 high-risk if it **changes** an invariant rather than merely working near one.
@@ -200,7 +200,7 @@ was wrong.
 | Q3 | Per-user output workspaces — **landed**, laptop half | Medium | **High** | Queue + cluster | `enterprise/test/check-60-user-workspaces.py`: two submitters land in two places, a hostile username is confined rather than mangled or escaped, and an anonymous submission still works and does not alias onto a real user — plus lint shapes for the directory mode. The arbitrary-UID half is on the cluster-day list below |
 | Q6 | Estimated-wait metric — **landed** | Small | Low | Queue | `enterprise/test/check-80-estimated-wait.py`: `comfy_estimated_wait_seconds` is exposed on `/metrics` in proper gauge form, reads zero or absent only with an empty queue, and reflects a manufactured entry's real `submitted_at` (grows with wall-clock time, not with a constant or queue depth) — the scaler half is I4 |
 | Q4 | Showback report — **landed** | Small | Low | Queue | `enterprise/test/check-90-showback.py`: `/api/showback` reports GPU seconds against the submitting user and tracks real wall-clock duration rather than a constant, two users' totals do not bleed into each other, an anonymous submission lands in its own explicit bucket, a *failed* job is still billed, a job whose worker was SIGKILLed is accounted rather than lost, and the `comfy:showback:*` key count stays below the number of identities that fed it — plus lint shapes for the expiry and the identity cap, which a one-minute suite cannot see |
-| Q5 | GPU-second quota breaker | Medium | Medium | Queue | e2e including quota exhausted and quota data missing (must fail open) |
+| Q5 | GPU-second quota breaker — **landed** | Medium | Medium | Queue | `enterprise/test/check-95-quota-breaker.py`: a submitter already over the ceiling produces ZERO writes to `comfy:queue` — armed before the request, counted, not inferred from `LLEN` afterwards — and is refused with a 429 that names the quota; a submitter under it, one with no accounting at all, and one whose accounting is present but unreadable are each queued exactly once and run to completion; and `/readyz` stays `{"ok": true}` throughout, with the over-quota identity sent on the readyz request itself. Plus the lint shape that keeps the breaker out of the readiness path — the half a green suite cannot see |
 | I1 | Schedule the warm window | Small | Low | Infra | New unit test on a pure helper; behaviour on cluster day |
 | I2 | Split the worker image | Medium | Low | Infra | A new CI job — the existing one builds only the gateway image |
 | I3 | Placeholder pod + PriorityClass | Medium | Medium | Infra | Cluster day: node held warm, real job still preempts |
@@ -437,6 +437,73 @@ teardown is "this month only, from the moment the cluster came back". If the
 report matters monthly, that two-line habit is the whole fix; if it matters
 more than monthly, the next step is shipping the same JSON to S3 from a
 CronJob, which is a new item and not this one.
+
+### Q5 landed — what it counts, which way it fails, and what it cannot do
+
+Q5 is done: `QUOTA_GPU_SECONDS` is a per-submitter ceiling on GPU seconds
+inside one showback period, enforced in `generate()` before a job is placed on
+the queue and refused with `429` plus a message saying what happened and when
+it resets. It is **off by default** (`0`), it lives in `.env.example` with the
+rest of the configuration, and `enterprise/setup.sh` substitutes it into the
+gateway Deployment the same way `MAX_GPU_WORKERS` is substituted into the
+`ScaledObject`.
+
+**It reads Q4's accounting and adds none of its own.** One `HGET` of
+`comfy:showback:<period>`, field `u:<user>` — the field
+`SHOWBACK_ACCRUE_LUA` writes and `/api/showback` reports. That means a
+refusal is always explainable from a URL the person refused can be pointed
+at, and it means the quota inherits Q4's definition of a GPU second whole,
+including what it over-counts. It also inherits the reaper decision for free:
+`excluded_gpu_seconds` is a different field, so time lost to workers dying
+mid-generation is not counted against the user who submitted the job, exactly
+as the Q4 section above says it must not be.
+
+**Anonymous submissions count against the anonymous bucket rather than being
+exempt.** Under `AUTH_MODE=none` that makes the ceiling one shared pool for
+every caller who sends no header, which is a real consequence and is written
+down here so nobody discovers it. The alternative — exempting the no-header
+case — turns the breaker off in exactly the deployment shape where "anyone
+with the URL can spend your GPU budget" is already true. Neither choice is a
+security control: the identity is client-supplied, so varying a header buys a
+fresh quota either way. This is a cost guardrail, and it uses the identity the
+report uses.
+
+**It fails open through four doors, loudly.** Redis unreachable, the field
+absent, the field present but not a number, and `QUOTA_GPU_SECONDS` itself not
+a number — every one of them proceeds with the submission. The first, third
+and fourth print a line on the gateway log naming what could not be read; the
+second does not, because "this submitter has spent nothing this period" is the
+ordinary case and logging it would bury the three that matter. Absence and
+unreadability are separate cases on purpose, and
+`check-95-quota-breaker.py` drives them separately: a strict `float()` gets
+the unreadable one backwards, raising a 500 where the requirement is to let
+the job through. The env var is parsed tolerantly for the same reason, unlike
+`MAX_QUEUE_DEPTH`'s `int()` — a breaker that crash-loops the gateway over its
+own configuration is a worse outage than the spend it guards against.
+
+**It is nowhere near `readyz()`, and that is enforced structurally.** The
+roadmap's own sentence — "It must not be wired into `readyz()`" — is now the
+nineteenth §3 invariant and a `scripts/lint.sh` rule that walks `hub.py`'s
+call graph: nothing reachable from `readyz()`, transitively, may mention the
+quota, and `quota_refusal()` must be called from `generate()` and nothing
+else. The rule also fails if the breaker is deleted, since every other clause
+in it is an absence and an absence is trivially true of an empty file.
+`check-95` asserts the runtime half (`/readyz` reads `{"ok": true}` while a
+submitter is over quota, with that identity sent on the readyz request
+itself), which is necessary and not sufficient: a health endpoint that read
+the quota would still be green on any gateway whose reader is under the cap.
+
+**What it deliberately does not do.** It does not touch jobs that are already
+queued or running — it is admission control on new submissions, which is why
+the refusal says so. And it is a ceiling on *past* accrual, not a reservation:
+seconds land in the Hash when a job reaches a terminal state, so a submitter
+who queues twenty jobs at once is under quota for all twenty and goes over
+while they run. Bounding that would mean reserving an estimate at submit and
+reconciling it at completion — a second accounting path, an estimate for a
+workflow nobody has run yet, and a reconciliation that has to survive the
+reaper. The roadmap chose one accounting path; the overshoot is bounded by
+`MAX_QUEUE_DEPTH` and by the pool size, and the budget alarm remains the
+backstop.
 
 ### Deferred, with reasons
 

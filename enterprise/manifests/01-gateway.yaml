@@ -70,6 +70,16 @@ spec:
             - name: QUEUE_KEY
               value: comfy:queue
 
+            # Q5's per-user GPU-second quota (docs/10-roadmap.md). The
+            # placeholder is substituted from .env by enterprise/setup.sh —
+            # the same shape 03-autoscale.yaml's maxReplicaCount uses — so
+            # the number lives with the rest of the configuration and not
+            # here. Applied by hand, this file leaves the value unsubstituted
+            # and hub.py reads anything it cannot parse as a number as OFF,
+            # which is also the default: see BEGIN QUOTA BREAKER in hub.py.
+            - name: QUOTA_GPU_SECONDS
+              value: "QUOTA_GPU_SECONDS_PLACEHOLDER"
+
           resources:
             requests:
               cpu: 100m

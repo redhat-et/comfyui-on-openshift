@@ -166,6 +166,29 @@ against a `noeviction` Redis. What this cannot see is the accumulator's
 expiry, which is measured in months, or its identity cap, which is a thousand;
 `scripts/lint.sh` pins both.
 
+**An over-quota submission never reaches the queue, and everything else
+still does.** `check-95-quota-breaker.py` (docs/10-roadmap.md, Q5) starts its
+own gateway on :8101 with `QUOTA_GPU_SECONDS` pinned to a value it chose —
+the same reason `check-30` starts its own agent with a shrunk
+`HEARTBEAT_TTL` — and seeds four synthetic submitters straight into the real
+showback Hash: one far over the ceiling, one under it, one with no field at
+all, and one whose field holds a non-numeric value. The refusal is proven as
+**zero writes to `comfy:queue`**, counted by a `QueueWriteWatcher` armed
+before the request, not by an `LLEN` afterwards — an implementation that
+rejects the response *after* enqueueing is worse than none, and a queue read
+after the fact cannot see the difference once the live agent has popped the
+job. The other three must each be queued exactly once and run to completion,
+which is the fail-open requirement stated as three separate fixtures: a
+missing field, an unreadable one, and a genuinely under-quota user are three
+different code paths, and a strict `float()` passes two of them. Finally
+`/readyz` must still read exactly `{"ok": true}` with the over-quota identity
+sent on the readyz request itself. That last one passes trivially today and is
+meant to: it is the regression guard against wiring the breaker into the
+readiness probe, which would turn one person's ceiling into a gateway-wide
+outage. What it cannot see is the *shape* of that separation — a health
+endpoint that reads the quota is green whenever its reader is under the cap —
+so `scripts/lint.sh` walks `hub.py`'s call graph for it.
+
 ## What it does not cover
 
 Anything requiring a real cluster: KEDA actually scaling, the machine pool

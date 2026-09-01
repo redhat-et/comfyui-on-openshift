@@ -589,7 +589,7 @@ that bites first — `make preflight` checks it, and it is a multi-day fix.
 
 ## Ideas worth doing next
 
-Ordered by payoff per unit of work. Three have landed, along with three
+Ordered by payoff per unit of work. Four have landed, along with three
 foundation items that were never on this list — worker resource sizing, a
 versioned queue payload, and test-harness discovery. **Struck items stay here:
 shipped ones because a roadmap that never visibly moves is a wish list, and
@@ -687,10 +687,24 @@ at all.
     that rendered last quarter still renders. Reject anything that is not
     `.safetensors` while you are there — `.ckpt` files are Python pickles and
     loading one executes whatever is inside it. *(Medium.)*
-11. **A cost circuit breaker in the gateway.** Read month-to-date spend from
-    AWS Budgets and refuse new submissions past a threshold, or give each user
-    a GPU-second quota. The budget alarm currently emails you *after* the
-    money is gone. *(Medium.)*
+11. ~~**A cost circuit breaker in the gateway.**~~ **Shipped, as the quota
+    half** — `QUOTA_GPU_SECONDS` in `.env` gives each user a GPU-second ceiling
+    per UTC month, and past it `/api/generate` refuses with a `429` that says
+    how much was used, that other submitters are unaffected, and when the
+    quota resets (`docs/10-roadmap.md`, Q5). It is **off by default**, and it
+    reads the showback accounting from item 7 rather than adding a second one —
+    so a refusal is explainable from `GET /api/showback`. The AWS Budgets half
+    was deliberately *not* built: it would put cloud credentials on the one pod
+    that is the whole public attack surface, to enforce a figure that lags real
+    spend by hours. Two properties matter more than the feature. It **fails
+    open** — unreadable accounting, an unreachable Redis, a garbled setting,
+    all let the job through, loudly, because a breaker that trips on a broken
+    dependency halts a cluster you are already paying for. And it is kept out
+    of `/readyz` by a lint rule that walks the call graph, because a quota
+    check on the readiness probe would take the entire gateway out of service
+    the moment one person went over. It is a guardrail on past accrual, not a
+    reservation: someone who queues twenty jobs at once goes over while they
+    run. The budget alarm remains the backstop.
 12. **Build the images with OpenShift Pipelines.** Bumping `COMFYUI_REF`
     becomes a pipeline run with a signed output rather than a laptop running
     `setup.sh`. *(Medium, and the right move once more than one person owns

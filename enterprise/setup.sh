@@ -28,6 +28,17 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 : "${ENABLE_MANAGER:=false}"
 : "${COMFYUI_REF:=v0.32.0}"
 : "${GPU_NODE_LABEL:=nvidia.com/gpu.present=true}"
+: "${QUOTA_GPU_SECONDS:=0}"
+
+# Off unless the operator chose a number, and off rather than fatal if they
+# chose something that is not one: this is a cost breaker, and a breaker that
+# refuses to deploy over its own configuration is a worse outage than the
+# spend it guards against. hub.py takes the same posture on the value it
+# actually reads (BEGIN QUOTA BREAKER).
+if ! printf '%s' "$QUOTA_GPU_SECONDS" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+    warn "QUOTA_GPU_SECONDS=${QUOTA_GPU_SECONDS} is not a number — the per-user GPU-second quota will be OFF"
+    QUOTA_GPU_SECONDS=0
+fi
 
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-openshift-keda}"
 
@@ -40,6 +51,15 @@ info "namespace  $APP_NAMESPACE"
 info "auth       $AUTH_MODE"
 info "workers    0..${MAX_GPU_WORKERS} ($GPU_INSTANCE_TYPE)"
 info "scale-to-0 $SCALE_TO_ZERO"
+
+# Any spelling of zero, not the literal "0": hub.py treats <= 0 as off, and a
+# banner that says "0.0 GPU-seconds per user" while the gateway is enforcing
+# nothing is the kind of small lie an operator only finds out about later.
+if [[ "$QUOTA_GPU_SECONDS" =~ ^0+(\.0+)?$ ]]; then
+    info "quota      off (QUOTA_GPU_SECONDS=${QUOTA_GPU_SECONDS})"
+else
+    info "quota      ${QUOTA_GPU_SECONDS} GPU-seconds per user per UTC month"
+fi
 
 # ---------------------------------------------------------------------------
 # Preconditions
@@ -314,16 +334,23 @@ fi
 
 log "Applying manifests"
 
-apply_with_image()
+# Two substitutions, not one. The image is built above and cannot be a literal
+# in the manifest; QUOTA_GPU_SECONDS is Q5's per-user GPU-second quota
+# (docs/10-roadmap.md), which is a per-deployment choice and so lives in .env
+# beside the rest of the configuration rather than as a number somebody edits
+# into a manifest — the same reason MAX_GPU_WORKERS is substituted into
+# 03-autoscale.yaml below. Called from both places the gateway is applied,
+# because a manifest applied from only one of them would carry the placeholder.
+apply_gateway()
 {
-    local file="$1" placeholder="$2" image="$3"
-
-    sed "s#image: ${placeholder}#image: ${image}#" "$file" \
+    sed -e "s#image: comfy-gateway:latest#image: ${GATEWAY_IMAGE}#" \
+        -e "s#QUOTA_GPU_SECONDS_PLACEHOLDER#${QUOTA_GPU_SECONDS}#" \
+        "${MANIFESTS}/01-gateway.yaml" \
         | oc apply -n "$APP_NAMESPACE" -f -
 }
 
 oc apply -n "$APP_NAMESPACE" -f "${MANIFESTS}/00-redis.yaml"
-apply_with_image "${MANIFESTS}/01-gateway.yaml" "comfy-gateway:latest" "$GATEWAY_IMAGE"
+apply_gateway
 
 # The worker's nodeSelector has to name a label the machine pool declares, or
 # the cluster autoscaler cannot tell that a pending pod would fit on a node it
@@ -379,7 +406,7 @@ else
         warn "removing the oauth-proxy sidecar left over from AUTH_MODE=oauth"
         oc delete deployment comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
         oc delete route comfy -n "$APP_NAMESPACE" --ignore-not-found
-        apply_with_image "${MANIFESTS}/01-gateway.yaml" "comfy-gateway:latest" "$GATEWAY_IMAGE"
+        apply_gateway
     fi
 
     warn "AUTH_MODE=none — the gateway will be public with no login."

@@ -789,6 +789,142 @@ fi
 
 # ---------------------------------------------------------------------------
 
+log "the quota breaker is not reachable from readyz() (docs/10-roadmap.md, Q5)"
+
+# The one thing about Q5 that a green test run cannot tell you.
+#
+# /readyz is the gateway's readiness probe (enterprise/manifests/01-gateway.yaml).
+# A quota check inside it — or inside anything it calls — would take the whole
+# gateway out of its Service the moment ONE submitter went over their
+# GPU-second ceiling: every browser WebSocket reporting an in-flight job
+# dropped, no new submissions from anybody, on a GPU pool that is still
+# running work and still costing money. An outage caused by the control that
+# exists to prevent one, and the roadmap names it: "It must not be wired into
+# readyz()".
+#
+# enterprise/test/check-95-quota-breaker.py asserts /readyz stays healthy
+# while a submitter is over quota, which is the runtime half. It cannot see
+# the shape: a future edit that reads the quota inside a helper readyz()
+# happens to call — for a "one health page shows everything" dashboard, say —
+# passes that check on any gateway whose Redis is answering and whose reader
+# is under the cap, and fails in production, once, at the worst moment. So the
+# separation is held here as a property of the call graph instead.
+#
+# It is deliberately more than a grep for "quota" inside readyz's body: the
+# walk below follows every module-level function readyz reaches, transitively,
+# because "readyz calls health_summary() which calls quota_refusal()" is the
+# same outage with one more hop in it.
+
+if python3 - <<'EOF'
+import ast, sys
+
+PATH = "enterprise/gateway/hub.py"
+source = open(PATH).read()
+tree = ast.parse(source)
+
+problems = []
+
+# Every module-level def, sync or async, by name.
+functions = {node.name: node
+             for node in tree.body
+             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+
+def names_in(node):
+    """
+    Every name mentioned anywhere under a node: bare names, and the attribute
+    half of a dotted access. Names, not source text — a docstring that
+    discusses the quota is not a reference to it, and the point of this rule
+    is what the code REACHES.
+    """
+    found = set()
+
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            found.add(child.id)
+        elif isinstance(child, ast.Attribute):
+            found.add(child.attr)
+
+    return found
+
+
+def quota_names(names):
+    """
+    The breaker's surface, recognised by name rather than by a list kept here:
+    QUOTA_GPU_SECONDS, quota_refusal(), and anything added to the block later
+    is covered without anybody remembering to come back and add it.
+    """
+    return sorted(name for name in names if "quota" in name.lower())
+
+
+# Vacuity guards. Every check below this point is an ABSENCE — "the readiness
+# path does not touch the breaker" — and an absence is trivially true of a
+# file with no breaker in it. These are what make the rule fail loudly if Q5
+# is deleted or renamed, instead of passing most completely.
+if "quota_refusal" not in functions:
+    problems.append("quota_refusal() is gone. The breaker must have exactly "
+                    "one entry point, or 'is the breaker in the readiness "
+                    "path?' stops being a question about one call")
+
+if "QUOTA_GPU_SECONDS" not in names_in(tree):
+    problems.append("QUOTA_GPU_SECONDS is not mentioned in this file at all — "
+                    "the per-user ceiling this rule keeps out of the "
+                    "readiness path does not exist, so the rule is guarding "
+                    "nothing")
+
+if "readyz" not in functions:
+    problems.append("readyz() is gone or has been renamed — this rule can no "
+                    "longer see the readiness path it is guarding")
+
+# The positive half: the breaker IS called, and only from the submit path.
+# Without this the rule below would pass most completely if Q5 were deleted.
+callers = {name for name, node in functions.items()
+           if "quota_refusal" in names_in(node)}
+
+if "quota_refusal" in functions and callers != {"generate"}:
+    problems.append(f"quota_refusal() is called from {sorted(callers) or 'nothing'}, "
+                    "not from generate() alone. The quota is admission "
+                    "control on submission: one caller, in the one place that "
+                    "can refuse before anything is written to the queue")
+
+# The negative half, transitively: nothing readyz() reaches may touch it.
+if "readyz" in functions:
+    reachable, pending = set(), ["readyz"]
+
+    while pending:
+        name = pending.pop()
+
+        if name in reachable or name not in functions:
+            continue
+
+        reachable.add(name)
+        pending.extend(names_in(functions[name]) & set(functions))
+
+    for name in sorted(reachable):
+        touched = quota_names(names_in(functions[name]))
+
+        if touched:
+            via = "" if name == "readyz" else f" (reached from readyz() via {name}())"
+            problems.append(f"{name}() references {touched}{via}. The quota "
+                            "breaker must not be reachable from the readiness "
+                            "probe: one submitter over their ceiling would "
+                            "otherwise pull the whole gateway out of service "
+                            "and drop every WebSocket reporting an in-flight "
+                            "job")
+
+for problem in problems:
+    print(f"  {PATH}: {problem}")
+
+sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then
