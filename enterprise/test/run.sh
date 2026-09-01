@@ -97,7 +97,37 @@ echo "    up (pid $GW)"
 #
 # The suite still stops at the first failing check: later checks starting from
 # the wreckage of an earlier failure report noise, not findings.
+#
+# TWO WAYS A CHECK FAILS, and both are folded. Exit status is the contract
+# (enterprise/test/README.md), but it is a contract a check can hold up to and
+# still lie: every check in this directory prints one PASS/FAIL line per
+# assertion through the same four-line check() helper, collects the failures in
+# a list, and turns that list into its exit code in its LAST few lines. A check
+# that loses those lines — an edit that drops the `sys.exit(1)`, a `raise
+# SystemExit` under an `if` that stopped being true, a helper that appends to a
+# list nothing reads — prints its FAIL lines exactly as loudly as ever and
+# exits 0, and a suite that folds only `$?` stays green while its own output
+# says otherwise. CI reads that same exit code, so nobody sees the FAIL lines
+# either. So the output is read as well, and a printed failure fails the suite
+# on its own.
+#
+# THE MARKER is the check() helper's own line format, anchored: a line that
+# begins with exactly two spaces, then FAIL, then two more spaces
+# (FAIL_MARKER below). It is not a bare search for the word, which would fire
+# on a check's legitimate prose — an assertion NAME containing "must not FAIL",
+# a Redis value echoed into a detail field, the `N FAILED: [...]` summary line
+# every check prints (that one starts with a digit, not with the marker, and
+# only ever appears beside a non-zero exit anyway). Anchoring at the start of a
+# line and requiring the helper's exact two-space padding means the only thing
+# that trips it is a check reporting a failed assertion in the format this
+# suite defines for reporting one. A green run prints no such line at all.
 # ---------------------------------------------------------------------------
+
+# Two spaces, FAIL, two spaces, at the start of a line — see above. Kept as one
+# named value because the README documents it as the reporting contract a new
+# check has to follow, and a marker spelled twice is a marker that is wrong in
+# one of the places.
+FAIL_MARKER='^  FAIL  '
 
 AGENT=""
 AGENT_N=0
@@ -151,11 +181,33 @@ for check in check*.py; do
   fi
 
   echo "--- $check (agent pid $AGENT)"
-  timeout "$CHECK_TIMEOUT" python3 "$check" "$AGENT"
-  RC=$?
+
+  # tee, not a redirect: the output still streams to the terminal (and to CI's
+  # log) as it is produced, and a copy is kept so the FAIL marker can be read
+  # off it. PIPESTATUS[0] rather than $?, because $? is tee's status here.
+  # stderr is folded in so a traceback lands in the same place as the rest.
+  CHECK_OUT="${check%.py}.out"
+  timeout "$CHECK_TIMEOUT" python3 "$check" "$AGENT" 2>&1 | tee "$CHECK_OUT"
+  RC=${PIPESTATUS[0]}
   RAN=$(( RAN + 1 ))
 
-  [ "$RC" -eq 0 ] || { echo "    $check FAILED (rc $RC)"; break; }
+  PRINTED_FAILURES=$(grep -c "$FAIL_MARKER" "$CHECK_OUT" 2>/dev/null || true)
+  PRINTED_FAILURES=${PRINTED_FAILURES//[^0-9]/}
+
+  # Which one fired is named, because they are different bugs: a non-zero exit
+  # is a check that failed, and a printed failure with rc 0 is a check whose
+  # own exit status stopped reporting what its assertions found.
+  if [ "$RC" -ne 0 ]; then
+    echo "    $check FAILED (rc $RC, ${PRINTED_FAILURES:-0} printed FAIL line(s))"
+    break
+  fi
+
+  if [ "${PRINTED_FAILURES:-0}" -gt 0 ]; then
+    echo "    $check FAILED (${PRINTED_FAILURES} printed FAIL line(s) but exited 0"
+    echo "    — the check's own exit status no longer reports what it asserted)"
+    RC=1
+    break
+  fi
 done
 
 if [ "$RC" -eq 0 ] && [ "$RAN" -eq 0 ]; then

@@ -112,7 +112,9 @@ async def prompt(body: dict):
         await asyncio.sleep(SLOW_PROMPT_DELAY_S)
     pid = str(uuid.uuid4())
     asyncio.create_task(run(body.get("client_id"), pid, slow="__slow__" in wf,
-                            vram_oom="__vram_oom__" in wf, die="__die__" in wf))
+                            vram_oom="__vram_oom__" in wf, die="__die__" in wf,
+                            empty_frame="__empty_frame__" in wf,
+                            close_after_history="__close_after_history__" in wf))
     return {"prompt_id": pid, "number": 1, "node_errors": {}}
 
 @app.get("/history/{pid}")
@@ -123,7 +125,8 @@ async def hist(pid: str):
 async def interrupt():
     return {}
 
-async def run(client_id, pid, slow=False, vram_oom=False, die=False):
+async def run(client_id, pid, slow=False, vram_oom=False, die=False,
+              empty_frame=False, close_after_history=False):
     global next_output_override
     ws = clients.get(client_id)
     await asyncio.sleep(0.1)
@@ -150,6 +153,36 @@ async def run(client_id, pid, slow=False, vram_oom=False, die=False):
             }})
             return
 
+        if empty_frame and i == 2:
+            # The frame websocket-client hands worker_agent.py when a server
+            # closes the socket: recv() returns "" instead of raising (see
+            # dying_ws below). Sent as a real empty text frame, and the
+            # connection is deliberately LEFT OPEN afterwards, because that is
+            # the only shape in which the agent's `if raw == ""` guard is
+            # observable at all: close the TCP as well and the very next recv()
+            # raises anyway, so a guard that is missing costs one loop
+            # iteration instead of the whole job. Held open, a missing guard
+            # means "" fails to parse, the loop continues, and the job sits
+            # there holding a card until JOB_TIMEOUT -- 1800 seconds in
+            # production. Nothing is written to /history, so the agent's one
+            # look there finds nothing and it must fail the job NOW, naming the
+            # connection.
+            await send(ws, "")
+            return
+
+        if close_after_history and i == 2:
+            # The other side of that door: the socket goes, but the work
+            # actually landed. /history is populated FIRST and only then is the
+            # connection closed -- with an ordinary code, so the agent's recv()
+            # sees the empty frame -- and the terminal event is never sent. The
+            # agent must ask /history rather than assume the worst, and report
+            # the outputs it finds there.
+            history[pid] = {"outputs": {"9": {"images": [
+                {"filename": "out_0001.png", "subfolder": "", "type": "output"}]}}}
+            if ws is not None:
+                dying_ws[id(ws)] = 1000
+            return
+
         if die and i == 2:
             # The host-RAM case, as far as this harness can carry it: the
             # ComfyUI PROCESS is gone, so its socket closes mid-job and its
@@ -164,7 +197,7 @@ async def run(client_id, pid, slow=False, vram_oom=False, die=False):
             # cid-keyed flag is then consumed by whichever polls first, which
             # closes an already-dead connection and leaves the live one open.
             if ws is not None:
-                dying_ws.add(id(ws))
+                dying_ws[id(ws)] = 1006
             return
 
     filename, subfolder = "out_0001.png", ""
@@ -182,15 +215,31 @@ async def run(client_id, pid, slow=False, vram_oom=False, die=False):
     await send(ws, {"type": "executing", "data": {"node": None, "prompt_id": pid}})
 
 async def send(ws, msg):
+    """One frame to the agent. A msg of "" is sent verbatim as an empty text
+    frame rather than as JSON, which is what `__empty_frame__` needs."""
     if ws:
         try:
-            await ws.send_text(json.dumps(msg))
+            await ws.send_text("" if msg == "" else json.dumps(msg))
         except Exception:
             pass
 
-# id()s of the WebSocket objects whose connection should be dropped, as a dead
-# ComfyUI process would drop it. Set by run(); consumed by the endpoint below.
-dying_ws: set = set()
+# The WebSocket objects whose connection should be closed, keyed by id() and
+# mapped to the close code to use. Set by run(); consumed by the endpoint
+# below. The code is not decoration -- it decides what the AGENT's client
+# library reports, and the two cases are genuinely different:
+#
+#   1006 is the reserved "abnormal closure" code, which a server may not put
+#   on the wire: uvicorn's websockets layer refuses to serialize it, the
+#   endpoint raises, and the TCP connection is simply dropped. websocket-client
+#   then raises WebSocketConnectionClosedException out of recv(). This is
+#   `__die__`, i.e. check-70's dead ComfyUI PROCESS.
+#
+#   1000/1001 are ordinary close codes and are sent as a real close frame.
+#   websocket-client returns that frame from recv() as the EMPTY STRING rather
+#   than raising -- which is the case worker_agent.py's `if raw == ""` guard
+#   exists for, and the one no fixture reached before
+#   check-75-closed-socket.py.
+dying_ws: dict = {}
 
 
 @app.websocket("/ws")
@@ -206,9 +255,9 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             await asyncio.sleep(0.05)
             if id(ws) in dying_ws:
-                dying_ws.discard(id(ws))
+                code = dying_ws.pop(id(ws))
                 clients.pop(cid, None)
-                await ws.close(code=1006)
+                await ws.close(code=code)
                 return
     except WebSocketDisconnect:
         clients.pop(cid, None)

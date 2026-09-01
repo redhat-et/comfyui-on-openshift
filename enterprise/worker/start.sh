@@ -17,8 +17,12 @@
 #     zombie and the container never restarts.
 #
 # This version traps SIGTERM, forwards it to both children, and exits if either
-# one dies — which lets the kubelet restart the pod instead of leaving a
-# half-dead worker in the pool.
+# one dies. Exiting is what lets restartPolicy: Always do its job — but that
+# policy restarts the CONTAINER inside this pod, not the pod itself: the pod
+# object, its name, and its HOSTNAME all survive. worker_agent.py's WORKER
+# IDENTITY block (note 9) exists because of exactly this distinction — see it
+# before assuming a restart looks like a fresh pod to anything keyed on
+# HOSTNAME.
 
 set -uo pipefail
 
@@ -82,7 +86,7 @@ agent_pid=$!
 wait -n "$comfy_pid" "$agent_pid"
 exit_code=$?
 
-echo "[start] a child exited (status ${exit_code}) — shutting the pod down"
+echo "[start] a child exited (status ${exit_code}) — shutting this container down"
 
 kill -TERM "$comfy_pid" "$agent_pid" 2>/dev/null
 wait 2>/dev/null

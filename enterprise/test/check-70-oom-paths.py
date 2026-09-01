@@ -13,18 +13,31 @@ reach.
   load-bearing once Q2 added retry at all.
 
   HOST RAM OOM -- the kernel kills the ComfyUI process. Here that is simulated
-  as far as this harness honestly can: the socket closes mid-job and /history
-  never learns the prompt existed. The agent must surface a terminal failure
-  rather than parking forever on a dead process. Note what actually resolves
-  it -- the per-job deadline, not the closed socket. This is the only
-  assertion in the suite that exercises JOB_TIMEOUT, which is why it is
-  allowed to cost a minute.
+  as far as this harness honestly can, via fake_comfy.py's `__die__`: the
+  socket drops abnormally (code 1006) and /history never learns the prompt
+  existed. websocket-client turns that into a raised
+  WebSocketConnectionClosedException, not a silent "" return -- see
+  fake_comfy.py's `dying_ws` comment for why 1006 specifically raises rather
+  than closing cleanly. The agent's dedicated except clause (worker_agent.py,
+  point 9's neighbor around `if raw == ""`) catches it, asks /history once,
+  and fails the job at once with a reason naming the lost connection. It does
+  NOT wait out JOB_TIMEOUT -- that used to be true here (see e0e60ec) only
+  because this fixture's own close call was broken, not because a closed
+  socket was otherwise unresolvable; fake_comfy.py's current `dying_ws`
+  mechanism fixed that flakiness, and worker_agent.py's except clause now
+  resolves this path in well under 30s regardless (see the check below). The
+  genuinely slow, JOB_TIMEOUT-bound mechanism -- an ordinary close that leaves the
+  connection open, so recv() returns "" once and then times out repeatedly --
+  is a DIFFERENT fixture (`__empty_frame__`) covered by
+  check-75-closed-socket.py, not by this file.
 
 WHAT THIS CANNOT REACH, and why the coverage claim stops here: a real CUDA
 allocation failure, real host memory pressure, and the kubelet's
 eviction-versus-OOMKilled distinction. In production the host-RAM case also
-takes the POD down -- start.sh waits on both children, so a dead ComfyUI ends
-the pod and the gateway's reaper fails the stranded job. There is no start.sh
+takes the CONTAINER down -- start.sh waits on both children, so a dead
+ComfyUI ends the container (restarted in the same pod by `restartPolicy:
+Always`) and the gateway's reaper fails the stranded job regardless. There is
+no start.sh
 in this harness; that half is check-30's SIGKILL territory and cluster day's.
 """
 import json, os, time, urllib.request

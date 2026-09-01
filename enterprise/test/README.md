@@ -34,12 +34,18 @@ that are easy to get wrong, impossible to notice in a demo, and miserable to
 debug in a cluster. Each of these corresponds to a bug in the original design,
 documented in `docs/07-design-review.md`.
 
-**Progress is filtered by `prompt_id`.** The stub deliberately emits events for
-a second, unrelated prompt on the same socket, including a terminal
-`executing: node=null`. An agent that does not filter ends the wrong job's
-stream and reports success on a job still running. The test asserts no foreign
-events leak through and that the foreign terminal event does not end the job
-early.
+**Every event is filtered by `prompt_id`, terminal ones included.** The stub
+deliberately emits events for a second, unrelated prompt on the same socket,
+including a terminal `executing: node=null`. An agent that does not filter ends
+the wrong job's stream and reports success on a job still running. The check
+counts, over the job's whole stream: exactly zero events belonging to any other
+prompt, exactly one terminal event and that one carrying this job's own
+`prompt_id`, and all three of this job's progress events. The terminal half
+needs its own count because the foreign terminal event arrives *after* all
+three progress events — so an agent that filters progress and not terminals
+ends the job on somebody else's completion and still shows three progress
+events. The assertion that stood here before ("at least three progress
+events") passes on exactly that agent.
 
 **A late subscriber loses nothing.** The test waits three seconds — long enough
 for the job to finish — before opening the WebSocket, and asserts it still
@@ -83,6 +89,27 @@ OOM-kill whichever worker it was requeued onto next. The stub records every
 workflow it is handed, so "ComfyUI had not seen it" is asserted rather than
 assumed on both sides of that line.
 
+**A worker that restarts cannot hide its own stranded job**
+(`check-32-worker-restart.py`). Everything above proves the reaper acts on a
+worker that died and stayed dead, under a replacement with a different name.
+This is the case underneath it. The heartbeat key and the processing list are
+named from the worker's *incarnation* rather than from `HOSTNAME`, because
+`restartPolicy: Always` restarts a container inside its pod and hands it back
+the identity it died with — and the reaper's entire liveness test is pairing
+those two keys by name, so a reused id lets the new incarnation vouch for the
+dead one and the stranded job is skipped for as long as the pod keeps
+restarting. The check SIGKILLs a worker mid-execution and brings a second one
+up under the same `HOSTNAME` inside `HEARTBEAT_TTL`, then asserts the job
+still reaches a terminal state. Three things about the fixture are asserted
+rather than assumed, because each of them silently turns this into a
+different, easier test: the phase breadcrumb reads `executing` (so the
+terminal state can only have come from the reaper), the dead incarnation's
+entry is still parked and unreaped at the instant the replacement registers
+(so the reap did not simply happen first), and the replacement registered
+inside `HEARTBEAT_TTL` of the kill (so this is identity reuse and not an
+ordinary lapse-then-reap). `check-30-sigkill.py`'s scenario B, immediately
+before it, is the control: the same death without the reuse.
+
 **And the two doors into a replay stay shut** (`check-35-retry-doors.py`).
 The breadcrumb decides whether a death is retried, so it has to be true at
 every instant, and the retry has to be about work somebody still wants.
@@ -96,6 +123,102 @@ ComfyUI at all when a healthy worker pops it (the worker's door, and what
 `cancel()` promises: a job that has not been picked up yet never starts). The
 second of those is measured by asking the stub whether the workflow ever
 arrived, which is the only way to see a GPU that was spent.
+
+**A LIVE worker keeps its job, and a reaped one abandons it**
+(`check-36-live-worker-fencing.py`). Every other worker-death check here kills
+something. This one kills nothing, because the failure it covers needs no
+death: the reaper's whole liveness test is whether the heartbeat key exists,
+and `run_job()`'s prologue blocks in three places that used to refresh nothing
+— an unbounded `mkdir` on the shared volume, a 30-second WebSocket connect, a
+30-second POST. A heartbeat that merely lapsed in there read as a death, at a
+phase that is retryable by construction, so a live worker's job was requeued
+underneath it and ComfyUI was handed one workflow twice. Scenario A parks a
+live agent past `HEARTBEAT_TTL` in the ComfyUI connect and asserts its
+heartbeat is still armed there, that `comfy:queue` received no write at all,
+and that the stub was handed the workflow exactly once. Scenario B forces the
+race the keepalive cannot close — it deletes the live agent's heartbeat key out
+from under it until the reaper genuinely requeues the job — and asserts the
+original attempt notices it no longer owns the job and abandons rather than
+submitting beside the retry. Every count comes from an observer armed before
+the event (`QueueWriteWatcher`, the stub's own arrival log, the job's whole
+event stream via `XRANGE`) and is read only after the system has gone idle: on
+a broken implementation the second run starts *after* the terminal event a
+browser stops at, so counting at the terminal event reads 1 either way.
+
+**A reap that fails leaves the job recoverable, and is bounded**
+(`check-37-reap-durability.py`). The reaper is the only code that ever writes a
+terminal event for a job whose worker died, and its loop used to `RPOP`: the
+entry left the processing list *before* the reap ran, so a reap that raised
+anywhere in its body destroyed the only record that the job existed, and the
+`except Exception: pass` above it promised a next tick that had nothing left to
+retry. The check fabricates a stranded entry rather than killing anything —
+what is under test is the reaper's own bookkeeping, not any particular way of
+dying — and injects exactly one fault per scenario. Scenario A replaces the
+job's event stream with a plain string so the terminal `XADD` raises
+`WRONGTYPE`, asserts the reap failed *at that write and nowhere earlier* (the
+terminal status is already on the hash, the stream is still a string), asserts
+the entry is still on the processing list, then lifts the fault and requires
+one terminal event on a later tick. Scenario B replaces the job's state hash
+with a string, so every reap of that entry raises on its first write forever:
+it must be given up on after a bounded number of attempts — more than one, or
+scenario A could never recover either — and set aside on the capped, expiring
+`comfy:reap:undeliverable` list rather than destroyed. Every count comes from
+an observer armed before the reaper could act.
+
+**A retry is not a promotion** (`check-55-retry-placement.py`). Q2's requeue and
+Q1's fair queueing meet in one line of `requeue_orphaned_job()`: a requeued job
+goes back through the same fair-queueing insert a first submission uses. The
+queue is popped from the tail, so a requeue written as a plain `RPUSH` puts the
+retried job ahead of every other submitter, and does it again on every death —
+a submitter whose workers keep dying then starves the lanes that did nothing
+wrong, which is the problem Q1 exists to solve arriving through a door
+`check-50-fair-queue.py` never looks at, because nothing there ever dies. The
+queue-jump is invisible to every other check here: the job is still requeued
+exactly once, still completes, and `comfy:queue` still receives exactly one
+write. Only its POSITION changes. So this check builds a two-lane backlog with
+a real middle (`[A1 B1 A2 B2 A3 B3]` in service order), fabricates one stranded
+job in a THIRD lane — nothing is killed; what is under test is where the reaper
+puts a job, as in `check-37` — and asserts the whole service order afterwards:
+the retried job must land third, at the back of its own lane's round, which is
+neither end of the list. "Not at the front" alone would also be satisfied by a
+requeue banished to the very back, which is equally wrong and for the same
+reason. The agent is frozen throughout (a queue is only observable while
+nothing drains it) and its heartbeat is held armed while it is, so the reaper
+does not read the freeze as a death and start reaping the lists being measured.
+
+**A closed socket resolves now, and both of its outcomes are real**
+(`check-75-closed-socket.py`). websocket-client does not raise on a server-side
+close: it returns the close frame from `recv()` as the empty string, and `""` is
+a `str`, so it walks past the binary-frame guard, fails to parse as JSON, and
+hits `continue` — the recv loop then spins on a dead socket until `JOB_TIMEOUT`
+(1800s in production) with a card held and a browser watching a bar that will
+never move. `worker_agent.py` has a two-line guard for exactly that value, and
+until this check nothing in the suite executed it: `check-70`'s dead-ComfyUI
+fixture closes with code 1006, which a server may not put on the wire, so
+uvicorn drops the TCP connection instead and the client raises. Deleting the
+guard outright left the whole suite green. Scenario A sends a real empty frame
+mid-generation and holds the connection OPEN — the only shape in which the
+guard's absence is visible, since a dropped TCP makes the next `recv()` raise
+anyway — with `/history` never learning the prompt: the job must fail at once,
+naming the lost connection rather than the deadline. Scenario B is the other
+outcome of the same handler, and was equally unreached: the same close, but
+`/history` has the prompt and its manifest by then, and the agent must ask once
+and report `completed` with the outputs rather than turning a lost connection
+into a lost generation. Both budgets are expressed in `JOB_TIMEOUT` rather than
+in numbers the check picked.
+
+**The estimated-wait gauge reads the end of the queue that is served next**
+(`check-80-estimated-wait.py`, Q6). Its other four assertions all run against a
+queue exactly one entry deep, where index `-1` and index `0` are the same entry
+and a one-character edit moves the gauge from one to the other with everything
+still green. They are not the same claim: the list is newest-first and a worker
+pops the tail, so the tail's age is the wait a caller is actually queued behind
+while the head is an entry nobody is waiting on yet — a gauge reading the head
+reports ~0 on an hour-old backlog, which is the number an operator would size
+the pool on. So a second job is submitted behind the manufactured stale one,
+putting minutes between the two ends of the list, and the gauge is required to
+match the served-next end. Both ages are read back off the queue itself rather
+than restated from the constant the check chose.
 
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
@@ -214,6 +337,7 @@ The convention:
 | **argv[1]** | The pid of a worker agent that is up and polling. Ignore it if you do not need it. |
 | **Environment** | Inherited from `run.sh`: Redis on 6399, the gateway on 8100, the stub ComfyUI on 8999, and the shrunk `HEARTBEAT_TTL` / `REAPER_INTERVAL` / `JOB_TIMEOUT` that let worker-death assertions resolve in seconds. |
 | **Exit status** | 0 for pass, non-zero for fail. Print one `PASS`/`FAIL` line per assertion — the existing checks share a four-line `check()` helper worth copying. |
+| **Reported failure** | A printed failure fails the suite on its own, whatever the check exits. `run.sh` reads each check's output for the `check()` helper's own line format — two spaces, `FAIL`, two spaces, at the start of a line — so a check that keeps printing its FAIL lines but stops turning them into a non-zero exit (the `sys.exit(1)` lost in an edit, a failures list nothing reads any more) is still caught, instead of leaving the suite and CI green over its own output. The marker is anchored and padded rather than a search for the word, so ordinary prose — an assertion name that mentions failing, a Redis value echoed into a detail field, the `N FAILED: [...]` summary line — does not trip it. Keep using the shared helper and this is automatic. |
 | **Runtime** | Under `CHECK_TIMEOUT` (default 240s), which is a hang kill-switch rather than a budget. Keep a check to seconds; the whole suite is meant to run in about a minute. |
 
 **You may kill the agent.** `check-20-failure-paths.py` SIGTERMs it and asserts

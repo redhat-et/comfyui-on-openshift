@@ -18,12 +18,14 @@ is this check, not hub.py, that fixes that name: whoever implements Q6 either
 matches it or updates this file, the same contract check-50-fair-queue.py and
 check-40-envelope.py already hold for their items.
 
-Four things are asserted, matched to the four sentences in the roadmap item:
+Five things are asserted -- four matched to the four sentences in the roadmap
+item, and one that none of them pins down:
 
   1. The gauge exists on /metrics, alongside the two that already do.
   2. It is zero or absent with an empty queue.
   3. It grows while jobs sit unserved.
   4. It is derived from real timestamps, not a constant.
+  5. It reads the entry at the end of the list that is actually served next.
 
 (2) alone is weak on purpose -- the roadmap item calls it out explicitly: "a
 gauge hardcoded to 0 would satisfy a careless test". A gauge hardcoded to 0
@@ -41,6 +43,19 @@ gauge is asserted to reflect roughly that manufactured age despite having
 just landed on the list. A wait figure computed from anything other than the
 real timestamps on real queue entries (a constant, a depth multiplier, a
 lookup unrelated to `submitted_at`) has no way to produce that number.
+
+(5) exists because (1)-(4) all run against a queue exactly ONE entry deep,
+where index -1 and index 0 are the same entry: every one of them passes
+identically whichever end the gauge reads, and a one-character edit to
+`estimated_wait_seconds()` moves it from one to the other. They are not the
+same claim. The list is newest-first and a worker pops the tail, so the
+tail's age is the wait a caller is actually queued behind, while the head is
+an entry nobody is waiting on yet -- a gauge reading the head reports ~0 on
+an hour-old backlog, which is the number an operator would size the pool on.
+So a second job is submitted, through the real endpoint, behind the stale
+one; the two ends of the list are then minutes apart in age, and the gauge is
+required to match the one at the served-next end. Both ages are read back off
+the queue itself rather than restated from the constant this file chose.
 """
 import json, os, re, signal, sys, time, urllib.error, urllib.request, uuid
 import redis
@@ -163,7 +178,7 @@ print("\n== 3 & 4: freeze the agent, let jobs sit unserved, and watch the gauge"
 # pushed after it is guaranteed to still be sitting on comfy:queue below.
 os.kill(agent_pid, signal.SIGSTOP)
 
-stale_id = None
+stale_id = fresh_id = None
 try:
     post("/api/generate", {"workflow": WORKFLOW})  # sacrificial; see above
 
@@ -222,6 +237,70 @@ try:
           "nothing else about the queue changed",
           growth >= GROWTH_WINDOW * 0.4, (value_1, value_2, growth))
 
+    # 5: WHICH END OF THE LIST. Everything above passes just as happily on a
+    # gauge that reads the wrong end, because everything above runs against a
+    # queue ONE entry deep -- and on a one-entry list index -1 and index 0 are
+    # the same entry, so `LINDEX comfy:queue -1` and `LINDEX comfy:queue 0`
+    # are the same number and nothing in this suite could tell them apart.
+    #
+    # They are not the same claim. The list runs newest-first: a worker's
+    # BLMOVE pops src=RIGHT, so the TAIL is the entry about to be served and
+    # its age is the queue-side latency this gauge is defined to report
+    # (hub.py's estimated_wait_seconds), while the HEAD is whatever was
+    # queued most recently -- an entry nobody is waiting behind yet. Reading
+    # the head reports ~0 on a queue that has been backed up for an hour,
+    # which is the number an operator would scale the pool on and the signal
+    # I4's Prometheus scaler is meant to read.
+    #
+    # So: submit a real job through the real endpoint while the agent is
+    # still frozen. It is submitted with no X-Forwarded-User, so it shares
+    # lane "" with the stale entry already queued, lands one round behind it,
+    # and is spliced in at the physical head -- the two ends of the list are
+    # now ~STALE_AGE apart in age, and the gauge has to say which one it
+    # means.
+    fresh_id = post("/api/generate", {"workflow": WORKFLOW})["job_id"]
+
+    raw_entries = r.lrange(QUEUE_KEY, 0, -1)
+    entries = []
+    for raw in raw_entries:
+        try:
+            entries.append(json.loads(raw))
+        except json.JSONDecodeError:
+            entries.append({})
+
+    now = time.time()
+    head, tail = (entries[0], entries[-1]) if entries else ({}, {})
+    head_age = now - (head.get("submitted_at") or now)
+    tail_age = now - (tail.get("submitted_at") or now)
+
+    # The fixture, asserted rather than assumed and one clause at a time: if
+    # the two ends are not the entries this expects, the reading below is
+    # about something other than what it says it is.
+    check("fixture: the entry at the served-next end (index -1) is the stale "
+          "job, so the gauge has an old entry to report",
+          tail.get("job_id") == stale_id,
+          {"tail": tail.get("job_id"), "stale": stale_id})
+    check("fixture: the entry at the just-queued end (index 0) is the job "
+          "submitted a moment ago, so the wrong end has a young entry to "
+          "report",
+          head.get("job_id") == fresh_id,
+          {"head": head.get("job_id"), "fresh": fresh_id})
+    check("fixture: the two ends are far enough apart in age that reading "
+          "either one is unambiguous",
+          tail_age - head_age >= STALE_AGE * 0.5,
+          {"head_age": round(head_age, 1), "tail_age": round(tail_age, 1)})
+
+    value_3 = gauge_or_zero(read_metrics(), GAUGE_NAME)
+
+    # Both ages are read off the list itself rather than restated from
+    # STALE_AGE, so this compares the gauge against the queue's own contents.
+    check(f"{GAUGE_NAME} reports the age of the entry at the SERVED-NEXT end "
+          f"of the queue (index -1, ~{tail_age:.0f}s) and not the one just "
+          f"queued at the other end (index 0, ~{head_age:.0f}s)",
+          abs(value_3 - tail_age) < 5.0,
+          {"gauge": round(value_3, 1), "tail_age": round(tail_age, 1),
+           "head_age": round(head_age, 1)})
+
 finally:
     os.kill(agent_pid, signal.SIGCONT)
 
@@ -232,6 +311,14 @@ if stale_id:
 else:
     check("the manufactured stale job still ran to completion once the "
           "agent resumed", False, "job was never queued")
+
+if fresh_id:
+    status = poll_status(fresh_id)
+    check("and so did the job submitted behind it, so this check leaves "
+          "nothing queued for the next one", status == "completed", status)
+else:
+    check("and so did the job submitted behind it, so this check leaves "
+          "nothing queued for the next one", False, "job was never queued")
 
 
 print()

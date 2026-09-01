@@ -42,6 +42,8 @@ seconds, argv[1] is a live agent's pid, and this check may leave it dead
 import json, os, signal, subprocess, sys, time, urllib.request, uuid
 import redis
 
+from worker_ids import heartbeat_keys
+
 GW = "http://127.0.0.1:8100"
 COMFY = "http://127.0.0.1:8999"
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
@@ -130,8 +132,10 @@ def wait_for(predicate, timeout=45, interval=0.2):
 
 def start_extra_agent(hostname, timeout=30):
     """A worker agent of this check's own, identified by a fixed HOSTNAME so
-    its heartbeat key is predictable. Named to match run.sh's agent*.log glob
-    so a failure dumps its log too."""
+    its heartbeat key is findable — by a prefix match on the identity, since
+    the key itself is named from the agent's INCARNATION and carries a nonce
+    this process cannot know (worker_agent.py, note 9; worker_ids.py). Named
+    to match run.sh's agent*.log glob so a failure dumps its log too."""
     env = dict(os.environ)
     env["HOSTNAME"] = hostname
     log = open(f"agent-{hostname}.log", "w")
@@ -139,7 +143,7 @@ def start_extra_agent(hostname, timeout=30):
                             stdout=log, stderr=subprocess.STDOUT)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if r.exists(f"comfy:worker:{hostname}"):
+        if heartbeat_keys(r, hostname):
             return proc
         if proc.poll() is not None:
             return proc  # died on startup; later assertions will show it

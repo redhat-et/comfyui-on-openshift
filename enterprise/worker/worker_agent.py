@@ -6,7 +6,7 @@ Runs alongside ComfyUI in the GPU pod. ComfyUI binds 127.0.0.1 only, so this
 agent is the sole path in or out — no user can reach the GPU pod directly, and
 the pod needs no Service, no Route, and no ingress rules.
 
-Eight things here that the obvious version of this script gets wrong, each of
+Ten things here that the obvious version of this script gets wrong, each of
 which produces an intermittent bug that is miserable to diagnose in a cluster:
 
   1. Connect the WebSocket BEFORE submitting the prompt. ComfyUI starts emitting
@@ -32,7 +32,9 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      BLMOVE parks the in-flight job in a per-worker processing list and a
      TTL'd heartbeat key marks this worker alive; when the heartbeat lapses,
      the gateway's reaper acts on the stranded job loudly instead of letting
-     it disappear.
+     it disappear. Both keys are named from the INCARNATION and not from the
+     pod — see point 9, which is the whole of what "this worker" has to mean
+     for that pairing to be a liveness test at all.
 
   6. Write down HOW FAR the job got, before doing the thing. The reaper above
      can see that a worker died and cannot see what killed it, so what it is
@@ -70,6 +72,43 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      confinement of the path. A `filename` that is not a single bare path
      component (is_bare_filename() below) is refused outright, the same way
      a hostile `filename_prefix` is refused rather than merely sanitized.
+
+  9. Name the heartbeat and the processing list after this INCARNATION, not
+     after the pod. Point 5's pair is a claim of the form "the process holding
+     THIS list is still alive", and the gateway's reaper tests it by pairing
+     the two keys by name — so whatever the name identifies is what "alive"
+     ends up meaning. HOSTNAME identifies the POD, and `restartPolicy: Always`
+     restarts a container inside its pod: an OOM-killed worker comes back with
+     the identity it died with, its first heartbeat answers the reaper's
+     question on the dead incarnation's behalf, and the reaper skips that
+     incarnation's processing list — not for a while, but for as long as the
+     pod keeps restarting. A boot nonce makes the identity name the process,
+     which is what the pair was always asserting about. See BEGIN WORKER
+     IDENTITY below.
+
+ 10. Heartbeat from a thread, and check you still OWN the job before you act
+     on it. Both halves answer one failure, and it needs nothing to die:
+     point 5's heartbeat used to be refreshed only from inside the two loops,
+     and run_job()'s prologue blocks outside both of them — ensure_workspace()
+     is an mkdir on a shared RWX volume and is UNBOUNDED, ws.connect() and
+     submit_prompt() are 30 seconds each. A heartbeat that merely LAPSED in
+     there is indistinguishable from a death to a reaper whose only liveness
+     test is whether the key exists, and the job is at PHASE_DISPATCHED by
+     construction the whole time — so the reaper requeued a live worker's job
+     and the same workflow was handed to ComfyUI twice, which is the precise
+     replay the narrow retry exists to prevent. The keepalive (start_heartbeat)
+     closes the window: the heartbeat is now a property of the process being
+     alive rather than of it being somewhere particular in its own code.
+
+     That shrinks the race; it cannot close it, because a worker slow enough —
+     an EFS mkdir that takes minutes, a Redis partition longer than the TTL —
+     can still be declared dead while it is alive. So the job carries an OWNER
+     (OWNER_FIELD): this incarnation writes its name on the job when it claims
+     it, the reaper stamps REAPED_OWNER over it before it does anything else
+     to a stranded entry, and this agent re-reads it at the two moments its
+     next action would become other people's business — before handing the
+     workflow to ComfyUI, and before writing a terminal outcome. Reaped means
+     abandon: no submit, no terminal event, no accrual. See still_ours().
 """
 
 from __future__ import annotations
@@ -83,6 +122,7 @@ import signal
 import socket
 import stat
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -118,22 +158,88 @@ BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
 # where an output SHOULD be from paths ComfyUI reports relative to it.
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 
+# ---------------------------------------------------------------------------
+# BEGIN WORKER IDENTITY — point 9
+#
+# Two identities, because the two questions asked of "which worker is this?"
+# have different right answers, and the failure that made this a pair was the
+# single id being used for both.
+#
+#   WORKER_ID          what a HUMAN is told. The pod name, so the string in a
+#                      failure message ("worker comfy-worker-8s4qd died") is
+#                      the one an operator pastes into `oc describe pod` /
+#                      `oc logs` — which is precisely what DESCRIBE_HINT in
+#                      hub.py sends them off to do. It goes on the job's state
+#                      hash and into the `started` event, and nowhere else.
+#
+#   WORKER_INCARNATION what REDIS is told. The pod name plus a nonce chosen
+#                      once, here, at process start — so it names THIS RUNNING
+#                      PROCESS rather than the pod that happens to be hosting
+#                      it. The heartbeat key and the processing list are both
+#                      named from it, and from nothing else.
+#
+# Why the second one has to exist. The heartbeat/processing pair (point 5) is
+# a claim of the form "the process holding THIS list is still alive", and the
+# gateway's reaper tests it by pairing the two keys BY NAME: it scans
+# comfy:processing:*, takes the suffix, and skips the list if
+# comfy:worker:<suffix> exists. So whatever that suffix identifies is what the
+# reaper's word "alive" ends up meaning.
+#
+# HOSTNAME identifies the POD. A container restart — `restartPolicy: Always`,
+# which is how an OOM-killed worker comes back, and the common path rather
+# than an exotic one — replaces the container inside the same pod and keeps
+# it. Named from HOSTNAME alone, the new incarnation's very first heartbeat
+# therefore answers the reaper's liveness question on behalf of the DEAD
+# incarnation, whose stranded job the reaper then skips for as long as the pod
+# keeps restarting: no terminal event (a progress bar that never moves), no
+# GPU seconds in either bucket, and a processing entry with no TTL left in a
+# `noeviction` Redis. enterprise/test/check-32-worker-restart.py reproduces
+# exactly that.
+#
+# The nonce closes it by construction rather than by procedure: two
+# incarnations cannot collide because they do not share a key, so there is no
+# startup step to get right, to skip on a Redis blip, or to remove later. The
+# cost is one line of readability in a place nobody reads — the KEY names —
+# and none at all in the messages, which still carry WORKER_ID.
+#
+# The separator is not a character a Kubernetes pod name can contain (RFC 1123
+# labels are lowercase alphanumerics and '-'), so a display id can always be
+# recovered as everything before the first one, and a glob on an identity can
+# never straddle two of them. enterprise/test/worker_ids.py relies on that.
+# ---------------------------------------------------------------------------
+INCARNATION_SEP = "#"
+
 WORKER_ID = os.environ.get("HOSTNAME") or f"worker-{uuid.uuid4().hex[:8]}"
+WORKER_INCARNATION = f"{WORKER_ID}{INCARNATION_SEP}{uuid.uuid4().hex[:8]}"
+
 CLIENT_ID = str(uuid.uuid4())
 
 # The heartbeat is how the gateway distinguishes a busy worker from a dead one.
-# It is refreshed on every pass through both the polling loop and the per-job
-# event loop, so the TTL must comfortably exceed RECV_TIMEOUT — the longest
-# this process legitimately goes without touching Redis.
+# It is refreshed by a keepalive thread that runs for as long as this process
+# does (see start_heartbeat, point 10), so the TTL does not have to be longer
+# than the longest thing the job path can block on — which was the bug: it
+# used to be refreshed only from the two loops, and the run_job() prologue
+# blocks in three places outside both of them.
 HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
 
-WORKER_KEY = f"comfy:worker:{WORKER_ID}"
+# How often the keepalive re-arms it. A third of the TTL, so two consecutive
+# failed refreshes still leave a third attempt inside the window — heartbeat()
+# swallows a Redis blip precisely so a blip is not a death, and that is only
+# true if there is another try before the key expires. Floored at a second so
+# a very small TTL in a test harness cannot turn this into a busy loop.
+HEARTBEAT_REFRESH = max(1.0, HEARTBEAT_TTL / 3.0)
+
+WORKER_KEY = f"comfy:worker:{WORKER_INCARNATION}"
 
 # The job currently being executed lives in this list (moved there from the
 # queue by BLMOVE, removed on any terminal state). If this process dies without
 # removing it, the gateway's reaper fails the job loudly instead of letting it
-# vanish. Key shape is shared with hub.py — change both or neither.
-PROCESSING_KEY = f"comfy:processing:{WORKER_ID}"
+# vanish. Key shape is shared with hub.py — change both or neither — and it is
+# named from the INCARNATION, not from WORKER_ID: the reaper pairs this key
+# with WORKER_KEY above by name, so the two must name the same thing, and that
+# thing must be this process. See BEGIN WORKER IDENTITY.
+PROCESSING_KEY = f"comfy:processing:{WORKER_INCARNATION}"
+# END WORKER IDENTITY
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +366,45 @@ RETRYABLE_PHASES = frozenset({PHASE_QUEUED, PHASE_DISPATCHED})
 # only thing that knows how far the job got is the state hash.
 PHASE_FIELD = "phase"
 ATTEMPT_COUNT_FIELD = "attempt_count"
+
+# Which incarnation currently OWNS this job, on that same state hash. The
+# fence that makes a requeue safe against a worker that is still alive
+# (worker_agent.py, point 10).
+#
+# The phase breadcrumb answers "how far did it get"; this answers the question
+# underneath it, which the reaper cannot otherwise ask: is the process that
+# got it that far still entitled to finish it? A heartbeat that lapses without
+# a death is not a hypothetical — the reaper's liveness test is the existence
+# of one key, so any pause longer than HEARTBEAT_TTL reads as a death, and a
+# worker declared dead in the middle of its own prologue is at a retryable
+# phase by construction. Without this field the requeue and the original
+# attempt both run to completion: ComfyUI is handed one workflow twice, two
+# terminal events land on one stream (the browser closed at the first), and
+# two accruals bill one job_id.
+#
+# A worker writes its INCARNATION here when it claims a job, and re-reads it
+# before the two acts that are irreversible from anyone else's point of view —
+# the submit, and the terminal write. The reaper stamps REAPED_OWNER over it
+# before it decides anything, so "somebody took this off me" is a value the
+# original attempt can see rather than something it has to infer.
+#
+# Shared vocabulary, in this block, for the same reason the phases are: the
+# gateway writes the sentinel and the worker compares against it, they ship in
+# two different images, and a rolling deploy always has one vintage of each
+# running at once. Two files disagreeing about this string would silently make
+# every fence a no-op with nothing failing anywhere to say so.
+#
+# Absence is deliberately NOT a fence. A job whose state hash was written by a
+# pre-F4 worker, or whose hash expired and was recreated by an HSET, has no
+# owner at all — and a missing field must not be able to suppress a real
+# terminal event, which is the one failure mode worse than the replay this
+# closes. Unowned means proceed; only a DIFFERENT owner means abandon.
+OWNER_FIELD = "owner"
+
+# What the reaper stamps on a job it has taken off a worker. Not a valid
+# incarnation — INCARNATION_SEP cannot appear in a pod name, so no worker can
+# ever be called this — so it can never accidentally match a live claim.
+REAPED_OWNER = "#reaped"
 
 
 def envelope_text(value) -> str:
@@ -1091,6 +1236,66 @@ def heartbeat(conn: redis.Redis) -> None:
         pass  # transient; the next refresh re-arms it well within the TTL
 
 
+# Set to end the keepalive below. Also what makes the thread stop BEFORE main()
+# deletes WORKER_KEY on the way out: a refresh racing that delete would put the
+# key back with a full TTL and leave a worker that has exited looking alive to
+# the reaper for HEARTBEAT_TTL — which is the same false-liveness bug as point
+# 9's, arriving from the other side.
+_heartbeat_stop = threading.Event()
+
+
+def start_heartbeat(conn: redis.Redis) -> threading.Thread:
+    """
+    Keep this worker's heartbeat armed for as long as the PROCESS is alive
+    (point 10), rather than for as long as it happens to be inside one of the
+    two loops that used to refresh it.
+
+    The loops cannot do this job. run_job()'s prologue blocks in three places
+    outside both of them — ensure_workspace() is an mkdir on a shared RWX
+    volume and has no timeout at all, ws.connect() and submit_prompt() have 30
+    seconds each — and the gateway's reaper reads a lapsed heartbeat as a
+    death, at a phase that is retryable by construction. The result was a live
+    worker's job requeued underneath it and one workflow handed to ComfyUI
+    twice (enterprise/test/check-36-live-worker-fencing.py, scenario A).
+
+    A thread rather than a deadline check inside the blocking calls, because
+    the unbounded one is a filesystem call with nowhere to put a check. It is
+    a daemon so it can never hold up an exit, and it shares the agent's
+    connection: redis-py hands each command its own connection out of the
+    pool, so this cannot interleave with the BLMOVE the main loop parks in.
+
+    This does not make the fence redundant. A refresh that cannot run — the
+    process stopped by the kernel, Redis unreachable for longer than the TTL —
+    still looks exactly like a death from the gateway's side. It narrows the
+    window; still_ours() is what makes being wrong about it safe.
+    """
+    def beat() -> None:
+        while not _heartbeat_stop.wait(HEARTBEAT_REFRESH):
+            heartbeat(conn)
+
+    thread = threading.Thread(target=beat, name="heartbeat", daemon=True)
+    thread.start()
+
+    return thread
+
+
+def still_ours(conn: redis.Redis, job_id: str) -> bool:
+    """
+    Is this job still mine to act on? See point 10, and OWNER_FIELD.
+
+    Read immediately before the two acts a reaped worker must not perform:
+    handing the workflow to ComfyUI, and writing a terminal outcome. Everything
+    between them is this process talking to its own ComfyUI about work that has
+    already started, which a second opinion from Redis cannot undo.
+
+    Unowned is OURS. A hash written before this field existed, or recreated by
+    an HSET after expiring, carries no owner — and a missing field that
+    suppressed a terminal event would strand exactly the jobs this whole
+    mechanism exists to stop stranding.
+    """
+    return conn.hget(state_key(job_id), OWNER_FIELD) in (None, "", WORKER_INCARNATION)
+
+
 def stream_key(job_id: str) -> str:
     return f"comfy:job:{job_id}:events"
 
@@ -1192,6 +1397,13 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             # would be read as "how far it got is unknown" and refused a retry
             # it had earned.
             PHASE_FIELD: PHASE_DISPATCHED,
+            # Point 10: and this incarnation is the one holding it. Written in
+            # the same HSET as the phase for the same reason the phase is
+            # written in the same HSET as the status — the two are read
+            # together, by this worker before it submits and before it reports,
+            # and a job that looked claimed with no owner would be read as
+            # unowned, which is the fence's fail-open direction.
+            OWNER_FIELD: WORKER_INCARNATION,
             # The GPU clock starts here (docs/10-roadmap.md, Q4), in the same
             # HSET as `running` and for a stricter version of the same reason:
             # this worker holds the card from this instant, and a clock
@@ -1234,6 +1446,27 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             finish(conn, job_id, "cancelled", {})
             return
 
+        # And the last moment a reap can still be free (point 10). Everything
+        # above this line happened inside this process; the next line spends a
+        # GPU. If the gateway decided this worker was dead while it was in the
+        # prologue above — an unbounded mkdir on the shared volume, a slow
+        # connect, a Redis pause longer than HEARTBEAT_TTL — the job has
+        # already been requeued and another worker either has it or is about to.
+        # Submitting anyway is the replay: one workflow on two cards, two
+        # terminal events on a stream the browser closed at the first, and two
+        # accruals against one job_id.
+        #
+        # Abandon rather than fail: the retry is running and will report for
+        # both of us, so a `failed` here would close a browser that is watching
+        # work which is going to succeed. Nothing is emitted, nothing is
+        # billed, and main()'s LREM already declines to delete a payload the
+        # reaper may have re-queued behind it.
+        if not still_ours(conn, job_id):
+            log(f"job {job_id}: reaped while this worker was still alive — "
+                f"another attempt owns it now, abandoning before submit "
+                f"(incarnation {WORKER_INCARNATION})")
+            return
+
         # Point 6, the other half: ComfyUI is about to be handed the workflow.
         # BEFORE the POST rather than after it returns, because ComfyUI has the
         # prompt from the moment the request is written — the round trip is a
@@ -1274,9 +1507,16 @@ def run_job(conn: redis.Redis, job: dict) -> None:
 
                 # A server-side close surfaces as an empty frame rather than an
                 # exception, and "" is a str, so it slips past the binary-frame
-                # guard below, fails to parse, and hits `continue` -- spinning
-                # this loop at full speed until the job deadline while holding a
-                # GPU. Treat it as what it is.
+                # guard below, fails to parse, and hits `continue`. That one
+                # iteration is cheap; what is not is what follows it. Nothing
+                # on the wire is coming after an ordinary close, so every
+                # later ws.recv() just blocks for RECV_TIMEOUT and lands in
+                # the WebSocketTimeoutException branch below -- which is
+                # already correct in isolation (it re-checks /history and
+                # keeps waiting), so this loop is paced, not spinning. The
+                # cost is JOB_TIMEOUT of that pacing to notice a connection
+                # that is never coming back, while holding a GPU. Treat the
+                # empty frame as what it is instead of waiting that out.
                 if raw == "":
                     raise websocket.WebSocketConnectionClosedException(
                         "ComfyUI closed the connection")
@@ -1480,6 +1720,23 @@ def record_gpu_seconds(conn: redis.Redis, job_id: str, destination: str) -> None
 
 
 def finish(conn: redis.Redis, job_id: str, status: str, payload: dict) -> None:
+    # The other half of point 10's fence, and the reason it is here rather than
+    # at each of finish()'s seven call sites: this is the single door every
+    # terminal outcome leaves by, so one check covers completed, failed and
+    # cancelled alike — including the failures main() reports for a run_job()
+    # that raised.
+    #
+    # A job this worker no longer owns has already been reported by whoever
+    # took it: the reaper wrote a terminal event, or the retry it queued will.
+    # Writing a second outcome over that is what the browser saw as a
+    # completion arriving after its stream had closed. Not billed either — the
+    # accrual below claims the clock, and the attempt that actually holds the
+    # card is entitled to it.
+    if not still_ours(conn, job_id):
+        log(f"job {job_id}: discarding '{status}' — this job was reaped and "
+            f"belongs to another attempt now")
+        return
+
     # Before the terminal status, not after it: the job's clock lives on the
     # same state hash, and anything that reads `status` and then reads the
     # report must not be able to see the first without the second. Every
@@ -1505,7 +1762,16 @@ def main() -> int:
     conn = connect_redis()
     heartbeat(conn)
 
-    log(f"worker {WORKER_ID} ready, polling {QUEUE_KEY}")
+    # From here the heartbeat is somebody's full-time job. Started before the
+    # poll loop rather than inside it, because the window it exists to cover is
+    # inside run_job() and neither loop is running then (point 10).
+    keepalive = start_heartbeat(conn)
+
+    # Both identities, once, at the one moment an operator reading a restart
+    # loop needs to tell two incarnations of one pod apart: same WORKER_ID,
+    # different key suffix. See BEGIN WORKER IDENTITY.
+    log(f"worker {WORKER_ID} (incarnation {WORKER_INCARNATION}) "
+        f"ready, polling {QUEUE_KEY}")
 
     try:
         while not shutting_down:
@@ -1602,6 +1868,15 @@ def main() -> int:
                         pass
 
     finally:
+        # Stop the keepalive BEFORE deregistering, and wait for it: a refresh
+        # that lands after the delete re-creates the key with a full TTL, and
+        # a worker that has exited then reads as alive to the reaper for
+        # HEARTBEAT_TTL — with its processing list skipped for exactly that
+        # long. The join is bounded because this is an exit path; a keepalive
+        # wedged in a Redis call is a daemon thread and dies with the process.
+        _heartbeat_stop.set()
+        keepalive.join(timeout=HEARTBEAT_REFRESH + 5)
+
         try:
             conn.delete(WORKER_KEY)
         except Exception:  # noqa: BLE001

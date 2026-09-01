@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import contextlib
+import hashlib
 import json
 import os
 import pathlib
@@ -73,6 +74,12 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 # running in a per-worker processing list. The reaper below fails jobs whose
 # worker's heartbeat is gone — without it, a worker OOM-kill or node death
 # leaves the browser on a progress bar that never moves.
+#
+# What follows either prefix is a worker INCARNATION id, not a pod name:
+# worker_agent.py's BEGIN WORKER IDENTITY explains why the distinction is
+# load-bearing here specifically, since the reaper's entire liveness test is
+# pairing one of these keys with the other by that suffix. Nothing on this
+# side parses the suffix; it only has to stay opaque and stay matched.
 WORKER_KEY_PREFIX = "comfy:worker:"
 PROCESSING_KEY_PREFIX = "comfy:processing:"
 REAPER_INTERVAL = int(os.environ.get("REAPER_INTERVAL", "30"))
@@ -103,10 +110,11 @@ def log(message: str) -> None:
 
     Deliberately rare. Everything ordinary about this process is already in
     uvicorn's access log, so a line printed here is one an operator is meant
-    to notice: today that is exactly the quota breaker announcing that it
-    could not read its own accounting and is therefore NOT enforcing
-    (BEGIN QUOTA BREAKER below). A control that stops existing silently is
-    the failure mode this exists for.
+    to notice: the quota breaker announcing that it could not read its own
+    accounting and is therefore NOT enforcing (BEGIN QUOTA BREAKER below), and
+    the reaper announcing that it could not reap a stranded entry (BEGIN REAP
+    DURABILITY), which is a job with no terminal event and a person's problem.
+    A control that stops existing silently is the failure mode this exists for.
     """
     print(f"[gateway] {message}", flush=True)
 
@@ -235,6 +243,45 @@ RETRYABLE_PHASES = frozenset({PHASE_QUEUED, PHASE_DISPATCHED})
 # only thing that knows how far the job got is the state hash.
 PHASE_FIELD = "phase"
 ATTEMPT_COUNT_FIELD = "attempt_count"
+
+# Which incarnation currently OWNS this job, on that same state hash. The
+# fence that makes a requeue safe against a worker that is still alive
+# (worker_agent.py, point 10).
+#
+# The phase breadcrumb answers "how far did it get"; this answers the question
+# underneath it, which the reaper cannot otherwise ask: is the process that
+# got it that far still entitled to finish it? A heartbeat that lapses without
+# a death is not a hypothetical — the reaper's liveness test is the existence
+# of one key, so any pause longer than HEARTBEAT_TTL reads as a death, and a
+# worker declared dead in the middle of its own prologue is at a retryable
+# phase by construction. Without this field the requeue and the original
+# attempt both run to completion: ComfyUI is handed one workflow twice, two
+# terminal events land on one stream (the browser closed at the first), and
+# two accruals bill one job_id.
+#
+# A worker writes its INCARNATION here when it claims a job, and re-reads it
+# before the two acts that are irreversible from anyone else's point of view —
+# the submit, and the terminal write. The reaper stamps REAPED_OWNER over it
+# before it decides anything, so "somebody took this off me" is a value the
+# original attempt can see rather than something it has to infer.
+#
+# Shared vocabulary, in this block, for the same reason the phases are: the
+# gateway writes the sentinel and the worker compares against it, they ship in
+# two different images, and a rolling deploy always has one vintage of each
+# running at once. Two files disagreeing about this string would silently make
+# every fence a no-op with nothing failing anywhere to say so.
+#
+# Absence is deliberately NOT a fence. A job whose state hash was written by a
+# pre-F4 worker, or whose hash expired and was recreated by an HSET, has no
+# owner at all — and a missing field must not be able to suppress a real
+# terminal event, which is the one failure mode worse than the replay this
+# closes. Unowned means proceed; only a DIFFERENT owner means abandon.
+OWNER_FIELD = "owner"
+
+# What the reaper stamps on a job it has taken off a worker. Not a valid
+# incarnation — INCARNATION_SEP cannot appear in a pod name, so no worker can
+# ever be called this — so it can never accidentally match a live claim.
+REAPED_OWNER = "#reaped"
 
 
 def envelope_text(value) -> str:
@@ -686,15 +733,30 @@ def showback_accrue_call(state: str, destination: str,
 #      pod docs/09 calls the entire public attack surface, to enforce a figure
 #      that lags real spend by hours.
 #
-#   2. IT FAILS OPEN, AND SAYS SO. Redis unreachable, the field missing, the
-#      value not a number, the env var not a number: every one of those
-#      proceeds with the submission. The asymmetry is the roadmap's — "a
-#      breaker that trips on an unreachable dependency halts a cluster you
-#      are already paying for, while the risk it guards against is slow". But
-#      a control that stops enforcing silently is a control that has quietly
-#      stopped existing, so every fail-open that is not simply "this
-#      submitter has spent nothing yet" prints a line naming what could not
-#      be read (see log() above). The budget alarm remains the backstop.
+#   2. IT FAILS OPEN, AND SAYS SO. The field missing, the value not a number,
+#      the env var not a number, or the read to fetch the field raising:
+#      every one of those proceeds with the submission, and
+#      quota_gpu_seconds_used() logs which one it was. The asymmetry is the
+#      roadmap's — "a breaker that trips on an unreachable dependency halts a
+#      cluster you are already paying for, while the risk it guards against
+#      is slow". But a control that stops enforcing silently is a control
+#      that has quietly stopped existing, so every fail-open that is not
+#      simply "this submitter has spent nothing yet" prints a line naming
+#      what could not be read (see log() above). The budget alarm remains the
+#      backstop.
+#
+#      "Redis unreachable" reaches this fail-open only when it fails between
+#      generate()'s two reads — this one and the backpressure `LLEN` above it
+#      in the function, which is NOT wrapped the same way and raises
+#      unhandled. For an outage that takes the whole instance down, that LLEN
+#      is what the submitter actually sees (a 500, not a quiet pass-through);
+#      it is deliberately not softened to match, because backpressure exists
+#      to protect Redis from an unbounded queue and "proceed when you cannot
+#      even read the depth" is the one answer that control must not give. The
+#      logged fail-open here is real and reachable — a read that fails on its
+#      own (a single flaky call, a differently-sharded key in a clustered
+#      Redis) — just not the "Redis is entirely down" case the phrase most
+#      readily suggests.
 #
 #   3. IT IS NOT WIRED INTO readyz(), NOT EVEN TRANSITIVELY. That endpoint is
 #      the gateway's readiness probe: a quota check inside it would take the
@@ -1077,9 +1139,11 @@ def fair_enqueue_script():
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
     # One reaper per gateway replica is fine, but for two reasons rather than
-    # one. RPOP is atomic, so two reapers racing over the same processing list
-    # each take different entries — which is the whole argument for failing a
-    # job at most once. It is NOT the argument for requeueing one at most once:
+    # one. Exactly one reaper can hold a given stranded entry — the SET NX
+    # claim in reap_processing_list(), which took that job over from RPOP when
+    # the reap stopped destroying what it was reaping (BEGIN REAP DURABILITY) —
+    # which is the whole argument for failing a job at most once. It is NOT the
+    # argument for requeueing one at most once:
     # a requeued job can be stranded again, on another worker, and be seen by
     # the other replica's reaper. That bound comes from the atomic HINCRBY in
     # reap_stranded_job() below, not from this.
@@ -1150,9 +1214,11 @@ def state_key(job_id: str) -> str:
 #     cancel stopped it early, so "retryable" would otherwise mean "hand the
 #     workflow the user withdrew to a second worker". It ends `cancelled`.
 #
-# Why the counter is HINCRBY and not read-then-write. "RPOP is atomic, so two
-# reapers each fail different entries" is the argument that makes fail-once
-# safe, and it does NOT carry over to requeue-once. A requeued job goes back on
+# Why the counter is HINCRBY and not read-then-write. "only one reaper can be
+# holding a given entry, so two reapers fail different jobs" is the argument
+# that makes fail-once safe — it was RPOP's atomicity and is now the claim in
+# reap_processing_list(), for the reason BEGIN REAP DURABILITY gives — and it
+# does NOT carry over to requeue-once. A requeued job goes back on
 # comfy:queue, is picked up by another worker, and can be stranded a second
 # time — a different entry, on a different processing list, seen on a different
 # pass, quite possibly by the OTHER gateway replica (01-gateway.yaml runs two,
@@ -1191,6 +1257,95 @@ CANCEL_REQUESTED_FIELD = "cancel_requested"
 # it is the person who can answer the question this code cannot.
 DESCRIBE_HINT = ("`oc describe pod` on that worker names the reason it went — "
                  "OOMKilled is a host-RAM OOM, and a node reclaim says so too")
+
+# ---------------------------------------------------------------------------
+# BEGIN REAP DURABILITY — how an entry leaves a processing list, which is a
+# different question from what reaping a job does.
+#
+# reap_processing_list() below READS the tail of the list and removes it only
+# once reap_stranded_job() has returned. It used to `RPOP`, which is to say the
+# entry came off the list first and the reap then ran against a value held
+# nowhere but in this process's memory. Anything that raised inside that body —
+# the terminal XADD against a key of the wrong type, a Redis that went away
+# between two of its commands, a bug — destroyed the only record that the job
+# had ever been queued. The `except Exception: pass` around the tick said "next
+# tick retries"; there was nothing left for a next tick to retry, the job
+# reached no terminal state at all, and the browser sat on a bar that never
+# moved until the stream TTL ran out. That is precisely the work-vanishing the
+# `noeviction` invariant exists to prevent (docs/09, section 3), arriving by a
+# door `noeviction` does not cover, and one injected transient error reproduces
+# it.
+#
+# Reading without removing gives up something RPOP provided for free, and it is
+# not a small something: RPOP is atomic, so exactly one reaper — of the two
+# gateway replicas 01-gateway.yaml runs — could ever be holding a given entry,
+# and that is what bounds FAILING a stranded job to once. Two reapers reading
+# the same tail have no such bound: both would fail the same job, and on a
+# retryable one both would reach the HINCRBY claim, where one requeues and the
+# other terminates the job it just requeued. So the exclusion stops being a
+# side effect of the read and becomes the thing it always was in substance: a
+# claim, `SET NX` on a key named from the entry's own bytes, which exactly one
+# caller can win. It is held for the DURATION of the reap rather than for the
+# instant of a pop, which is strictly the stronger property; the HINCRBY claim
+# above is unchanged and still carries requeue-once on its own.
+#
+# What is traded, stated plainly: this is at-least-once where RPOP was
+# at-most-once. A gateway that dies in the window between a reap completing and
+# its LREM leaves the entry to be reaped a second time. That costs a duplicate
+# terminal event on a stream a browser stopped reading at the first one — where
+# the old shape's equivalent window cost the job entirely.
+#
+# And a bound, because "leave it until it works" is a loop that never ends on
+# an entry that can never work: the tail would be retried every tick for the
+# life of the gateway, with everything behind it stuck. Failures are counted
+# per ENTRY, and after REAP_MAX_ATTEMPTS the entry is set aside on a capped,
+# expiring list with a line on the log — not deleted, because "bounded" must
+# not quietly mean the same vanishing act by a slower route.
+# ---------------------------------------------------------------------------
+
+# Named from the entry's bytes, because an entry has no id of its own and the
+# job's id names the wrong thing: a job stranded twice is two entries on two
+# processing lists, and the second must not inherit the first one's attempt
+# count. Collisions are harmless — two byte-identical entries are two copies of
+# one stranding, and serialising them is the correct handling anyway.
+def reap_entry_id(raw: str) -> str:
+    """A stable, short name for one queue entry, for the two marks below."""
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:32]
+
+
+# The exclusive claim on one entry. Its TTL is a visibility timeout and nothing
+# else: the reap itself is milliseconds, so this only ever has to cover a
+# reaper that DIED mid-reap, and it is released explicitly on both ordinary
+# exits (see reap_processing_list and defer_stranded_entry) so a retry never
+# waits for it. Long enough to outlive a tick, and never shorter than a minute,
+# because a REAPER_INTERVAL tuned down for a test must not turn this into a
+# window two reapers fit inside.
+REAP_CLAIM_PREFIX = "comfy:reap:claim:"
+REAP_CLAIM_TTL = max(2 * REAPER_INTERVAL, 60)
+
+# How many times one entry may fail to reap before it is set aside, and where
+# that count lives. Five: enough that a Redis unavailable across several ticks
+# is ridden out rather than given up on, few enough that a genuinely poisonous
+# entry stops holding up the list behind it within a minute of production
+# ticks. The counter expires on its own so a gateway that dies between the last
+# failure and the give-up cannot leave one key per entry behind forever in an
+# instance that is deliberately `noeviction`.
+REAP_FAILURES_PREFIX = "comfy:reap:failures:"
+REAP_MAX_ATTEMPTS = int(os.environ.get("REAP_MAX_ATTEMPTS", "5"))
+REAP_FAILURES_TTL = max(REAP_CLAIM_TTL * (REAP_MAX_ATTEMPTS + 2), 3600)
+
+# Where an entry goes when it has been given up on. Capped and expiring for the
+# same reason everything else here is: this is a `noeviction` Redis, so a list
+# that only ever grows is the outage. PAYLOAD_TTL rather than the shorter
+# EVENT_STREAM_TTL because the reader is a person who was paged, not a browser
+# — a day is the window in which "a job of mine disappeared last night" is
+# still an answerable question.
+REAP_UNDELIVERABLE_KEY = "comfy:reap:undeliverable"
+REAP_UNDELIVERABLE_MAX = 100
+REAP_UNDELIVERABLE_TTL = PAYLOAD_TTL
+
+# END REAP DURABILITY
+# ---------------------------------------------------------------------------
 
 
 async def arm_state_ttl(conn: redis.Redis, job_id: str) -> None:
@@ -1364,6 +1519,32 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
         # dropped.
         return
 
+    # FENCE FIRST, before anything is read and before anything is decided.
+    #
+    # This entry is on a processing list whose worker's heartbeat has lapsed,
+    # and a lapse is not a death: the only liveness test here is whether one
+    # key exists, so a worker paused longer than HEARTBEAT_TTL — an unbounded
+    # mkdir on the shared volume, a Redis blip across the whole TTL — is
+    # indistinguishable from an OOM kill. Whatever this function goes on to do
+    # with the job, the worker that was running it must be able to find out
+    # that it happened, or a requeue hands one workflow to two GPUs and a fail
+    # is overwritten by a terminal event from a worker that no longer owns the
+    # job. worker_agent.py's still_ours() is the other half; see OWNER_FIELD.
+    #
+    # Before the read rather than after it, because the ordering that matters
+    # is with respect to the WORKER, not to this function: a worker that reads
+    # its ownership after this line abandons, which is always safe (the job is
+    # about to reach a terminal state or be requeued either way), while one
+    # that reads it before this line submits and is then racing exactly as it
+    # did before the fence existed. Erring towards fencing early costs nothing
+    # — the entry is already off the list.
+    #
+    # arm_state_ttl, because HSET recreates a state hash that expired
+    # mid-flight and a recreated key has no TTL at all: an immortal one-field
+    # hash per reaped job, in a Redis that is deliberately noeviction.
+    await conn.hset(state_key(job_id), OWNER_FIELD, REAPED_OWNER)
+    await arm_state_ttl(conn, job_id)
+
     # Both facts in one round trip, and both read before anything is decided:
     # how far the job got, and whether its owner still wants it.
     phase, cancel_requested = await conn.hmget(
@@ -1460,21 +1641,138 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
     await requeue_orphaned_job(conn, entry, attempt)
 
 
+async def defer_stranded_entry(conn: redis.Redis, key: str, raw: str,
+                               entry_id: str) -> None:
+    """
+    A reap raised, and the entry it raised on is still on its processing list.
+
+    Two outcomes. Below the cap the entry simply stays where it is and the
+    claim is released, so the next tick tries again — the claim's TTL exists
+    for a reaper that died, and making an ordinary retry wait for it would cost
+    a minute per attempt for nothing.
+
+    At the cap it is set aside. Not deleted: "bounded" must not turn into the
+    vanishing this whole mechanism exists to stop, so it is moved onto one
+    capped, expiring list an operator holding a job id can read, and a line is
+    printed — at that point the job really does have no terminal event, and
+    only a person can decide what to do about it.
+
+    Every write here is best-effort, and the failure of any of them leaves the
+    entry exactly where it is: on the processing list, for the next tick. The
+    one thing this function must never do is lose it.
+    """
+    failures_key = f"{REAP_FAILURES_PREFIX}{entry_id}"
+    claim_key = f"{REAP_CLAIM_PREFIX}{entry_id}"
+
+    try:
+        failed = await conn.incr(failures_key)
+        await conn.expire(failures_key, REAP_FAILURES_TTL)
+
+        if failed < REAP_MAX_ATTEMPTS:
+            log(f"could not reap a stranded entry on {key} (attempt {failed} "
+                f"of {REAP_MAX_ATTEMPTS}) — it is still parked there and the "
+                f"next tick will try it again")
+            await conn.delete(claim_key)
+            return
+
+        # The entry this failed on is the tail: the reaper reads only the tail,
+        # and the other replica's reaper cannot be holding this one. Confirmed
+        # rather than assumed, because a worker whose heartbeat merely LAPSED
+        # is not dead and does remove its own entry when it finishes — and if
+        # the tail has moved on, the right thing to do is nothing at all and
+        # let the next tick look again at whatever is there now.
+        if await conn.lindex(key, -1) != raw:
+            await conn.delete(claim_key)
+            return
+
+        # RIGHT is that tail. One LMOVE rather than LREM-then-LPUSH so the
+        # entry is on exactly one list at every instant, this process dying
+        # between two commands included.
+        await conn.lmove(key, REAP_UNDELIVERABLE_KEY, "RIGHT", "LEFT")
+        await conn.ltrim(REAP_UNDELIVERABLE_KEY, 0, REAP_UNDELIVERABLE_MAX - 1)
+        await conn.expire(REAP_UNDELIVERABLE_KEY, REAP_UNDELIVERABLE_TTL)
+        await conn.delete(failures_key, claim_key)
+
+        log(f"a stranded entry on {key} could not be reaped in "
+            f"{REAP_MAX_ATTEMPTS} attempts and has been set aside on "
+            f"{REAP_UNDELIVERABLE_KEY} — the job it names has no terminal "
+            f"event and nothing will retry it now")
+    except Exception:  # noqa: BLE001 - the entry is still on the processing list
+        pass
+
+
+async def reap_processing_list(conn: redis.Redis, key: str) -> None:
+    """
+    Every stranded entry on one dead worker's processing list, oldest first,
+    each removed only once its reap has actually finished.
+
+    See BEGIN REAP DURABILITY above for why the entry is read rather than
+    popped, and for what replaces the exclusion RPOP used to provide.
+    """
+    while True:
+        # The tail — the same entry, in the same order, that RPOP took.
+        raw = await conn.lindex(key, -1)
+
+        if raw is None:
+            return
+
+        entry_id = reap_entry_id(raw)
+        claim_key = f"{REAP_CLAIM_PREFIX}{entry_id}"
+
+        # Losing the claim is not an error and not something to work around:
+        # the other replica's reaper has this entry, and there is nothing
+        # behind it to get on with, because the tail is the only entry this
+        # loop ever reads.
+        if not await conn.set(claim_key, "1", nx=True, ex=REAP_CLAIM_TTL):
+            return
+
+        try:
+            await reap_stranded_job(conn, raw)
+        except Exception:  # noqa: BLE001 - handled by leaving the entry where it is
+            await defer_stranded_entry(conn, key, raw, entry_id)
+
+            # Stop here rather than moving down the list. A reap that just
+            # raised is most often a Redis that is unwell, and the rest of
+            # this list would raise the same way and spend its attempts doing
+            # it. Nothing is lost by waiting: every entry is still parked.
+            return
+
+        # Only now, with every write the reap makes landed — the terminal
+        # event included — is losing this entry the same as losing nothing.
+        await conn.lrem(key, 1, raw)
+        await conn.delete(claim_key, f"{REAP_FAILURES_PREFIX}{entry_id}")
+
+
 async def reap_orphaned_jobs() -> None:
     while True:
         try:
             conn = client()
 
             async for key in conn.scan_iter(match=f"{PROCESSING_KEY_PREFIX}*"):
-                worker_id = key[len(PROCESSING_KEY_PREFIX):]
+                # The suffix is an INCARNATION — one running worker process —
+                # and this one line is the whole liveness test, so it is only
+                # as true as that. Named from a pod instead, a container
+                # restarted inside its pod (restartPolicy: Always, which is how
+                # an OOM-killed worker comes back) heartbeats under the id its
+                # predecessor died holding, this `continue` fires forever, and
+                # the predecessor's stranded job never reaches a terminal state
+                # at all. worker_agent.py's BEGIN WORKER IDENTITY is the other
+                # half of this; enterprise/test/check-32-worker-restart.py is
+                # what fails if either half is undone.
+                incarnation = key[len(PROCESSING_KEY_PREFIX):]
 
-                if await conn.exists(f"{WORKER_KEY_PREFIX}{worker_id}"):
+                if await conn.exists(f"{WORKER_KEY_PREFIX}{incarnation}"):
                     continue
 
-                while (raw := await conn.rpop(key)) is not None:
-                    await reap_stranded_job(conn, raw)
+                await reap_processing_list(conn, key)
 
-        except Exception:  # noqa: BLE001 - a Redis blip; readiness reports it, next tick retries
+        except Exception:  # noqa: BLE001 - see below
+            # A Redis blip, and "the next tick retries" is now something this
+            # loop has actually arranged rather than a hope: no entry is
+            # removed from a processing list before its own reap has returned,
+            # so whatever this swallowed, every entry the tick did not finish
+            # is still parked where the next one will find it. What it cannot
+            # fix is a Redis that stays unreachable — readiness reports that.
             pass
 
         await asyncio.sleep(REAPER_INTERVAL)
@@ -1600,6 +1898,14 @@ async def generate(request: Request):
     state = {"status": "queued", "queue_position_at_submit": position,
              PHASE_FIELD: PHASE_QUEUED}
 
+    # envelope["user"], not the raw header: envelope_text() already clamped it
+    # to MAX_ENVELOPE_FIELD_CHARS in build_envelope() above, and this value is
+    # what SHOWBACK_ACCRUE_LUA later reads back (user_field) to build a Hash
+    # FIELD NAME (quota_field()'s f"{SHOWBACK_USER_PREFIX}{user}"). Writing the
+    # raw header here put an unbounded, client-supplied string on that path —
+    # the showback key-space bound above ("THE FIELD COUNT IS CAPPED") caps
+    # the number of fields, not their size, so an uncapped field name is a
+    # second, uncounted way to grow that Hash against `noeviction` Redis.
     if user:
         state["user"] = user
 
@@ -1805,12 +2111,25 @@ async def estimated_wait_seconds(conn: redis.Redis) -> float | None:
 
     Which entry: LMOVE pops `src="RIGHT"` (worker_agent.py's BLMOVE), so the
     tail — index -1 — is always the entry served next, whatever fair queueing
-    (BEGIN FAIR QUEUEING above) did to the rest of the list. Its age is the
-    queue-side latency a caller submitting right now would be waiting behind,
-    the same "age of the oldest thing in line" a queueing system reports when
-    it has no per-item service-time estimate to build a forecast from (the SQS
-    ApproximateAgeOfOldestMessage shape) — a fact read off one entry, not a
-    depth-based guess.
+    (BEGIN FAIR QUEUEING above) did to the rest of the list. Its age is a
+    fact read off one entry, not a depth-based guess — the same "age of the
+    oldest thing in line" a queueing system reports when it has no per-item
+    service-time estimate to build a forecast from (the SQS
+    ApproximateAgeOfOldestMessage shape).
+
+    That shape holds cleanly for a job on its FIRST attempt: `submitted_at` is
+    when this caller actually started waiting, so the age is exactly the
+    queue-side latency they have been waiting behind. It does not hold as
+    cleanly once requeue_orphaned_job() has touched the entry —
+    `submitted_at` is carried over unchanged across a requeue (see that
+    function's comment: Q6 should measure from the original submission, not
+    restart every time the cluster loses a pod), so a retried job's age also
+    counts the time it spent dispatched to the worker that died and the
+    reaper's own detection lag (up to HEARTBEAT_TTL + REAPER_INTERVAL). If
+    that entry lands at the tail, the gauge reads a real elapsed time, but one
+    that overstates how long a caller submitting right now would actually
+    wait — it is no longer purely queue-side latency once part of it was
+    spent elsewhere.
 
     An empty queue reads as LINDEX returning None: 0.0, not "unknown" — there
     is nothing to be waiting on. A malformed or pre-F2 entry (no
@@ -1851,6 +2170,14 @@ async def gather_stats() -> dict:
 
     # Count heartbeat keys, not a set: keys expire on their own, so a worker
     # that was SIGKILLed stops being counted instead of inflating this forever.
+    #
+    # One key is one live INCARNATION, so a pod that has just restarted is
+    # counted twice until its predecessor's key lapses (at most HEARTBEAT_TTL).
+    # Deliberately not deduplicated by pod name: expiry already bounds it, a
+    # replaced POD has always over-counted the same way for the same window,
+    # and the alternative is this gauge growing an opinion about the shape of
+    # an id the reaper is careful to treat as opaque. The consequence is an
+    # estimated wait that is briefly optimistic after a crash-restart.
     workers = 0
 
     async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*"):
