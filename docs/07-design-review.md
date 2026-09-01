@@ -240,6 +240,14 @@ in [`10-roadmap.md`](10-roadmap.md) get the same treatment as they land, and for
 the same reason: the version that looks obvious on the page is usually the one
 that reads fine, passes its own test, and fails intermittently in a cluster.
 
+Four of them are written up below — F2, Q2, Q3 and Q4. The rest of the landed
+work does not have an entry here: Q1, Q5, Q6, F4 and the two cross-wave sweep
+fixes carry their reasoning in `docs/09-engineering-handoff.md` §3, in
+`docs/10-roadmap.md`'s own per-item sections, and in
+`enterprise/test/README.md`'s account of what each check is defending. That is
+a gap in this file rather than in the record, and it is named here so nobody
+reads the absence as "nothing to say".
+
 ### F2 — four items each extending the queue payload
 
 The obvious way to give the queue payload a lane key, an attempt count, a

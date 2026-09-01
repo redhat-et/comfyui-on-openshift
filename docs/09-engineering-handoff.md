@@ -9,6 +9,19 @@ It repeats some of `README.md` on purpose. The README argues the case to
 someone deciding whether to adopt this. This argues it to the person who now
 has to keep it running, which is a different set of facts.
 
+One of those facts runs underneath all the others, and it is worth holding on
+to while you read the rest: **your on-call surface is a FastAPI process, a
+Python agent, one Redis, and a bill.** Not a control plane, not a CUDA driver
+build, not an ingress controller, not an identity provider, not a certificate
+rotation. Section 1 draws that line row by row, section 3 is what is left on
+your side of it, section 5 is the bill, section 10 sorts everything on your
+side into what you may move and what you may not, and section 13 comes back to
+why the line is where it is. If you have operated GPU inference on raw EC2 or
+bare Kubernetes, you already know what is on the other side of that line and
+what it costs to carry. You are about to stop carrying it. That is the reason
+this runs where it runs, and most of the design follows from it rather than
+from anything in the application.
+
 ---
 
 ## 0. Where this stands
@@ -17,8 +30,21 @@ This is a working system rather than a proof of concept, and it is also not a
 product. Both configurations run end to end: the single-user path puts one
 ComfyUI pod on one GPU behind an authenticated port-forward, and the
 multi-user path puts a queue, cluster SSO and a GPU pool that scales to zero
-in front of the same cluster. The parts that are easy to get wrong and
-miserable to debug — progress streaming, cancellation, worker death, path
+in front of the same cluster.
+
+And this has actually been run. Both configurations have been stood up on a
+real cluster, on real GPUs, driving real ComfyUI workflows end to end — not a
+stub, not a laptop. That deserves a sentence of its own because it is not
+recoverable from the code or from the git history, and *"has this ever
+actually run?"* is one of the first questions a new owner asks and one of the
+hardest to answer from a repository. What that sentence does not cover is
+[`10-roadmap.md`](10-roadmap.md)'s cluster-day list: the specific checks that
+still need hardware, Q3's arbitrary-UID half chief among them, which one agent
+running as one UID on one filesystem cannot reproduce at all. Those are owed,
+not done.
+
+The parts that are easy to get wrong and miserable to debug — progress
+streaming, cancellation, worker death, path
 handling — are covered by an end-to-end suite that runs against a real Redis
 and a stub ComfyUI on your laptop in about a minute, and by four CI jobs on
 every pull request. What has *not* happened is scale: nobody has run this past
@@ -87,7 +113,7 @@ The practical consequence: your on-call surface is a FastAPI process, a Python
 agent, a Redis, and a bill. Everything underneath is somebody else's pager. If
 you have previously operated GPU inference on raw EC2 or bare Kubernetes, that
 row-by-row comparison is the case for this platform, and it is most of why
-this repo is only ~8,700 lines instead of a distributed system.
+this repo is only ~9,700 lines of Python instead of a distributed system.
 
 **Inventory of what is actually yours:**
 
@@ -95,13 +121,13 @@ this repo is only ~8,700 lines instead of a distributed system.
 scripts/            13 numbered pipeline scripts, idempotent, bash 3.2-safe
 manifests/base/     single-user Deployment + Service (kustomize)
 enterprise/         the multi-user configuration
-  gateway/hub.py    464 lines — the entire public attack surface
-  worker/worker_agent.py  422 lines — the only path in or out of a GPU pod
+  gateway/hub.py    2,370 lines — the entire public attack surface
+  worker/worker_agent.py  1,891 lines — the only path in or out of a GPU pod
   manifests/        Redis, gateway, worker, KEDA, oauth-proxy, Routes
   test/             e2e suite: real Redis, stub ComfyUI, no cluster needed
 app/Containerfile   the single-user ComfyUI image
-docs/               01-08, plus this file
-.env                22 variables; the only configuration surface
+docs/               ten documents — 01-08, this file, and the roadmap
+.env                24 variables; the only configuration surface
 ```
 
 ---
@@ -192,9 +218,9 @@ no cluster and reads no manifest — so if you are about to argue with a lint
 failure naming one of them, read its row above first. The check exists
 precisely because the edit looks harmless.
 
-Six more shapes are pinned there for the opposite reason: they are in the
+Seven more shapes are pinned there for the opposite reason: they are in the
 Python and the shell the suite *does* run, and the suite still cannot see
-five of them. `make lint` fails on a retry counter written by anything other
+six of them. `make lint` fails on a retry counter written by anything other
 than `HINCRBY` — whose failure mode needs the two gateway replicas
 `01-gateway.yaml` runs and `enterprise/test/run.sh` starts one — and on a
 `TERMINAL_TYPES` that gained a member, which `check-30-sigkill.py` would also
@@ -229,7 +255,7 @@ are both invisible to a suite that runs for a minute against ten of them,
 which is exactly why the accumulator's row above is enforced here rather than
 there.
 
-Q5's quota breaker added the nineteenth, and it is the only row here whose
+Q5's quota breaker added the twentieth, and it is the only row here whose
 failure mode is caused by the safety feature itself: `make lint` fails if
 anything reachable from `readyz()` — transitively, not just its own body —
 mentions the quota, and if `quota_refusal()` is called from anywhere other
@@ -254,6 +280,13 @@ liveness test.
 a specific bug in the design this was built from. Read it once, early. It is
 the fastest way to understand why the code looks the way it does, and it is
 the document that will stop you "simplifying" something back into a defect.
+
+This table is not the whole of what is fixed here, and it is emphatically not
+the whole of what is *decided* here. Section 10 sorts this table, the settled
+decisions in `docs/10-roadmap.md`, and the deliberate omissions at the end of
+`docs/06-enterprise-architecture.md` into one list of five bins, so that the
+question "may I change this?" has an answer that does not depend on which of
+three documents you happened to read.
 
 ---
 
@@ -281,8 +314,10 @@ a failed assertion — `run.sh` reads both, so a check that keeps printing its
 drops the `sys.exit(1)`, a failures list nothing reads any more) cannot leave
 the suite, or CI, green over its own output. And when you add or change an
 assertion, break the behaviour it is about and watch it fail before you believe
-it: four assertions have shipped here unable to fail, each found only by
-someone deliberately breaking the feature and noticing nothing went red.
+it: six assertions have shipped here unable to fail, each found only by someone
+deliberately breaking the feature and noticing nothing went red. They are
+listed, with what replaced each one, in the README under *"The assertions that
+could not fail"*.
 
 Then, when you want a cluster:
 
@@ -361,10 +396,10 @@ Ordered by likelihood. Full detail in `docs/05-troubleshooting.md`.
 | Queue grows, workers idle or absent | KEDA cannot reach Redis, or the pool cannot scale | `oc get scaledobject,hpa`; the scaler dials from `openshift-keda`, so the Redis address must be fully qualified. |
 | Everything works, generation is slow | Model loading over EFS, or the wrong instance type | `docs/05-troubleshooting.md`; also idea 3 in the README. |
 
-Set the alert before you need it: the gateway exports `comfy_queue_depth` and
-`comfy_workers_registered`, `setup.sh` applies a ServiceMonitor, and *"queue
-deeper than N for 30 minutes"* is the alert that catches a wedged pool before a
-human does.
+Set the alert before you need it: the gateway exports `comfy_queue_depth`,
+`comfy_workers_registered` and `comfy_estimated_wait_seconds`, `setup.sh`
+applies a ServiceMonitor, and *"queue deeper than N for 30 minutes"* is the
+alert that catches a wedged pool before a human does.
 
 ---
 
@@ -421,24 +456,40 @@ idea 1 in the README's "Ideas worth doing next", which is two cron lines.
 The full list is in the README under **Ideas worth doing next**, and
 [`10-roadmap.md`](10-roadmap.md) turns it into a work plan — what each item
 touches, what proves it, what order they can safely land in, and which of them
-need a real cluster. The short version, in the order I would take them:
+need a real cluster. The short version, in the order I would take them —
+shipped and decided-against items kept on the list rather than deleted, the
+way the README's version keeps them, because the reasoning is the useful part:
 
 1. **Schedule the warm window** (two cron lines). Removes the morning cold
-   start without paying overnight. Highest payoff per unit of work on the list.
-2. **Fair queueing.** The pop is a single-list `BLMOVE` (`worker_agent.py:374`),
-   so one overnight batch of 200 jobs starves every interactive user.
-   Round-robin the pop across submitters rather than ranking them — it solves
-   the starvation without introducing a priority claim a caller could forge.
-3. **Retry-once-then-fail, then spot instances.** Retry is deliberately absent
-   today because a workflow that OOM-killed one worker will kill the next. A
-   bounded retry on a *different* node fixes the node-death case without the
-   poison-pill loop — and once it exists, `g6` spot at 60–70% off becomes
-   reasonable, which is the biggest remaining cost lever.
-4. **Per-user output workspaces.** The authenticated username is already
-   stamped on job state; threading it into the output path is the other half,
-   and it makes showback trivial.
-5. **NVIDIA time-slicing.** An L4 running SD1.5-class workflows does not use
-   24 GB. Measure peak VRAM first; MIG is not available on this card.
+   start without paying overnight. Highest payoff per unit of work on the list,
+   and the only one of these five still entirely ahead of you.
+   `10-roadmap.md` carries it as I1.
+2. **Fair queueing — landed** (`10-roadmap.md`, Q1). The problem was that the
+   pop is a single-list `BLMOVE` (`worker_agent.py:1787`), so one overnight
+   batch of 200 jobs starved every interactive user. What shipped round-robins
+   the *insert* across submitters rather than ranking them, which fixes the
+   starvation without introducing a priority claim a caller could forge; the
+   pop is still one `BLMOVE`, which is what the reaper depends on. It has a row
+   in section 3, because placing a job fairly means reading the queue inside
+   one Lua `EVAL` and that is time no other client gets.
+3. **Retry-once-then-fail — landed narrow** (Q2); **spot — still open** (I7).
+   Retry was absent because a workflow that OOM-killed one worker will kill the
+   next. What shipped retries only deaths where ComfyUI never saw the workflow,
+   which is the one case with no poison pill to replay; everything else is
+   still failed, not requeued. Spot turned out not to depend on it — an
+   interruption gives two minutes of notice and the SIGTERM drain finishes
+   anything that fits in two minutes — so I7's real trade is losing longer
+   generations, which is a product decision rather than something retry fixes.
+4. **Per-user output workspaces — landed, laptop half** (Q3). The submitter's
+   identity is stamped on job state and now threads through into the output
+   path, which is what made showback (Q4) cheap. The arbitrary-UID half cannot
+   be proven off a cluster and is on the cluster-day list.
+5. **NVIDIA time-slicing — decided against** (I6). The argument for it is that
+   an L4 running SD1.5-class workflows does not use 24 GB. The argument against
+   it won: time-slicing gives no memory isolation, so co-resident peaks simply
+   sum and the victim is whichever process allocates second rather than the
+   greedy one, and MIG — which partitions memory properly — is not available on
+   this card. Section 10, bin 3, has the rest of it.
 
 `docs/06-enterprise-architecture.md` ends with the complementary list — what is
 deliberately *not* here and the reasoning for each omission. Read it before you
@@ -446,7 +497,188 @@ add any of it, because in several cases the omission is the decision.
 
 ---
 
-## 10. Reading order
+## 10. What you can change
+
+This project is moving between engineering groups, and it will be lobbied in
+several directions at once. The answer to "what is load-bearing and what is
+negotiable" already exists, but it is spread across three documents — section 3
+of this file, the settled decisions in [`10-roadmap.md`](10-roadmap.md), and the
+deliberately-not-here list at the end of
+[`06-enterprise-architecture.md`](06-enterprise-architecture.md) — so an
+incoming group has to reconstruct it before it can argue with any of it. Here
+it is in one place, in five bins. The bin matters more than the item, because
+the bin says what kind of argument would move it.
+
+### Bin 1 — Constraints, not preferences
+
+Three lines, and they are one constraint by three doors:
+
+- ComfyUI in the worker binds `127.0.0.1` — `enterprise/worker/start.sh`.
+- The worker pods have no Service and no Route —
+  `enterprise/manifests/02-worker.yaml`.
+- Under `AUTH_MODE=oauth` the gateway rebinds to loopback and the Service
+  exposes only the proxy port — `05-oauth-proxy-patch.yaml`,
+  `05-oauth-proxy.yaml`.
+
+ComfyUI has no authentication, and its custom-node system executes arbitrary
+Python by design, on a node that holds an instance role, sits inside your VPC,
+and has the shared model volume mounted writable. Change any of these three and
+you do not have a different design with a different trade-off. You have an
+unauthenticated remote-code-execution endpoint on a node holding cloud
+credentials. There is no workload for which that is the better call, which is
+why `make lint` fails on each of them rather than trusting a reviewer to spot
+it in a diff about something else.
+
+### Bin 2 — Fixed bugs; reversing these reintroduces them
+
+Section 3's table, every row of it. Each row traces to a specific failure that
+already happened once here — in the design this repository was built from, or
+in the work that has landed since — and
+[`07-design-review.md`](07-design-review.md) names it: the
+WebSocket connected *after* the prompt was submitted, `prompt_id` fetched and
+never used, `ws.recv()` with no timeout, no SIGTERM handling, pub/sub dropping
+messages into an empty room, an image that would not have started on OpenShift
+at all, a 30-second router default cutting every long generation at exactly the
+same place. The later rows are the same process applied to the work in
+[`10-roadmap.md`](10-roadmap.md) as it landed — the phase breadcrumb written
+before the POST rather than after it, the per-process incarnation id, the reap
+that reads before it removes, the insert that splices instead of rewriting the
+list.
+
+These look like ceremony, and that is precisely their failure mode: each is a
+line whose purpose is invisible in the diff that deletes it, and each was
+written by somebody who had just spent a day finding out what its absence does.
+Removing one is not a simplification, it is a re-introduction, and the row says
+which symptom you get back. Read the row before you argue with the lint rule —
+the rule exists because the edit looks harmless.
+
+### Bin 3 — Settled with reasoning; revisit only with new evidence
+
+These are decisions, not constraints, and they are overturnable. What an
+incoming group should know is *which argument it is answering*, because each
+one has a written argument and overturning it without answering that argument
+means running the same reasoning again at higher cost.
+
+| Decision | The argument it makes | Written down in |
+|---|---|---|
+| Retry is narrow — only deaths before ComfyUI ever saw the workflow | A host-RAM OOM is indistinguishable *at the queue layer* from a node reclaim, so a general retry walks a workflow that killed one worker across the whole pool, in sequence, at GPU prices | `10-roadmap.md`, "Retry is narrow, not general"; `06`, "General job retry" |
+| Fair queueing instead of priority lanes | A priority lane is a claim the caller makes, and `X-Forwarded-User` is client-supplied under `AUTH_MODE=none` — everyone declares themselves interactive and the starvation returns wearing a new name. Round-robin solves the stated problem with no trust decision at all | `10-roadmap.md`, "Priority becomes fair queueing"; `06`, "Job priority" |
+| The quota breaker fails **open**, and is unreachable from `readyz()` | A breaker that trips on an unreachable dependency halts a cluster you are already paying for, while the spend it guards against is slow. Inside the readiness path it pulls the gateway out of its Service the moment one submitter crosses a ceiling | `10-roadmap.md`, "The cost breaker is a local quota"; section 3's row |
+| No NVIDIA time-slicing | It gives no memory isolation, so co-resident workflows' peak VRAM simply sums and the victim is whichever process allocates second, not the greedy one. The density win is zero anyway: a 16 GiB node offers one pod ~10.5 GiB and one worker takes it | `10-roadmap.md`, "I6 — do not do this" |
+| `ENABLE_MANAGER=false` in a shared pool | It hands every user with UI access code execution on a node with cloud credentials — and it is not even durable, because the pool scales to zero and anything it wrote goes with the node | `06`, "ComfyUI-Manager and auto-downloaders" |
+| One Redis, AOF, no HA | At this scale, three Redis nodes protect against a failure less likely than the ones nobody has fixed yet | `06`, "Redis HA" |
+
+Notice the last row, because it shows what "new evidence" means here. Its
+argument is explicitly conditional on scale: it does not need a better idea to
+fall over, it needs a different number of users. Several of the others are the
+same shape. A group that arrives with a measurement is having a different
+conversation from a group that arrives with a preference, and these rows are
+written so you can tell which one you are in.
+
+### Bin 4 — Genuinely open, and expected to change
+
+Nothing below is settled, and treating it as settled is the opposite mistake
+from reversing bin 2.
+
+- **The scaling work.** Scheduling the warm window rather than pinning it, a
+  low-priority placeholder pod holding a node warm, scaling on estimated wait
+  rather than queue depth, `cooldownPeriod`, `MAX_GPU_WORKERS`.
+  `10-roadmap.md` carries these as I1, I3 and I4 with efforts, risks and a
+  landing order attached. None of them has landed. `cooldownPeriod: 600` is
+  called out in `06` as "a starting point, not a truth".
+- **The storage layout.** EFS is required by *this* shape — the gateway serves
+  images off the volume the workers write to, and those pods are on different
+  nodes by construction — but the shape itself is not required. Writing outputs
+  to S3 and returning presigned URLs removes the `ReadWriteMany` requirement
+  outright. Model staging on node-local NVMe is an unscoped spike rather than a
+  work item (`03-storage.md`; `10-roadmap.md`'s I5).
+- **Kueue instead of the hand-rolled queue.** The fair queueing here is correct
+  and measured, and it is also a small scheduler written by hand. Kueue is the
+  Kubernetes-native one, with quota-aware queueing and fair sharing across
+  teams. The README puts the crossover at hundreds of GPUs; that number is a
+  judgement, not a measurement, and it is the kind of judgement a new group is
+  entitled to make differently.
+- **GPU selection.** `g5` versus `g6`, L4 versus L40S versus the eight-card
+  H100 nodes, on-demand versus spot. This is a VRAM-and-price question that
+  moves with the workflows and with AWS's price list, and the worker sizing in
+  `02-worker.yaml` is calibrated for a 4-vCPU 16 GiB machine, so it moves with
+  the answer.
+- **ROSA specifically, versus OpenShift generally.** Almost nothing here is
+  ROSA — the Routes, `oauth-proxy`, KEDA, the GPU Operator and the
+  arbitrary-UID posture are OpenShift. What is ROSA-specific is the machine-pool
+  commands in `scripts/`, the ~15-minute rebuild that makes `make down` a habit
+  rather than a last resort, and the HCP restriction that there is no MachineSet
+  to edit — which is exactly what blocks the NVMe spike above.
+
+Saying this out loud is the point of the section. A repository commented this
+heavily reads as untouchable, and a group that treats all of it as load-bearing
+will end up paying for a decision that nobody actually made.
+
+### Bin 5 — Would be a different project
+
+Not forbidden. Just a new thing rather than a continuation, and worth calling
+by its real name at the start rather than discovering it halfway through.
+
+- **Reachable workers.** A Service, a Route, `--listen 0.0.0.0`, ComfyUI's own
+  UI put in front of a user. This is the property the rest is built on, and the
+  only one that cannot be recovered after the fact.
+- **Replacing ComfyUI.** A great deal here is shaped by ComfyUI specifically:
+  one socket multiplexing every prompt, no authentication, arbitrary Python in
+  custom nodes, one long-lived process with a single fixed
+  `--output-directory`. A different engine invalidates the reasoning, not just
+  the code.
+- **Becoming a model server.** Batching requests onto one card, holding weights
+  resident across tenants, an inference API with latency targets. That is a
+  different product with different failure modes, and the queue in front of it
+  would be the smallest part of the work.
+
+### Why bins 1 and 2 can be trusted by people who did not build them
+
+Those two bins ask the most of you: they ask you to accept a claim about a bug
+you never saw, made by a group you are replacing. You do not have to accept it.
+They are the two bins that are **checkable**, and checking is cheaper than
+arguing:
+
+- **The assertions have been mutation-tested, and some of them failed that
+  test.** `make test` runs 289 assertions — 29 shell unit assertions and 260 in
+  the end-to-end suite across 17 check files — and the count is the least
+  interesting thing about it. Assertions here have been caught unable to fail,
+  each found by someone deliberately breaking the feature and noticing that
+  nothing went red; what replaced them is in the README under *"The assertions
+  that could not fail"*, and section 4 above states the standing rule. A suite
+  that has caught itself is a different kind of evidence from a suite with a
+  large number attached.
+- **The one performance claim was measured, not reasoned.**
+  `enterprise/test/bench-fair-enqueue.py` is in the repository and you can run
+  it yourself: one submit against a 499-deep queue of ~26 KB workflows cost
+  117.7 ms of exclusive Redis time with the whole envelope in the list, and
+  1.6 ms with an ordering record in the list and the workflow beside it. That
+  number is why the fair-queueing row in section 3 reads the way it does.
+- **Every claim about a bug names where to check it.** Section 3's rows cite
+  the file and the numbered comment block — `worker_agent.py`, note 3;
+  `BEGIN WORKER IDENTITY`; `FAIR_ENQUEUE_LUA` — and, where one exists, the
+  check that proves it by name (`check-36-live-worker-fencing.py`,
+  `check-37-reap-durability.py`). `07-design-review.md` shows the original code
+  beside what replaced it. You can go and read the code a claim is about
+  instead of the sentence making it.
+- **Twelve shape rules in `scripts/lint.sh` pin section 3's file-level
+  invariants mechanically** — the block is titled after that section. They are
+  greps, deliberately: no parser and no dependency, because the two they were
+  written for produce a crash-loop or an unauthenticated RCE rather than a test
+  failure. Each carries in its own failure message the reason it exists and the
+  section 3 row it pins.
+
+So the honest instruction to an incoming group is: distrust the previous one
+and check. Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM
+handler, or the workspace confinement, and run `make test`. Something goes red
+in about a minute, and *which* assertion goes red tells you what that line was
+actually holding. That is a faster way to find out what bins 1 and 2 are worth
+than reading this document — which is the point. Neither bin is asking for your
+good faith.
+
+---
+
+## 11. Reading order
 
 1. `README.md` — the shape and the case for it.
 2. **This file.**
@@ -462,12 +694,12 @@ add any of it, because in several cases the omission is the decision.
    read cover to cover.
 
 Then run `make test`, read `hub.py` and `worker_agent.py` top to bottom (they
-are 886 lines together and both open with a numbered list of the things the
+are ~4,260 lines together and both open with a numbered list of the things the
 obvious implementation gets wrong), and you have the whole system.
 
 ---
 
-## 11. Support and escalation
+## 12. Support and escalation
 
 - **Cluster-level** (API server unreachable, node lifecycle, upgrades): Red Hat
   + AWS joint support on the ROSA support plan. Check the plan is still active
@@ -485,7 +717,7 @@ obvious implementation gets wrong), and you have the whole system.
 
 ---
 
-## 12. Last word
+## 13. Last word
 
 The temptation with a repository like this one is to simplify it. Much of what
 is here looks like ceremony until you know what it is for: a bounded socket
@@ -499,16 +731,24 @@ grounds that it looks unnecessary, that is the moment to run `make test` first
 and read the comment block second — the tests were written from the bugs, so
 they will usually tell you before a cluster does.
 
-The other thing worth saying is that the platform is doing more work here than
-the code is. The reason this repository is ~8,700 lines and not a distributed
-system is that cluster SSO, the driver lifecycle, node autoscaling to zero,
-audit logging, arbitrary-UID isolation and TLS rotation are not in it — they
-are underneath it, and they are somebody else's pager. When you are deciding
-whether to add something, the first question is whether OpenShift already does
-it, because in this problem domain it usually does, and the version you would
-write would be the version nobody maintains. The corollary is the one thing
-that would genuinely undermine the design: if you ever find yourself making a
-GPU worker reachable — a Service, a Route, `--listen 0.0.0.0` — to solve a
-problem, stop and solve it at the gateway instead. That single property is
-what the rest of this is built on, and it is the only one that cannot be
-recovered after the fact.
+Which returns this document to where it started. The platform is doing more
+work here than the code is: the reason this repository is ~9,700 lines of
+Python and not a distributed system is that cluster SSO, the driver lifecycle,
+node autoscaling to zero, audit logging, arbitrary-UID isolation and TLS
+rotation are not in it — they are underneath it, and they are somebody else's
+pager. That is the whole argument for where this runs, and it is worth being
+glad about rather than merely resigned to: a FastAPI process, a Python agent,
+one Redis and a bill is a small enough surface that one person can hold all of
+it in their head, which is not true of any version of this that owns its own
+control plane. When you are deciding whether to add something, the first
+question is therefore whether OpenShift already does it, because in this
+problem domain it usually does, and the version you would write would be the
+version nobody maintains.
+
+The corollary is the one thing that would genuinely undermine the design, and
+it is bin 1 of section 10 in a sentence: if you ever find yourself making a GPU
+worker reachable — a Service, a Route, `--listen 0.0.0.0` — to solve a problem,
+stop and solve it at the gateway instead. That single property is what the rest
+of this is built on, and it is the only one that cannot be recovered after the
+fact. Everything below that line is somebody else's pager. Everything above it
+is now yours, and section 10 says which parts of it you are free to move.

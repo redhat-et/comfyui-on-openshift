@@ -18,14 +18,31 @@ a queue that lets GPU workers appear and vanish, a machine pool that autoscales
 to *zero nodes*, driver lifecycle, arbitrary-UID isolation, network policy,
 audit logging, in-cluster image builds with no registry credential to rotate —
 none of that is written here. It is the platform. What is written here is the
-~8,700 lines that connect ComfyUI to it, and every place that connection turns
-out to be subtle.
+~9,700 lines of Python that connect ComfyUI to it, and every place that
+connection turns out to be subtle.
 
 Two configurations share one cluster, one GPU operator, and one set of volumes:
 a single-user pod for one person and one GPU, and a multi-user configuration
 with a queue, cluster SSO, and a GPU pool that scales to zero. The queue and
 gateway logic is covered by an end-to-end test suite that runs on your laptop
 in about a minute — no cluster, no GPU, no AWS account (`make test`).
+
+## Who is reading this
+
+Four people arrive here with four different fears. The rest of this README is
+one argument — that the platform underneath is doing the work, and that the
+code here is the wiring — but which face of it you need first depends on which
+of them you are.
+
+| You are | What you are afraid of | Start here |
+|---|---|---|
+| **A designer** | That "on a platform" means a worse version of the tool you already know | **"What changes for the people using it"** — the loop, step by step, including the one click in ComfyUI-Manager that fetches a missing model onto storage that outlives the cluster. Two things genuinely change; both are named there rather than discovered later. |
+| **Cost or finance** | Spend that lands on the card with nobody's name on it | **"The numbers, briefly"** — three cost states, each with a command and a known return time. **"Why it is cheap, which is not the reason people assume"** is the duty-cycle argument for the size of the number, which is not discipline. `GET /api/showback` answers who spent the card, and `QUOTA_GPU_SECONDS` caps one person's month — off by default, and it fails open. |
+| **A platform engineer** | Going on call for somebody else's creative tool | **"What you actually operate"** — a FastAPI process, a Python agent, one Redis, and the bill. The driver, the nodes, the control plane and the TLS are somebody else's pager, and that division is the reason this repository is under ten thousand lines of Python rather than a distributed system. |
+| **Security** | An unauthenticated remote-code-execution endpoint, which is exactly what ComfyUI is | **"Security — the strongest control is architectural"** — the GPU pods have no Service and no Route and ComfyUI binds to loopback, so the endpoint is unreachable rather than defended. **"Proof, not promises"** is what has been attacked, what was measured, and the six assertions this suite caught being unable to fail. |
+
+"Which path are you on?" further down routes by task instead — what you want
+to do next, rather than what you are worried about.
 
 ## What changes for the people using it
 
@@ -137,6 +154,21 @@ about cost:
 3. **Park at lunch, down overnight.** `make park` and `make down` — and
    `docs/02-cost.md` has crontab lines that make the habit automatic.
 
+The ladder matters more than any single row in it. Every rung is one platform
+operation with a command and a known return time, which is what lets the habit
+survive a working week: the card comes back in about five minutes, the whole
+cluster in about fifteen. On a cluster that takes forty minutes to rebuild
+nobody actually tears down, the ladder is decorative, and the number you pay
+is the top row. HCP's fast rebuild and flat control-plane fee are what make the
+bottom two rungs something people use rather than something they could use.
+
+The other half of a cost question is whose cost it was. `GET /api/showback`
+reports one UTC month's GPU seconds per submitter, from the attribution the
+queue envelope was already carrying, and `QUOTA_GPU_SECONDS` turns that same
+accounting into a per-person ceiling — off by default, and deliberately
+failing open. Both are described in full under "Ideas worth doing next",
+items 7 and 11, including what the number over-counts and why.
+
 The full accounting — every fee, the monthly patterns, and where money leaks
 — is in `docs/02-cost.md`.
 
@@ -181,6 +213,10 @@ provider, and the thing doing the generating is stock ComfyUI.
 This repo will run on any OpenShift, but ROSA with hosted control planes is
 where it is designed to feel best. Seven reasons, each of which is a file in
 this repository rather than a claim.
+
+This is the concentrated form of the argument, not the whole of it. The cost
+ladder above, the failure table below, and "Three things that will bite you"
+at the end are each the same case seen from a different side.
 
 ### Cost — the platform can turn the GPU off, and turn the cluster off
 
@@ -292,7 +328,7 @@ stops being a problem rather than becoming one.
 - **The eight-step EFS setup is scripted.** RWX storage on an STS cluster is
   eight things that must all be right simultaneously; getting six right yields
   a PVC stuck in `Pending` with no useful event. That is why it is a script.
-- **The failure modes are written down** — eight documents covering what
+- **The failure modes are written down** — ten documents covering what
   actually goes wrong, including a dedicated page on why the force-delete
   everyone reaches for causes the symptom it claims to cure.
 
@@ -318,9 +354,9 @@ stops being a problem rather than becoming one.
   storage and deploy steps run against any OpenShift 4.x cluster — on-prem,
   bare metal, vSphere.
 - **Metrics the cluster already knows how to graph.** The gateway exports
-  `comfy_queue_depth` and `comfy_workers_registered`, and `setup.sh` applies a
-  ServiceMonitor so user-workload monitoring can alert on a wedged pool before
-  a human notices.
+  `comfy_queue_depth`, `comfy_workers_registered` and
+  `comfy_estimated_wait_seconds`, and `setup.sh` applies a ServiceMonitor so
+  user-workload monitoring can alert on a wedged pool before a human notices.
 - **Every job has a name attached.** The gateway stamps the authenticated
   username onto job state, so when the GPU bill asks whose job this was, there
   is an answer.
@@ -409,6 +445,16 @@ Most of this repository's design is failure handling, so it is worth being able
 to read it in one place. Nothing below is aspirational: each row is a code path
 you can find, and most are covered by an assertion in `enterprise/test/`.
 
+Read it as evidence rather than as a list of defences. Almost nothing here is
+exceptional: a pool that scales to zero terminates workers as a matter of
+routine, a node drain is an upgrade doing its job, and a container restarted in
+place is `restartPolicy: Always` behaving exactly as documented. The platform
+generates this traffic by design, which is why the SIGTERM drain, the TTL'd
+heartbeat and the incarnation nonce are asserted rather than assumed — they
+are on the ordinary operating path, not on an unlikely day. Termination being
+routine is what makes scale-to-zero affordable; handling it is the price of the
+cost ladder above.
+
 #### Out of memory — three different failures that people call one thing
 
 ComfyUI makes it easy to exceed memory, and the three ways it happens are not
@@ -416,7 +462,7 @@ handled alike. Knowing which one you hit is most of the diagnosis.
 
 | | What actually happens | What the user sees |
 |---|---|---|
-| **VRAM / CUDA OOM** — the common one: a resolution, batch size or model stack that does not fit the card | ComfyUI catches it and emits `execution_error`. The agent (`worker_agent.py:279`) turns that into a terminal `failed` carrying ComfyUI's own exception message. The worker stays healthy and takes the next job. | `failed: Allocation on device ...` — the real message, not a generic error. Nothing is retried, because the same workflow would fail the same way on any card. |
+| **VRAM / CUDA OOM** — the common one: a resolution, batch size or model stack that does not fit the card | ComfyUI catches it and emits `execution_error`. The agent (`worker_agent.py`, `run_job()`) turns that into a terminal `failed` carrying ComfyUI's own exception message. The worker stays healthy and takes the next job. | `failed: Allocation on device ...` — the real message, not a generic error. Nothing is retried, because the same workflow would fail the same way on any card. |
 | **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The container hits its own memory limit and the kernel kills ComfyUI inside that cgroup. `start.sh` waits on both children, so the container exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run — `restartPolicy: Always` then restarts the container inside this same pod, which keeps its name and its `HOSTNAME`. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses — including across that restart, because the worker's identity is its pod name plus a nonce chosen at process start (`worker_agent.py`, note 9), not the pod name alone. At the queue level this is still indistinguishable from infrastructure death — but the container is not: it terminates as `OOMKilled` and `oc describe pod` names the reason. |
 | **Node-level pressure** — eviction rather than a container kill | The kubelet evicts with a grace period, so SIGTERM arrives first and the drain below applies. A GPU pod is Guaranteed QoS, so it is the last thing evicted, not the first. | Usually nothing: the job finishes before the pod goes. |
 
@@ -453,7 +499,9 @@ flowchart TD
 | **Graceful termination** — scale-to-zero, a node drain, a rolling deploy, a spot interruption notice | The agent traps SIGTERM, stops accepting new work, and **finishes the job in flight** before exiting (`worker_agent.py`, note 4). Termination is routine on a pool that scales to zero, so this is the common path, not the exceptional one. | The generation completes normally. Asserted by the e2e suite. |
 | **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5), and writes a `phase` breadcrumb as it goes (note 6). When the heartbeat lapses, the gateway's reaper reads that breadcrumb and either fails the stranded job **naming the dead worker**, or — only if the worker died before ComfyUI was ever handed the workflow — requeues it once. | Died mid-generation: `failed: worker comfy-worker-xxxx died`, loudly, rather than a progress bar that never moves. Failed and not requeued on purpose — a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices — and the message points at `oc describe pod`, which *can* tell an OOM kill from a reclaim. Died before it started: a non-terminal `retry` event the browser reads past, and a second worker finishes the job. Both asserted by the e2e suite. |
 | **A worker that comes straight back** — the container is restarted inside its own pod, which is how `restartPolicy: Always` answers a kernel OOM | The heartbeat key and the processing list are named from the worker's *incarnation* — its pod name plus a nonce chosen at process start (`worker_agent.py`, note 9) — not from the pod name alone, which a restart keeps. The reaper's whole liveness test is pairing those two keys by name, so an id that outlives the process it names lets the replacement vouch for its own predecessor. | The restart is invisible to the stranded job: it is failed by the reaper on exactly the schedule it would have been if the pod had never come back. Without the nonce the *same* row above silently stops applying — the job never reaches a terminal state at all, its GPU seconds land in neither bucket, and its queue entry stays in Redis for the life of the pod. Asserted by the e2e suite, restart and all. |
-| **ComfyUI wedges or dies mid-job** | The agent's `recv()` is bounded and each job carries a deadline (`JOB_TIMEOUT`, 1800s). On every timeout it re-checks `/history` in case a completion event was simply missed. | The job fails with a reason instead of the pod sitting `Running` and `Ready` while silently consuming nothing — which is worse than a crash, because KEDA sees a growing queue and adds more workers beside the dead one. |
+| **A worker that is alive and was called dead** — the reaper's whole liveness test is whether one heartbeat key exists, and `run_job()`'s prologue blocks in three places: an unbounded `mkdir` on the shared volume, a 30-second WebSocket connect, a 30-second POST | The heartbeat is refreshed by a thread that runs for the whole process rather than from inside the two loops (`worker_agent.py`, note 10), so it is a property of the process being alive. That shrinks the window and cannot close it, so the job also carries an **owner**: the reaper stamps its own mark over that field before it touches a stranded entry, and the worker re-reads it before handing ComfyUI the workflow and again before writing a terminal outcome. Reaped means abandon — no submit, no terminal event, no accrual. | Without both halves a live worker's job is requeued underneath it and ComfyUI is handed one workflow twice, on one GPU pool, with the second `completed` landing on a stream the browser stopped reading. Asserted by the e2e suite (`check-36-live-worker-fencing.py`), which kills nothing. The residual window is two Redis round trips wide and is written down rather than claimed closed — `docs/10-roadmap.md`, F4. |
+| **A reap that fails halfway** — the reaper is the only code that ever writes a terminal event for a job whose worker died, so its own crash is the job's last chance | The stranded entry is *read*, not popped: it leaves the processing list only after its reap has returned, a reap that raised is retried on a later tick, and an entry that can never be reaped is set aside on a capped, expiring list rather than dropped. Exclusion between the two gateway replicas is an explicit per-entry claim rather than a side effect of popping. | The trade is at-least-once for at-most-once: a gateway dying between a reap and its cleanup costs a duplicate terminal event on a stream the browser stopped reading at the first one, where popping first cost the job itself. Asserted by the e2e suite (`check-37-reap-durability.py`), which injects one fault per scenario rather than killing anything. |
+| **ComfyUI wedges or dies mid-job** | The agent's `recv()` is bounded and each job carries a deadline (`JOB_TIMEOUT`, 1800s). On every timeout it re-checks `/history` in case a completion event was simply missed. A socket that ComfyUI closes does not wait that deadline out: the close surfaces as an empty frame rather than an exception, the agent treats it as the close it is, asks `/history` once in case the prompt landed in the instant before the process went, and otherwise fails immediately naming the lost connection. | The job fails with a reason instead of the pod sitting `Running` and `Ready` while silently consuming nothing — which is worse than a crash, because KEDA sees a growing queue and adds more workers beside the dead one. Both outcomes of the closed socket are asserted by the e2e suite (`check-75-closed-socket.py`); before it existed, deleting the guard left the whole suite green. |
 
 #### The job itself
 
@@ -624,6 +672,17 @@ saving for thirty designers, GPU line only:
 | A card each, off outside work hours | 5,940 | **3.7×** — just turning it off |
 | Pooled, scaling with demand | 1,257 | **4.7× more** — recovering the setup time |
 
+The assumptions, because they are what drive the rows: thirty designers,
+nine-hour days, twenty-two working days a month. The first row is
+30 × 730 card-hours, the second 30 × 9 × 22. The third is **not** simply
+30 × 1.3 × 22 — that is 858 card-hours of generation, and a pool does not pack
+that perfectly. A worker stays up for `cooldownPeriod` (600s in
+`03-autoscale.yaml`) after its queue empties, and a cold pool pays for a node
+before it pays for a job, so the pooled row carries the pool's own idle on top
+of the generation itself. Treat 1,257 as an estimate of that overhead rather
+than as arithmetic you can reproduce from the two numbers above; nobody has
+run this at thirty designers, and `docs/09-engineering-handoff.md` §0 says so.
+
 The first factor is not architectural: anyone disciplined enough to shut
 instances down nightly gets it without a cluster. The second is, and it is the
 one worth defending. **The queue does not create a saving; it converts one
@@ -693,9 +752,12 @@ is simply long, two L4s beat one L40S at about the same price.
 ## Ideas worth doing next
 
 Ordered by payoff per unit of work. Five have landed, and half of a sixth,
-along with three
-foundation items that were never on this list — worker resource sizing, a
-versioned queue payload, and test-harness discovery. **Struck items stay here:
+along with four foundation items that were never on this list — worker resource
+sizing, a versioned queue payload, test-harness discovery, and the heartbeat
+keepalive and ownership fence that stop a live worker's job being requeued
+underneath it. A cross-wave sweep landed two more that were on no list at all:
+the worker's Redis identity now names the process rather than the pod, and a
+reap that fails halfway leaves the job recoverable. **Struck items stay here:
 shipped ones because a roadmap that never visibly moves is a wish list, and
 decided-against ones because the reasoning is the useful part.**
 `docs/10-roadmap.md` is the worked version and the record: what landed, what
@@ -775,8 +837,9 @@ at all.
    change, and the pop is the same `BLMOVE` into the per-worker processing
    list. One submitter, or none, degrades to plain FIFO by construction. The
    enqueue cost was measured rather than assumed, and the first implementation
-   stalled Redis for 113 ms at full queue depth before it was fixed —
-   `enterprise/test/bench-fair-enqueue.py` keeps the number re-measurable.
+   stalled Redis for 117.7 ms at full queue depth before it was fixed, against
+   1.6 ms after — `enterprise/test/bench-fair-enqueue.py` keeps both numbers
+   re-measurable, and "Proof, not promises" has the shape of the fix.
 9. **Scale on queue *wait*, not queue depth.** Depth is a proxy; what a user
    feels is time-to-first-pixel. *(Medium.)* *(The gauge half — Q6 in
    `docs/10-roadmap.md` — is landed: `/metrics` exports
@@ -846,10 +909,10 @@ flowchart TB
     class G,A,R,B yours
 ```
 
-That division is why this repository is around nine thousand lines and not a
-distributed system. When you are deciding whether to add something, the first
-question is whether OpenShift already does it — because in this problem domain
-it usually does, and the version you would write is the version nobody
+That division is why this repository is under ten thousand lines of Python and
+not a distributed system. When you are deciding whether to add something, the
+first question is whether OpenShift already does it — because in this problem
+domain it usually does, and the version you would write is the version nobody
 maintains. `docs/09-engineering-handoff.md` is the long form, for whoever picks
 this up next.
 
@@ -930,6 +993,121 @@ of every claim the original design's manifests did not implement and every line
 of its Python that would not have run. It is the list of things you would
 otherwise have discovered at 2am.
 
+### The output path has been attacked, and the attack is in the suite
+
+Every path that ends on the shared volume begins as something a caller chose.
+The submitter's name arrives in a request header, a save node's
+`filename_prefix` arrives inside the workflow, and the output filename comes
+back from ComfyUI. All three are handled as hostile, and ten hostile strings
+are driven through the running system on every `make test`: four usernames (an
+eight-deep traversal, an absolute path, an empty value, 2000 characters), a
+`filename_prefix` carrying `..`, two reported output filenames
+(`../../OUTSIDE/secret.txt`, and a bare `sub/evil.png` that never spells `..`
+at all), a `/outputs/../../etc/passwd` request, and two hostile submitter
+identities pushed through the showback accounting. None of them escapes
+`OUTPUT_ROOT`. The legitimate cases are asserted in the same files —
+`alice.smith@example.com` and a filename with parentheses must still
+round-trip to a real, servable URL — because sanitizing hard enough to break
+the usernames an IdP actually issues is its own failure.
+
+There are two layers, and the second one has already caught what the first one
+missed. Sanitization makes a separator unrepresentable in a workspace name;
+the join is then resolved and re-verified against `OUTPUT_ROOT`, and the
+gateway independently refuses to serve any `/outputs/...` path that resolves
+outside it. `check-65-output-filename-confinement.py` exists because subfolder
+confinement alone was not enough: `output_subfolder()` confined the subfolder
+correctly and `collect_outputs()` then concatenated the raw reported filename
+onto it, so the escape lived in how the URL's two halves were joined rather
+than in what either half returned. That check reproduces the escape against the
+live agent's own output first, and only then asserts the fix — a hostile
+filename produces no image entry at all, rather than one served from a
+rewritten name.
+
+One part of this is reasoned rather than tested, and it is worth saying so:
+resolve-then-verify is what would catch a symlink already planted in the output
+volume, which no string rule can see, and nothing in the suite plants one. The
+order of operations is the argument there (`worker_agent.py`,
+`workspace_path()`), not a green check.
+
+### The assertions that could not fail, and what replaced them
+
+`make test` runs 289 assertions — 29 shell unit assertions and 260 in the
+end-to-end suite across 17 check files. The count is the least interesting
+thing about it. An assertion nobody has watched fail is a decoration, and this
+suite has caught six of its own being exactly that:
+
+- Three assertions of the form "`comfy:queue` is empty afterwards" were
+  **proven unable to fail** by mutation testing. One agent polls one queue
+  here, so an entry a wrong implementation put back has already been popped
+  again by the time a check looks — `LLEN` reads 0 either way. They were
+  replaced by counting the command Redis actually executed
+  (`enterprise/test/queue_watch.py`).
+- The worker's guard for a server-side socket close was **deleted outright and
+  the whole suite stayed green**: no check reached it, because the one
+  dead-ComfyUI fixture closed in a way that made the client raise instead.
+  That is what `check-75-closed-socket.py` was written for.
+- A re-gate against a live mutation that really did requeue a rejected job
+  found the assertion still passing, because the watcher was armed after the
+  submit rather than before it (`check-20-failure-paths.py`, and the same
+  construction in `check-70-oom-paths.py`).
+- **"At least three progress events"** passed on an agent that filters progress
+  and not terminals: the stub's foreign terminal event arrives *after* all
+  three, so the job ends on somebody else's completion with three progress
+  events already delivered. `check-10-stream.py` now counts foreign events over
+  the job's whole stream and requires the one terminal event to carry this
+  job's own `prompt_id`.
+- **Every estimated-wait assertion ran against a one-entry queue**, where index
+  `-1` and index `0` are the same entry — so nothing could tell which end of
+  the queue the gauge reads, and a gauge reading the head reports ~0 on an
+  hour-old backlog. `check-80-estimated-wait.py` now submits a second job
+  behind the manufactured stale one.
+- **A requeue that jumps the queue is invisible to every other check**: the job
+  is still requeued once, still completes, and `comfy:queue` still receives
+  exactly one write. Only its position changes.
+  `check-55-retry-placement.py` builds a two-lane backlog with a real middle
+  and asserts the whole service order afterwards.
+
+The harness itself had the same shape of hole, and it is worth naming beside
+them: `run.sh` folded only a check's exit status, so a check that kept printing
+its `FAIL` lines while its `sys.exit(1)` went missing left the suite — and CI,
+which reads the same status — green over its own output. It now reads each
+check's output for the shared `check()` helper's own line format as well.
+
+So the useful thing to do with this suite is to distrust the authors and check.
+Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM handler, or
+the workspace confinement, and run `make test`: something goes red, and which
+assertion goes red tells you what that code was actually holding. It is a
+faster way to find out what the suite is worth than reading it.
+`docs/10-roadmap.md` states the standing rule in the other direction — an
+existing assertion may be replaced only by one that is strictly stronger, in
+the same commit, with both shown in review.
+
+### The fair-enqueue cost was measured, not assumed
+
+Fair queueing means placing a new job relative to the jobs already queued,
+which means reading them, inside one Lua `EVAL`. Redis executes one command at
+a time, so that read is time no other client gets — including every worker
+parked in `BLMOVE`, which is to say the pool stops being handed work for the
+duration. One submitter's insert is therefore a cluster-wide cost, and it was
+measured rather than reasoned about.
+
+| One `/api/generate`, 499-deep queue | ~26 KB workflow | ~103 KB workflow |
+|---|---:|---:|
+| Whole envelope in the list | 117.7 ms | 1235 ms |
+| Ordering record in the list, workflow at `comfy:job:<id>:payload` | 1.6 ms | 2.2 ms |
+
+The second column is the more useful one: what the insert reads per entry is
+now fixed, so the cost has stopped tracking a size the *client* chooses.
+`enterprise/test/bench-fair-enqueue.py` is committed, imports the real `hub.py`
+rather than reimplementing the call shape, and uses its own key namespace, so
+the numbers are re-measurable against any Redis — the recorded ones are an
+M-series laptop with redis-server 8. `make test` does not run it: it is a
+measurement rather than an assertion, and `run.sh` discovers only `check*.py`.
+The e2e suite structurally cannot see this at all, since it runs a queue three
+jobs deep with a two-node workflow where every version of the insert is
+instant; `make lint` pins the shape the number depends on, and
+`docs/09-engineering-handoff.md` section 3 has the row.
+
 ## Configuration
 
 Everything lives in `.env`. The ones you are most likely to change:
@@ -948,18 +1126,33 @@ Everything lives in `.env`. The ones you are most likely to change:
 
 ## Three things that will bite you
 
+Each of these is the platform holding an opinion, and in each case the opinion
+is what makes something else in this README true. They bite because they are
+load-bearing, not because they are rough edges nobody got around to sanding.
+
 **The GPU node is tainted** `nvidia.com/gpu=true:NoSchedule`. Anything you
 deploy onto it needs the matching toleration. The manifests here have it; your
-own pods will not.
+own pods will not. That taint is also why a $0.98/hour node cannot quietly fill
+with whatever else wanted scheduling — it is what lets the GPU pool be sized
+from queue depth alone, and what makes a node with nothing left on it safe
+for the autoscaler to reclaim. `scripts/lint.sh` fails a worker that loses the
+toleration.
 
 **OpenShift runs your container as an arbitrary UID**, not the one in your
 Dockerfile. Every path the process writes to must be a mounted volume or be
 group-writable and group-root-owned at build time. This is the single most
 common reason an image that works under `podman run` crash-loops here — see the
-bottom third of `app/Containerfile` for the fix.
+bottom third of `app/Containerfile` for the fix. It is the same rule that makes
+a compromised container not a compromised node, which is most of why running
+ComfyUI's arbitrary-Python node system in front of a team is defensible at all.
+It also propagates: the per-user output workspaces are `2775` and setgid
+because the next pod to write into one will be a different UID.
 
 **First GPU Operator run takes 10–20 minutes.** It compiles a driver against
-the running RHCOS kernel and pulls multi-gigabyte images. It is not hung.
+the running RHCOS kernel and pulls multi-gigabyte images. It is not hung. What
+you are watching is the driver lifecycle being handed over — the operator
+recompiles on every kernel move, for the life of the cluster, which is the job
+that would otherwise be yours forever.
 
 ## Sources
 

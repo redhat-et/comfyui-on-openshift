@@ -84,8 +84,9 @@ make status                                      # burn rate
 ```
 
 The gateway also serves Prometheus gauges at `/metrics` (`comfy_queue_depth`,
-`comfy_workers_registered`), and `setup.sh` applies a ServiceMonitor so
-OpenShift's user-workload monitoring can graph and alert on them — "queue
+`comfy_workers_registered`, `comfy_estimated_wait_seconds`), and `setup.sh`
+applies a ServiceMonitor so OpenShift's user-workload monitoring can graph and
+alert on them — "queue
 deeper than N for 30 minutes" is the alert that catches a wedged pool before
 a human does.
 
