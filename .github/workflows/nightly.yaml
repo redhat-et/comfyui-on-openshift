@@ -72,8 +72,14 @@ jobs:
 
       - name: scan for known CVEs
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        env:
+          # Anonymous ghcr.io pulls of the trivy vulnerability DB are
+          # IP-rate-limited on shared GitHub runners; fall back to the
+          # AWS-hosted mirror first.
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
         with:
           image-ref: gpu-scan-test
           severity: HIGH,CRITICAL
           exit-code: "1"
           ignore-unfixed: true
+          cache: true

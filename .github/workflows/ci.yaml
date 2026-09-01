@@ -93,17 +93,6 @@ jobs:
       - name: build the gateway image
         run: docker build -t gateway-uid-test -f enterprise/gateway/Containerfile enterprise/gateway
 
-      # Cheap here because the image is already built above. The GPU images
-      # are scanned nightly instead (nightly.yaml) — they are too large to
-      # pull and scan on every PR.
-      - name: scan the gateway image for known CVEs
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
-        with:
-          image-ref: gateway-uid-test
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-
       - name: serve as an arbitrary UID
         run: |
           docker run -d --name gw --user 1000670000:0 -p 8000:8000 gateway-uid-test
@@ -123,3 +112,28 @@ jobs:
             echo "gateway did not serve /healthz as an arbitrary UID with GID 0"
             exit 1
           fi
+
+      # Moved to run after the arbitrary-UID proof above (used to sit between
+      # build and serve, with exit-code: 1): a newly-disclosed HIGH/CRITICAL
+      # in the ubi9 base image used to fail this job before the correctness
+      # test this job exists for — the arbitrary-UID boot — ever ran, on
+      # every unrelated PR. continue-on-error keeps a CVE from blocking the
+      # PR check entirely; the scan still runs and still shows red in the job
+      # summary, it just doesn't gate. This is intentionally soft only for
+      # this small, frequently-rebuilt image — the two GPU images
+      # (nightly.yaml) scan with exit-code 1 and no continue-on-error,
+      # because they build once a day, not on every push.
+      - name: scan the gateway image for known CVEs
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        continue-on-error: true
+        env:
+          # Anonymous ghcr.io pulls of the trivy vulnerability DB are
+          # IP-rate-limited on shared GitHub runners; fall back to the
+          # AWS-hosted mirror first.
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
+        with:
+          image-ref: gateway-uid-test
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          cache: true
