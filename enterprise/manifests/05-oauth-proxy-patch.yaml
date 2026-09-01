@@ -7,6 +7,14 @@ spec:
     spec:
       serviceAccountName: comfy-gateway
 
+      # Back on, and only here. 01-gateway.yaml sets this false because nothing
+      # in that pod talks to the API server; the sidecar below does — a
+      # TokenReview for the login and a SubjectAccessReview for --openshift-sar
+      # — and it reads the token from the projected volume this restores. The
+      # true lives in the same file as the container that needs it so an edit
+      # cannot separate them.
+      automountServiceAccountToken: true
+
       volumes:
         - name: proxy-tls
           secret:

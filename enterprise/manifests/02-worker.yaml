@@ -63,6 +63,18 @@ spec:
       # 1500-second render threw the work away anyway. Change them together.
       terminationGracePeriodSeconds: 1980
 
+      # No Kubernetes API client lives in this pod, so the projected
+      # ServiceAccount token is nothing but a credential sitting in the
+      # filesystem waiting to be read. Verified against the source rather than
+      # assumed: neither enterprise/gateway/hub.py nor
+      # enterprise/worker/worker_agent.py imports a Kubernetes client or opens
+      # the API server at all — Redis is the only thing either one dials.
+      #
+      # It matters more here than anywhere else in the namespace: this pod runs
+      # arbitrary custom-node Python on a GPU node, and a mounted token is a
+      # credential that node's code can read and use against the cluster.
+      automountServiceAccountToken: false
+
       securityContext:
         runAsNonRoot: true
         seccompProfile:

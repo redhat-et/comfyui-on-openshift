@@ -425,6 +425,34 @@ rm -f "$HUB_PY_BACKUP" "$ENVELOPE_LOG"
 
 # ---------------------------------------------------------------------------
 
+log "scripts/lint.sh — namespace hardening shapes (W4, P8, P9)"
+
+# The rules added with the Redis ACL, the ServiceAccount-token removal and the
+# namespace NetworkPolicy. Same mechanism as the manifest fixtures above — a
+# deliberately-broken file copied under a zz-fixture- name into the directory
+# lint already scans, then removed — and the same rule about the expected
+# message: each fixture below violates exactly one invariant and the assertion
+# names it, so a fixture cannot keep passing once the rule it was written for
+# is deleted.
+#
+# Every one of these is invisible to enterprise/test/run.sh by construction. It
+# runs one Redis with one password on one laptop, no Kubernetes at all, so it
+# can see neither a pod's ServiceAccount token, nor a NetworkPolicy, nor which
+# Redis user a connection authenticated as.
+
+LINT_LOG="$(mktemp -t comfy-lint-fixture.XXXXXX)"
+
+trap cleanup_manifest_fixture_drops EXIT
+
+expect_true "lint fails a worker manifest that mounts a ServiceAccount token nothing in the pod uses" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-mounts-sa-token.yaml" \
+    "does not set automountServiceAccountToken: false"
+
+cleanup_manifest_fixture_drops
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then

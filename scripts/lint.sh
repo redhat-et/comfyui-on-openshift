@@ -326,6 +326,33 @@ for f, doc in docs:
                        "to limits, cpu and memory both) so that node pressure "
                        "evicts and OOM-kills everything else first")
 
+    # No pod in the multi-user namespace may mount a ServiceAccount token it
+    # does not use. Neither hub.py nor worker_agent.py imports a Kubernetes
+    # client or opens the API server — Redis is the only thing either dials —
+    # and Redis itself speaks Redis. A projected token in a pod with no API
+    # client is a credential lying in the filesystem for whatever else ends up
+    # running there, which on the worker is arbitrary custom-node Python on a
+    # node inside your VPC.
+    #
+    # Scoped to enterprise/manifests on purpose: manifests/base is the
+    # single-user overlay, whose optional S3 model sync runs an init container
+    # under an IRSA ServiceAccount and DOES need its token.
+    #
+    # The exception is written where the exception is created:
+    # 05-oauth-proxy-patch.yaml sets it back to true in the same file that adds
+    # the oauth-proxy sidecar, which really does call TokenReview and
+    # SubjectAccessReview. That file is a bare patch with no kind, so it is not
+    # a Deployment and this rule does not reach it.
+    if kind == 'Deployment' and f.startswith('enterprise/manifests/'):
+        mounts_token = dig(doc, 'spec', 'template', 'spec',
+                           'automountServiceAccountToken')
+        if mounts_token is not False:
+            bad(f, f"Deployment/{name} does not set "
+                   "automountServiceAccountToken: false. Nothing in this "
+                   "namespace's own pods calls the Kubernetes API, so the "
+                   "projected token is a credential with no reader except "
+                   "whatever else ends up executing in the pod")
+
     # The SIGTERM drain needs a window longer than the job it is draining.
     # The pool scales to zero, so termination is routine; a grace period
     # shorter than JOB_TIMEOUT means the kubelet SIGKILLs the agent partway

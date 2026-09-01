@@ -52,6 +52,11 @@ spec:
       labels:
         app: redis
     spec:
+      # Redis speaks Redis. It has no reason to hold a token for the cluster's
+      # API server, and this is a pod whose entire job is to sit in the middle
+      # of the queue holding everybody's work.
+      automountServiceAccountToken: false
+
       securityContext:
         runAsNonRoot: true
         seccompProfile:

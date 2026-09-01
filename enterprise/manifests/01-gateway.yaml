@@ -44,6 +44,20 @@ spec:
                   - key: feature.node.kubernetes.io/pci-10de.present
                     operator: DoesNotExist
 
+      # No Kubernetes API client lives in this pod, so the projected
+      # ServiceAccount token is nothing but a credential sitting in the
+      # filesystem waiting to be read. Verified against the source rather than
+      # assumed: neither enterprise/gateway/hub.py nor
+      # enterprise/worker/worker_agent.py imports a Kubernetes client or opens
+      # the API server at all — Redis is the only thing either one dials.
+      #
+      # AUTH_MODE=oauth turns this back on: 05-oauth-proxy-patch.yaml adds the
+      # proxy sidecar, and THAT does call the API server — TokenReview for the
+      # login and a SubjectAccessReview for --openshift-sar. The patch sets it
+      # to true again, in the same file that introduces the container needing
+      # it, so the two can never be separated by an edit.
+      automountServiceAccountToken: false
+
       securityContext:
         runAsNonRoot: true
         seccompProfile:
