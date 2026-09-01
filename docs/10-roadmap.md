@@ -103,6 +103,7 @@ silently assume, and that are each worth doing on their own merits.
 | F1 | Worker resource sizing — **landed** | Small | **High** | A unit assertion that requests and limits are internally consistent and fit the target instance type — `scripts/unit-tests.sh` runs the real `scripts/lint.sh` against a fixture with the old shape |
 | F2 | Versioned queue payload envelope — **landed** | Small | Low | `enterprise/test/check-40-envelope.py`: the reserved fields are on the wire with their defaults, an old-shape payload still completes, and an unknown field is not fatal — plus a lint check that the two copies of the envelope have not diverged |
 | F3 | Test harness convention + manifest shape assertions | Small | Low | A deliberately broken manifest fails `make lint`; a new check is discovered without editing two places |
+| F4 | Heartbeat keepalive + job ownership fence — **landed** | Small | **High** | `enterprise/test/check-36-live-worker-fencing.py`, which kills nothing: a live worker parked past `HEARTBEAT_TTL` in `run_job()`'s prologue keeps its heartbeat armed and its job (zero writes to `comfy:queue`, one handoff to ComfyUI, one terminal event), and a live worker whose job IS requeued under it — its heartbeat deleted out from under it until the reaper acts — abandons rather than submitting the workflow beside the retry |
 
 **F1 — worker resource sizing.** The diagnosis above held on inspection and
 the item has landed; four things about it were narrower in this file than they
@@ -186,6 +187,71 @@ than of a running system — a missing toleration, a Service that regained a
 port, a dropped Route annotation, a Containerfile that lost its `chgrp 0` block
 — and the e2e suite structurally cannot see any of them. This is also what
 turns the infra gate below from a request for vigilance into a check.
+
+**F4 — the un-heartbeated window, and the fence under it.** Q2 narrowed retry
+to deaths that happened before ComfyUI was handed the workflow, and left one
+question unasked: what *is* a death? The reaper's whole liveness test is
+whether one key exists, so the answer was "a heartbeat that is not there" —
+and the heartbeat was refreshed only from inside the polling loop and the
+post-submit receive loop. `run_job()`'s prologue runs between them and blocks
+in three places: `ensure_workspace()` is an `mkdir` on the shared RWX volume
+and is unbounded, `ws.connect()` and `submit_prompt()` are 30 seconds each. A
+worker slow in there had a heartbeat that merely LAPSED, which read as a death;
+its job was at `PHASE_DISPATCHED` — retryable by construction, since the whole
+point of that phase is "ComfyUI has not seen it" — and it was requeued while
+the worker was alive and about to submit it. Both attempts then ran: ComfyUI
+was handed one workflow twice, a second `started`/`completed` landed on a
+stream the browser had already closed at the first terminal event, and one
+`job_id` was billed twice against a mechanism whose own comment says a job is
+billed at most once. This is exactly the replay Q2's narrowing exists to
+prevent, arriving through a door Q2 did not look at, and it needs nothing to
+die.
+
+Two halves, because the first one alone is not a fix:
+
+  1. **The keepalive.** `start_heartbeat()` refreshes from a daemon thread for
+     as long as the process lives, at a third of the TTL. The heartbeat becomes
+     a property of the process being alive rather than of it being somewhere
+     particular in its own code, which is what it was always claiming to mean.
+
+  2. **The fence.** A keepalive shrinks the window; it cannot close it. A
+     refresh that *cannot run* — the process stopped by the kernel, Redis
+     unreachable for longer than the TTL, an EFS `mkdir` that takes minutes on
+     a thread that is itself waiting on the same Redis — still looks exactly
+     like a death. So the job carries an owner (`OWNER_FIELD`, in the shared
+     envelope block): the worker writes its incarnation on the job in the same
+     `HSET` that claims it, the reaper stamps `REAPED_OWNER` over it before it
+     reads or decides anything, and the worker re-reads it at the two moments
+     its next act stops being private — before the `/prompt` POST, and inside
+     `finish()`, the single door every terminal outcome leaves by. Reaped means
+     abandon: no submit, no terminal event, no accrual. Absence is deliberately
+     not a fence — an unowned job proceeds — because a missing field that
+     suppressed a terminal event would strand precisely the jobs this whole
+     mechanism exists to stop stranding.
+
+**What F4 does NOT do, precisely.** The fence is check-then-act, not a
+compare-and-swap: the worker reads the owner and then submits, and a reap that
+lands between those two operations is not caught. That window is two Redis
+round trips wide instead of the tens of seconds the prologue used to be, and it
+can only be entered at all by a worker the gateway has *already* wrongly
+declared dead — but it is not zero, and calling it closed would be a claim
+rather than a fix. Closing it needs the submit and the ownership test to be one
+atomic operation, which they cannot be while the submit is an HTTP POST to
+another process: the honest form is a lease with a fencing token that ComfyUI
+itself validates, or an idempotency key on `/prompt` so a second submission of
+one job is refused by the far side rather than declined by the near one. Both
+are redesigns of the worker/ComfyUI contract, not edits to this file. The same
+gap applies to `finish()` on the terminal side, where the consequence is
+smaller: a second terminal event on a stream, not a second GPU.
+
+Two smaller things F4 also does not do. The reaper's requeue still does not
+accrue, so an attempt that held a card for a slow prologue and was then reaped
+has that time billed to nobody — the second attempt's `started_at` overwrites
+the first, and the fence stops the abandoning worker from claiming it. And
+`still_ours()` reads Redis, so a worker that cannot reach Redis raises there
+and fails its own job rather than abandoning it quietly; that is the existing
+behaviour of every other Redis read on the job path (`cancelled()` included)
+and was left alone deliberately.
 
 ## The work items
 

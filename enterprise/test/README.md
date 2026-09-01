@@ -118,6 +118,27 @@ ComfyUI at all when a healthy worker pops it (the worker's door, and what
 second of those is measured by asking the stub whether the workflow ever
 arrived, which is the only way to see a GPU that was spent.
 
+**A LIVE worker keeps its job, and a reaped one abandons it**
+(`check-36-live-worker-fencing.py`). Every other worker-death check here kills
+something. This one kills nothing, because the failure it covers needs no
+death: the reaper's whole liveness test is whether the heartbeat key exists,
+and `run_job()`'s prologue blocks in three places that used to refresh nothing
+— an unbounded `mkdir` on the shared volume, a 30-second WebSocket connect, a
+30-second POST. A heartbeat that merely lapsed in there read as a death, at a
+phase that is retryable by construction, so a live worker's job was requeued
+underneath it and ComfyUI was handed one workflow twice. Scenario A parks a
+live agent past `HEARTBEAT_TTL` in the ComfyUI connect and asserts its
+heartbeat is still armed there, that `comfy:queue` received no write at all,
+and that the stub was handed the workflow exactly once. Scenario B forces the
+race the keepalive cannot close — it deletes the live agent's heartbeat key out
+from under it until the reaper genuinely requeues the job — and asserts the
+original attempt notices it no longer owns the job and abandons rather than
+submitting beside the retry. Every count comes from an observer armed before
+the event (`QueueWriteWatcher`, the stub's own arrival log, the job's whole
+event stream via `XRANGE`) and is read only after the system has gone idle: on
+a broken implementation the second run starts *after* the terminal event a
+browser stops at, so counting at the terminal event reads 1 either way.
+
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
 must not resolve.
 

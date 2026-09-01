@@ -242,6 +242,45 @@ RETRYABLE_PHASES = frozenset({PHASE_QUEUED, PHASE_DISPATCHED})
 PHASE_FIELD = "phase"
 ATTEMPT_COUNT_FIELD = "attempt_count"
 
+# Which incarnation currently OWNS this job, on that same state hash. The
+# fence that makes a requeue safe against a worker that is still alive
+# (worker_agent.py, point 10).
+#
+# The phase breadcrumb answers "how far did it get"; this answers the question
+# underneath it, which the reaper cannot otherwise ask: is the process that
+# got it that far still entitled to finish it? A heartbeat that lapses without
+# a death is not a hypothetical — the reaper's liveness test is the existence
+# of one key, so any pause longer than HEARTBEAT_TTL reads as a death, and a
+# worker declared dead in the middle of its own prologue is at a retryable
+# phase by construction. Without this field the requeue and the original
+# attempt both run to completion: ComfyUI is handed one workflow twice, two
+# terminal events land on one stream (the browser closed at the first), and
+# two accruals bill one job_id.
+#
+# A worker writes its INCARNATION here when it claims a job, and re-reads it
+# before the two acts that are irreversible from anyone else's point of view —
+# the submit, and the terminal write. The reaper stamps REAPED_OWNER over it
+# before it decides anything, so "somebody took this off me" is a value the
+# original attempt can see rather than something it has to infer.
+#
+# Shared vocabulary, in this block, for the same reason the phases are: the
+# gateway writes the sentinel and the worker compares against it, they ship in
+# two different images, and a rolling deploy always has one vintage of each
+# running at once. Two files disagreeing about this string would silently make
+# every fence a no-op with nothing failing anywhere to say so.
+#
+# Absence is deliberately NOT a fence. A job whose state hash was written by a
+# pre-F4 worker, or whose hash expired and was recreated by an HSET, has no
+# owner at all — and a missing field must not be able to suppress a real
+# terminal event, which is the one failure mode worse than the replay this
+# closes. Unowned means proceed; only a DIFFERENT owner means abandon.
+OWNER_FIELD = "owner"
+
+# What the reaper stamps on a job it has taken off a worker. Not a valid
+# incarnation — INCARNATION_SEP cannot appear in a pod name, so no worker can
+# ever be called this — so it can never accidentally match a live claim.
+REAPED_OWNER = "#reaped"
+
 
 def envelope_text(value) -> str:
     """A reserved string field: always a str, always bounded, never None."""
@@ -1369,6 +1408,32 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
         # nowhere to report it. Anything else is failed below rather than
         # dropped.
         return
+
+    # FENCE FIRST, before anything is read and before anything is decided.
+    #
+    # This entry is on a processing list whose worker's heartbeat has lapsed,
+    # and a lapse is not a death: the only liveness test here is whether one
+    # key exists, so a worker paused longer than HEARTBEAT_TTL — an unbounded
+    # mkdir on the shared volume, a Redis blip across the whole TTL — is
+    # indistinguishable from an OOM kill. Whatever this function goes on to do
+    # with the job, the worker that was running it must be able to find out
+    # that it happened, or a requeue hands one workflow to two GPUs and a fail
+    # is overwritten by a terminal event from a worker that no longer owns the
+    # job. worker_agent.py's still_ours() is the other half; see OWNER_FIELD.
+    #
+    # Before the read rather than after it, because the ordering that matters
+    # is with respect to the WORKER, not to this function: a worker that reads
+    # its ownership after this line abandons, which is always safe (the job is
+    # about to reach a terminal state or be requeued either way), while one
+    # that reads it before this line submits and is then racing exactly as it
+    # did before the fence existed. Erring towards fencing early costs nothing
+    # — the entry is already off the list.
+    #
+    # arm_state_ttl, because HSET recreates a state hash that expired
+    # mid-flight and a recreated key has no TTL at all: an immortal one-field
+    # hash per reaped job, in a Redis that is deliberately noeviction.
+    await conn.hset(state_key(job_id), OWNER_FIELD, REAPED_OWNER)
+    await arm_state_ttl(conn, job_id)
 
     # Both facts in one round trip, and both read before anything is decided:
     # how far the job got, and whether its owner still wants it.
