@@ -1,5 +1,7 @@
 # ComfyUI on OpenShift
 
+**One GPU pool, a whole team — not a card per person.**
+
 [![ci](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml/badge.svg)](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml)
 
 A ComfyUI (PyTorch) inference backend on GPU nodes, built for **ROSA** — Red
@@ -109,6 +111,49 @@ assumption is stated because it drives the number.
 That is not a discount, it is a structural consequence of separating the thing
 users touch from the thing that costs money. The ratio moves with your
 utilization; the direction does not.
+
+### Sizing the pool, five to thirty people
+
+Aggregate GPU-hours answer "what does a month cost." They do not answer "how
+many workers does the pool need running at once" — and that second number is
+what decides whether the tenth person to hit Queue Prompt waits behind the
+other nine, or gets a warm worker immediately.
+
+The shape of the traffic is what makes this answerable: a render is two to
+three minutes, the setup between renders is longer, and — critically — the
+gaps do not line up across people. Treating each active user as needing a GPU
+for roughly **26% of the time they are actively iterating** (a 2.5-minute
+render against a 7-minute setup gap — tune both for your team), the number of
+*concurrent* workers a pool needs grows far slower than headcount does:
+
+| Team | Concurrent workers | Pool, warm during active hours | A dedicated pod each, same hours | Savings |
+|---:|---:|---:|---:|---:|
+| 5 | 3 | $3.99/hr | $5.94/hr | 33% |
+| 10 | 5 | $5.94/hr | $10.82/hr | 45% |
+| 15 | 6 | $6.92/hr | $15.70/hr | 56% |
+| 20 | 8 | $8.87/hr | $20.58/hr | 57% |
+| 25 | 9 | $9.84/hr | $25.46/hr | 61% |
+| 30 | 10 | $10.82/hr | $30.34/hr | 64% |
+
+Both columns already include the $1.06/hour cluster floor and the $0.976/hour
+all-in rate per `g6.xlarge` worker from above; "concurrent workers" is sized so
+the average queueing wait stays under ~30 seconds — imperceptible against a
+render that takes minutes anyway. Savings widen with team size because pooled
+capacity is a queueing problem, not a division problem: doubling the team does
+not double the overlap.
+
+**The catch is the one from "Where this loses" below, and it is not optional:**
+this only holds if the pool is kept **warm at the "concurrent workers" count
+during active hours** — a scheduled floor (`minReplicas` raised at 9am, dropped
+at 6pm), not KEDA's default scale-to-zero. Interactive iteration is exactly the
+pattern `docs/06-enterprise-architecture.md` names as the wrong fit for
+scale-to-zero: the 8–17 minute cold start lands mid-loop. Scale-to-zero still
+earns its keep outside active hours and for any burst above the floor; it is
+the floor itself that has to stay warm.
+
+Two caveats before trusting a row: the table assumes worst-case full overlap
+of everyone's active window, so staggered usage needs fewer workers than
+shown, and it excludes EFS, which is small and flat regardless of team size.
 
 ## The numbers, briefly
 
@@ -738,6 +783,34 @@ because it was already there.
 With those, this design reaches several hundred designers and low hundreds of
 GPUs without a rewrite; the shape stays the same. Past that it is multi-cluster
 with a federated queue, and the hard problems stop being technical.
+
+### What AWS actually offers here
+
+Every number above uses `g6.xlarge` because that is this repo's default, not
+because it is the only option. AWS's accelerated-compute catalog that ROSA
+schedules onto, and where each one fits:
+
+| Family | GPU | VRAM | ~$/hr (on-demand) | Fits |
+|---|---|---:|---:|---|
+| G4dn | NVIDIA T4 | 16 GB | ~0.526 | Cheapest; SD1.5-class workflows |
+| G5 | NVIDIA A10G | 24 GB | ~1.01 | SDXL-class, general default before G6 |
+| G6 | NVIDIA L4 | 24 GB | ~0.80 | This repo's default — same VRAM as G5, lower cost |
+| G6e | NVIDIA L40S | 48 GB | ~1.86 | Larger checkpoints, longer video jobs |
+| P4d | NVIDIA A100 | 40 GB ×8 | ~22–33 (24xlarge, 8 GPUs, varies by region) | Training-scale; the smallest unit is eight cards |
+| P5 | NVIDIA H100 | 80 GB ×8 | ~55+ (48xlarge, 8 GPUs) | Same eight-card floor, newer silicon |
+
+Two families that exist on AWS but do not belong in this table: **AMD**
+(`G4ad`, Radeon Pro V520) has no ROCm math-library support for its `gfx1011`
+die — an unresolved upstream gap since the instance launched — so it never
+gets past `rocBLAS` regardless of how the GPU Operator side is wired. **AWS
+Trainium/Inferentia** (Neuron SDK) require ahead-of-time graph compilation,
+which is fundamentally at odds with ComfyUI's dynamic node graph. Neither is a
+"not yet" — they're a different chip's programming model, not a configuration
+gap in this repo.
+
+On-demand GPU pricing moves in both directions and varies by region; treat the
+table as a way to compare families against each other, not as this week's
+invoice. `make status` reports what your actual machine pools cost right now.
 
 ### One thing to know about the big cards
 
