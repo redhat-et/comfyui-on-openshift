@@ -58,6 +58,7 @@ OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
 failures = []
 
 
+
 def check(name, cond, detail=""):
     print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
     if not cond:
@@ -100,10 +101,15 @@ def submit_and_wait(user, timeout=15):
     return resp["job_id"], drain(resp["job_id"], timeout=timeout)
 
 
-def set_next_output(filename, subfolder=""):
+def set_next_output(filename, subfolder="", type="output", images=None):
+    """What the stub's /history manifest reports for the NEXT job. One entry
+    by default; `images` (a list of {filename, subfolder, type}) when the
+    scenario needs a manifest with more than one entry in it."""
+    body = {"images": images} if images is not None else {
+        "filename": filename, "subfolder": subfolder, "type": type}
     req = urllib.request.Request(
         COMFY + "/__set_next_output__",
-        data=json.dumps({"filename": filename, "subfolder": subfolder}).encode(),
+        data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
     )
     urllib.request.urlopen(req, timeout=10).read()
@@ -215,6 +221,32 @@ check("a filename containing '/' is refused just like one containing '..' "
       "-- subfolder is the only field a save node uses to nest, so a slash "
       "inside filename itself is never legitimate",
       images == [], images)
+
+# ---------------------------------------------------------------------------
+# (e) a preview (type "temp") beside a real output is not reported as one
+# ---------------------------------------------------------------------------
+print("\n== (e) a 'temp' preview in the manifest is dropped; the 'output' beside it is served")
+
+# ComfyUI's PreviewImage node reports its files in the same manifest shape as
+# SaveImage, with type "temp" instead of "output" -- and writes them under
+# --temp-directory, which is /tmp in the pod and not the shared volume at all.
+# A URL built for one of those is a 404 by construction, and worse than a 404:
+# it is one that resolves into the shared volume at a path a later SaveImage
+# on another worker could legitimately fill.
+seed_output()
+set_next_output(None, images=[
+    {"filename": "ComfyUI_temp_abcde_00001_.png", "subfolder": "", "type": "temp"},
+    {"filename": "out_0001.png", "subfolder": "", "type": "output"},
+])
+job_id, terminal = submit_and_wait("petra")
+check("the job completes", terminal and terminal["type"] == "completed", terminal)
+images = (terminal or {}).get("data", {}).get("images", [])
+check("exactly one image is reported -- the durable output, not the preview "
+      "that ComfyUI wrote to its temp directory and will never serve",
+      len(images) == 1 and images[0]["filename"] == "out_0001.png"
+      and images[0].get("type") == "output", images)
+check("and that one is a real, confined, servable URL",
+      workspace_ok(images[0]["url"]) if images else False, images)
 
 print()
 if failures:

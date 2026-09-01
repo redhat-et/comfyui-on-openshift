@@ -968,6 +968,11 @@ WORKSPACE_DIR_MODE = 0o2775
 # What ComfyUI's own SaveImage defaults to when a workflow leaves it empty.
 DEFAULT_FILENAME_PREFIX = "ComfyUI"
 
+# The manifest `type` of a file written under --output-directory. The other
+# value ComfyUI emits is "temp" (PreviewImage and friends, written under
+# --temp-directory), which never reaches the shared volume at all.
+DURABLE_OUTPUT_TYPE = "output"
+
 # The one input ComfyUI treats as a path relative to --output-directory. Save
 # nodes spell it this way (SaveImage, SaveAnimatedPNG/WEBP and the video nodes
 # that copy them), which is what makes rewriting it the whole per-job scoping
@@ -1632,6 +1637,18 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
 
     for node_output in (entry.get("outputs") or {}).values():
         for image in node_output.get("images", []):
+            # Only what was written to the shared volume. ComfyUI's manifest
+            # carries every file a node reported, and a PreviewImage node
+            # reports its files exactly like SaveImage does except for
+            # `type`: "temp" instead of "output", written under
+            # --temp-directory (/tmp in the pod, start.sh) rather than under
+            # --output-directory. A URL built for one of those is a 404 by
+            # construction, and not a harmless one: it resolves into the
+            # shared volume at a path a later save on another worker could
+            # legitimately fill with somebody else's image.
+            if image.get("type") != DURABLE_OUTPUT_TYPE:
+                continue
+
             raw_filename = image.get("filename")
             subfolder, filename = output_subfolder(workspace, image.get("subfolder") or "", raw_filename)
 

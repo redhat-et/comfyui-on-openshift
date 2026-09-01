@@ -148,17 +148,32 @@ async def stall_next_ws(body: dict):
 # stub can produce a hostile filename — the default is a hardcoded literal —
 # so a check proving that gap is closed has to be able to ask this stub to
 # report one instead.
+#
+# The body is either one entry ({filename, subfolder, type}) or a whole
+# manifest ({"images": [...]}), because two of the things a check needs to
+# prove need more than one entry: that a `temp` preview beside a real output
+# is dropped while the output is still served, and that stripping is per
+# entry rather than per job. `type` defaults to "output", which is what every
+# entry ComfyUI's own save nodes report; a preview node reports "temp".
 next_output_override = None
+
+
+def _override_entry(body: dict) -> dict:
+    return {
+        "filename": body.get("filename", "out_0001.png"),
+        "subfolder": body.get("subfolder", ""),
+        "type": body.get("type", "output"),
+    }
 
 
 @app.post("/__set_next_output__")
 async def set_next_output(body: dict):
     global next_output_override
-    next_output_override = {
-        "filename": body.get("filename", "out_0001.png"),
-        "subfolder": body.get("subfolder", ""),
-    }
-    return next_output_override
+    entries = body.get("images")
+    if not isinstance(entries, list):
+        entries = [body]
+    next_output_override = [_override_entry(entry) for entry in entries]
+    return {"images": next_output_override}
 
 
 @app.get("/system_stats")
@@ -270,14 +285,11 @@ async def run(client_id, pid, slow=False, vram_oom=False, die=False,
                 dying_ws[id(ws)] = 1006
             return
 
-    filename, subfolder = "out_0001.png", ""
+    images = [{"filename": "out_0001.png", "subfolder": "", "type": "output"}]
     if next_output_override is not None:
-        filename = next_output_override.get("filename", filename)
-        subfolder = next_output_override.get("subfolder", subfolder)
-        next_output_override = None
+        images, next_output_override = next_output_override, None
 
-    history[pid] = {"outputs": {"9": {"images": [
-        {"filename": filename, "subfolder": subfolder, "type": "output"}]}}}
+    history[pid] = {"outputs": {"9": {"images": images}}}
 
     # A foreign terminal event first: the naive agent ends the job here.
     await send(ws, {"type": "executing", "data": {"node": None, "prompt_id": "other-prompt"}})
