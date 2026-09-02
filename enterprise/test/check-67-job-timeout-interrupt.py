@@ -44,17 +44,18 @@ assertion about the next job could fail. Every stub prompt this check
 starts is released in the `finally` below, because a never-ending prompt
 left behind would hold ComfyUI's slot for every later check in the suite.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, uuid
-import redis
+import os, signal, sys, time, uuid
 
+from harness import (
+    COMFY, GW, alive, check, connect_redis, drain, failures, handoffs,
+    start_agent as _start_agent, stop_agent as _stop_agent, wait_gone,
+)
 from worker_ids import heartbeat_keys
 
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
+get, post = GW.get, GW.post
+
 WORKER_AGENT = os.environ["WORKER_AGENT"]
 RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "60"))
 
@@ -63,116 +64,33 @@ RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "60"))
 # is observed inside this check rather than inside CHECK_TIMEOUT.
 JOB_TIMEOUT = 6
 DRAIN_TIMEOUT = 8
-TERMINAL_TYPES = {"completed", "failed", "cancelled"}
 
-failures = []
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body=None, base=GW):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(base + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path, base=GW):
-    return json.loads(urllib.request.urlopen(base + path, timeout=10).read())
+r = connect_redis()
 
 
 def interrupts():
-    return get("/__interrupts__", base=COMFY)["count"]
+    return COMFY.get("/__interrupts__")["count"]
 
 
 def comfy_queue():
-    q = get("/queue", base=COMFY)
+    q = COMFY.get("/queue")
     return q.get("queue_running", []), q.get("queue_pending", [])
-
-
-def handoffs(probe):
-    return get("/__received__", base=COMFY)["nodes"].count(probe)
-
-
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    state = subprocess.run(["ps", "-p", str(pid), "-o", "state="],
-                           capture_output=True, text=True).stdout.strip()
-    return not state.startswith("Z")
-
-
-def wait_gone(pid, timeout=30):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not alive(pid):
-            return True
-        time.sleep(0.1)
-    return False
-
-
-def drain(job_id, timeout=60):
-    """Tail the gateway WebSocket to the first terminal event, with an
-    absolute deadline the gateway's pings cannot extend (see check-30)."""
-    import websocket
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    deadline = time.time() + timeout
-    seen, terminal = [], None
-    while time.time() < deadline:
-        ws.settimeout(max(1.0, deadline - time.time()))
-        try:
-            m = json.loads(ws.recv())
-        except Exception:  # noqa: BLE001
-            break
-        if m.get("type") == "ping":
-            continue
-        seen.append(m["type"])
-        if m["type"] in TERMINAL_TYPES:
-            terminal = m
-            break
-    ws.close()
-    return seen, terminal
 
 
 def start_agent(hostname, env_extra, timeout=30):
     """A worker agent of this check's own, under a fixed HOSTNAME so its
     keys are findable (worker_ids.py), logging to agent-<hostname>.log so
     run.sh's failure-path `cat agent*.log` shows it."""
-    env = dict(os.environ)
-    env["HOSTNAME"] = hostname
-    env.update(env_extra)
-    log = open(f"agent-{hostname}.log", "w")
-    proc = subprocess.Popen([sys.executable, WORKER_AGENT], env=env,
-                            stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if heartbeat_keys(r, hostname) or proc.poll() is not None:
-            break
-        time.sleep(0.2)
-    return proc
+    return _start_agent(hostname, env_extra, timeout=timeout, r=r)
 
 
 def stop_agent(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=15)
-    except Exception:  # noqa: BLE001
-        proc.kill()
+    _stop_agent(proc, timeout=15)
 
 
 def release_stub():
     try:
-        post("/__release__", base=COMFY)
+        COMFY.post("/__release__")
     except Exception:  # noqa: BLE001
         pass
 

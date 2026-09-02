@@ -31,7 +31,9 @@ touch lives there, so the same call covers both. Nothing here runs the
 probe command itself: that lives in the manifest, and this suite reads no
 manifest.
 """
-import json, os, sys, time, urllib.request
+import os, sys, time
+
+from harness import GW, check, failures
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -41,14 +43,6 @@ HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
 REFRESH_S = max(1.0, HEARTBEAT_TTL / 3.0)
 WAIT_S = 2 * REFRESH_S + 1
 LIVENESS_FILE = os.environ.get("AGENT_LIVENESS_FILE", "/tmp/comfy-agent-alive")
-
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
 
 
 def mtime():
@@ -76,18 +70,7 @@ check(f"its mtime advanced over {WAIT_S:.1f}s of idling -- the agent's own loop 
 
 print("\n== and while a job is RUNNING, not only between jobs")
 
-GW = "http://127.0.0.1:8100"
-
-
-def post(path, body):
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
-
+get, post = GW.get, GW.post
 
 # A slow job: the stub emits progress every two seconds for about six, which
 # is longer than one refresh interval here and far longer than the loop's
