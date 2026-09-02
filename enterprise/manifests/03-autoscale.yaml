@@ -111,3 +111,42 @@ spec:
         databaseIndex: "0"
       authenticationRef:
         name: comfy-redis-auth
+
+    # BEGIN WARM FLOOR
+    # The scheduled warm floor — docs/10-roadmap.md's I1, and the setting the
+    # README's 5-30 person sizing table assumed existed.
+    #
+    # KEDA evaluates every trigger and takes the MAXIMUM, so this coexists with
+    # the queue trigger above rather than replacing it: inside the window the
+    # pool never drops below desiredReplicas, outside it the queue is the only
+    # thing that decides, and a busy afternoon still scales past the floor to
+    # maxReplicaCount. Nothing here changes what happens at 19:00 — the queue
+    # trigger's cooldownPeriod drains the pool as it always did.
+    #
+    # WHY THIS AND NOT A CRON JOB. The obvious implementation of "warm during
+    # working hours" is something that edits the machine pool's min-replicas on
+    # a schedule, and that is I3's mechanism and the reason I1 and I3 were
+    # recorded as contradicting each other: any `./enterprise/setup.sh` re-run
+    # puts min-replicas back and silently un-warms the pool, at a moment
+    # nobody connects to the change they were actually deploying. Expressed as
+    # a trigger, the floor is declarative and lives in .env — so re-running
+    # setup.sh reasserts it instead of resetting it, which is the whole of the
+    # I1/I3 conflict resolved by choosing where the state lives.
+    #
+    # Every value here is substituted by enterprise/setup.sh from .env, by KEY
+    # rather than by matching the default beside it, for the same reason
+    # maxReplicaCount is. desiredReplicas: "0" is the off position, and
+    # setup.sh removes this whole trigger rather than sending a zero — KEDA's
+    # cron scaler wants a positive number, and a floor of nobody is better
+    # expressed by not having a floor.
+    - type: cron
+      metadata:
+        # An IANA zone name, or UTC. It is the operator's working day this is
+        # describing, so it is the one setting here that is usually wrong on
+        # the default: a floor that warms at 09:00 UTC is a floor that warms at
+        # 04:00 for a team in New York.
+        timezone: UTC
+        start: "0 9 * * 1-5"
+        end: "0 18 * * 1-5"
+        desiredReplicas: "0"
+    # END WARM FLOOR

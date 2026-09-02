@@ -470,6 +470,14 @@ expect_true "lint fails a Deployment in the multi-user namespace that no Network
     lint_fails_on_manifest_fixture "$LINT_FIXTURES/deployment-no-network-policy.yaml" \
     "is not selected by any NetworkPolicy"
 
+# I1's warm floor. The failure is not that KEDA rejects this — it accepts it
+# happily, clamps to maxReplicaCount, and the floor simply never arrives, with
+# no error anywhere and a person waiting out a cold start at nine in the
+# morning that the setting existed to have already paid for.
+expect_true "lint fails a ScaledObject whose warm floor asks for more workers than maxReplicaCount allows" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/warm-floor-above-max-replicas.yaml" \
+    "warm floor that never arrives"
+
 cleanup_manifest_fixture_drops
 trap - EXIT
 

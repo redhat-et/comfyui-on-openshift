@@ -32,14 +32,39 @@ Everything comes from the repo's `.env`. The variables this configuration adds:
 | `STORAGE_MODE` | — | **must be `rwx`**; setup refuses otherwise, see below |
 | `AUTH_MODE` | `oauth` | `oauth` = cluster SSO. `none` = public, no login |
 | `MAX_GPU_WORKERS` | `3` | ceiling for both the pod and node autoscalers |
-| `SCALE_TO_ZERO` | `true` | `false` pins one warm worker — see the cold-start note |
+| `SCALE_TO_ZERO` | `true` | `false` pins one warm worker all the time — and skips KEDA, the ScaledObject and machine-pool autoscaling with it |
+| `WARM_WORKERS` | `0` (off) | hold this many workers during working hours; see below |
+| `WARM_START` / `WARM_END` | `0 9 * * 1-5` / `0 18 * * 1-5` | the window, as cron expressions |
+| `WARM_TIMEZONE` | `UTC` | IANA zone the window is read in |
 | `ENABLE_MANAGER` | `false` | bake in ComfyUI-Manager; read the security note first |
-| `COMFYUI_REF` | `v0.32.0` | the ComfyUI tag to build |
+| `COMFYUI_REF` | a commit SHA | the ComfyUI revision to build; the default is the commit `v0.32.0` points at, and a tag or branch works too |
 | `QUOTA_GPU_SECONDS` | `0` (off) | per-user GPU-second quota per UTC month; over it, `/api/generate` refuses with 429 and says when it resets. Reads the same accounting `/api/showback` reports, and fails open |
 
 Changing `AUTH_MODE` is also just an edit-and-re-run: switching oauth → none,
 `setup.sh` detects the leftover oauth-proxy sidecar and recreates the gateway
 without it.
+
+### The scheduled warm floor
+
+`SCALE_TO_ZERO` is all or nothing: either the first job of the day waits 8-17
+minutes for a node, or a card bills around the clock. `WARM_WORKERS` is the
+setting in between — hold N workers between `WARM_START` and `WARM_END`, scale
+to zero outside them.
+
+It is a KEDA `cron` trigger beside the queue trigger, not a schedule that edits
+the machine pool. KEDA takes the maximum across triggers, so the queue still
+decides everything outside the window and a busy afternoon still scales past
+the floor to `MAX_GPU_WORKERS`. More to the point, the floor lives in `.env`:
+re-running `setup.sh` reasserts it instead of resetting it, which is what a
+cron job editing `min-replicas` could not do (`docs/10-roadmap.md`, I1 and I3).
+
+Off by default, because it is the setting here that spends money while nobody
+is watching. One `g6.xlarge` held 09:00-18:00 on weekdays is ~195 hours a month
+at ~$0.80, about $155, on top of whatever the queue itself provokes. Set
+`WARM_TIMEZONE` before `WARM_WORKERS`: the default window is a UTC working day.
+
+It needs `SCALE_TO_ZERO=true`. The `false` path skips KEDA entirely, so there
+is no ScaledObject for the trigger to live in; `setup.sh` warns if you set both.
 
 ### Two Redis users, not one
 

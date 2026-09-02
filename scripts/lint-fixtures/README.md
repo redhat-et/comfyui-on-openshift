@@ -18,6 +18,7 @@ without ever touching the manifests that actually ship.
 | `manifests/worker-no-gpu-toleration.yaml` | GPU worker Deployment with no `nvidia.com/gpu` toleration |
 | `manifests/route-missing-timeout-tunnel.yaml` | Route with `timeout` but no `timeout-tunnel` |
 | `manifests/gateway-svc-exposes-container-port.yaml` | Gateway Service listing the gateway's own container port (8000) alongside the proxy port |
+| `manifests/warm-floor-above-max-replicas.yaml` | `ScaledObject` whose `cron` warm-floor trigger asks for more workers than `maxReplicaCount` — KEDA clamps and the floor silently never arrives (I1, `docs/10-roadmap.md`) |
 | `manifests/deployment-no-network-policy.yaml` | A Deployment in the multi-user namespace that no `NetworkPolicy` `podSelector` names — cut off by the namespace default-deny, with a Ready pod and no event saying so |
 | `manifests/worker-holds-admin-redis-password.yaml` | Worker Deployment taking `comfy-redis/password` — the admin Redis credential — instead of the least-privilege ACL user's `worker_password` (W4) |
 | `manifests/worker-redis-url-has-no-user.yaml` | Worker Deployment whose `REDIS_URL` names no user, so `redis.from_url()` authenticates as `default` and the ACL user is bypassed with nothing failing (W4, the silent half) |

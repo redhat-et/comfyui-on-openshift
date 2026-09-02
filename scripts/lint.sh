@@ -408,6 +408,37 @@ for f, doc in docs:
                    f"terminationGracePeriodSeconds={grace} — a job may legally "
                    "run past the drain window and be SIGKILLed mid-render")
 
+    # The scheduled warm floor may not ask for more workers than the pool is
+    # allowed to have (docs/10-roadmap.md, I1). KEDA takes the maximum across
+    # triggers and then clamps to maxReplicaCount, so a cron trigger above the
+    # ceiling is not an error anywhere — it is a floor that silently never
+    # arrives, on the one setting in this configuration whose entire purpose is
+    # that somebody does not wait 8-17 minutes at nine in the morning.
+    #
+    # enterprise/setup.sh raises the ceiling to meet WARM_WORKERS when it
+    # renders this file, and says so; the rule is here for the hand-edited case
+    # and for the day that substitution is changed.
+    if kind == 'ScaledObject':
+        for trigger in (dig(doc, 'spec', 'triggers') or []):
+            if not isinstance(trigger, dict) or trigger.get('type') != 'cron':
+                continue
+
+            try:
+                desired = int(str(dig(trigger, 'metadata', 'desiredReplicas')))
+                ceiling = int(str(dig(doc, 'spec', 'maxReplicaCount')))
+            except (TypeError, ValueError):
+                # A placeholder rather than a number: setup.sh substitutes both
+                # of these at apply time, and an unsubstituted file is not a
+                # violation of anything.
+                continue
+
+            if desired > ceiling:
+                bad(f, f"ScaledObject/{name}'s cron trigger asks for "
+                       f"{desired} workers but maxReplicaCount is {ceiling}. "
+                       "KEDA clamps to the ceiling, so this is a warm floor "
+                       "that never arrives and reports no error while not "
+                       "arriving")
+
     # Both Route annotations or neither works. On edge and reencrypt routes
     # only timeout-tunnel governs the upgraded WebSocket, against a one-hour
     # router default; plain timeout alone still drops long generations, and
