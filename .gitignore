@@ -22,3 +22,9 @@ checkpoints/
 *.swp
 __pycache__/
 *.pyc
+
+# A redis-server started in the repo root (a test run, a local experiment)
+# writes its snapshot here; it is never a source file.
+dump.rdb
+*.rdb
+appendonly.aof
