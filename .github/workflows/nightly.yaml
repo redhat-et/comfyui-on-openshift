@@ -55,6 +55,13 @@ jobs:
       - name: build the single-user GPU image
         run: docker build -t gpu-single-user-uid-test -f app/Containerfile app/
 
+      - name: where do the flagged Python packages live (diagnostic)
+        run: |
+          # Trivy's grouped table no longer prints the path of a python-pkg
+          # finding; this lists every copy of the two it keeps flagging.
+          docker run --rm --entrypoint sh gpu-single-user-uid-test -c \
+            "find / -xdev \( -name 'msgpack*' -o -name 'setuptools*' \) -maxdepth 8 2>/dev/null | grep -v '^/proc' | sort"
+
       - name: serve as an arbitrary UID, CPU-forced
         run: |
           # No -v /tmp/models:/models -v /tmp/output:/output (this job used
@@ -150,6 +157,13 @@ jobs:
           docker build -t gpu-worker-uid-test \
             --build-arg ENABLE_MANAGER=false \
             -f enterprise/worker/Containerfile enterprise/worker
+
+      - name: where do the flagged Python packages live (diagnostic)
+        run: |
+          # Trivy's grouped table no longer prints the path of a python-pkg
+          # finding; this lists every copy of the two it keeps flagging.
+          docker run --rm --entrypoint sh gpu-worker-uid-test -c \
+            "find / -xdev \( -name 'msgpack*' -o -name 'setuptools*' \) -maxdepth 8 2>/dev/null | grep -v '^/proc' | sort"
 
       - name: serve as an arbitrary UID, CPU-forced, agent disabled
         run: |
