@@ -264,6 +264,46 @@ WORKER_KEY = f"comfy:worker:{WORKER_INCARNATION}"
 PROCESSING_KEY = f"comfy:processing:{WORKER_INCARNATION}"
 # END WORKER IDENTITY
 
+# How long one BLMOVE parks before returning None so the loop can notice
+# the SIGTERM flag. Named because REDIS_SOCKET_TIMEOUT below is defined
+# relative to it and the two must never be edited apart.
+QUEUE_POLL_TIMEOUT = 5
+
+# Socket timeouts on the Redis connection, set EXPLICITLY rather than left
+# to the library's default — because that default changed underneath this
+# file once. redis-py < 7 defaults socket_timeout to None (block forever);
+# redis-py 8 defaults it to 5 seconds, which is exactly QUEUE_POLL_TIMEOUT
+# and turns every idle BLMOVE into a raised TimeoutError. The requirements
+# file pins < 7 for that reason; this makes the pin a belt and not the
+# only thing holding the trousers up.
+#
+# But "block forever" is the other wrong answer. A Redis whose TCP path is
+# blackholed rather than refused (a NetworkPolicy change, a node's conntrack
+# table, a Redis pod replaced with its Service still pointing at the old
+# IP) leaves a BLMOVE with no timeout parked until the kernel gives up on
+# the connection, which is measured in minutes to hours — and the heartbeat
+# thread's SET parks the same way. The worker is Running, ComfyUI answers
+# the liveness probe, and nothing consumes the queue. So: a bound, larger
+# than the longest reply this agent legitimately waits for (the BLMOVE's
+# own QUEUE_POLL_TIMEOUT) by a margin wide enough that a loaded Redis is
+# never mistaken for a dead one. A TimeoutError out of the poll loop is not
+# caught: it ends the process, start.sh ends the container, and the kubelet
+# restarts it against whatever Redis is reachable then.
+REDIS_SOCKET_TIMEOUT = int(os.environ.get("REDIS_SOCKET_TIMEOUT", str(QUEUE_POLL_TIMEOUT + 25)))
+REDIS_CONNECT_TIMEOUT = int(os.environ.get("REDIS_CONNECT_TIMEOUT", "10"))
+
+# A file this process touches once per poll-loop pass and once per heartbeat
+# refresh, so an exec liveness probe can tell a polling agent from a wedged
+# one without reaching Redis: `stat -c %Y` age under 120 s — twice the
+# production HEARTBEAT_REFRESH (HEARTBEAT_TTL / 3 = 60 s), so one late
+# refresh is not a restart and two consecutive ones are. The pod's existing
+# probe asks ComfyUI's HTTP server, which answers happily while the agent
+# beside it is parked in a socket call. Touched BEFORE the Redis call in
+# heartbeat(), not after: a Redis outage is not the agent's fault and
+# restarting the pod would not fix it; a socket call that never returns is
+# what this exists to catch, and the next touch simply does not happen.
+AGENT_LIVENESS_FILE = os.environ.get("AGENT_LIVENESS_FILE", "/tmp/comfy-agent-alive")
+
 
 # ---------------------------------------------------------------------------
 # BEGIN SHARED ENVELOPE — the queue payload contract (docs/10-roadmap.md, F2)
@@ -1344,14 +1384,32 @@ def connect_redis() -> redis.Redis:
         password=REDIS_PASSWORD,
         decode_responses=True,
         health_check_interval=30,
+        socket_timeout=REDIS_SOCKET_TIMEOUT,          # see REDIS_SOCKET_TIMEOUT
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
     )
     conn.ping()
 
     return conn
 
 
+def touch_liveness() -> None:
+    """Freshen AGENT_LIVENESS_FILE's mtime. Never raises: a probe file that
+    cannot be written is a probe that fails, which is the right direction,
+    and not a reason to fail a job."""
+    try:
+        with open(AGENT_LIVENESS_FILE, "a"):
+            pass
+
+        os.utime(AGENT_LIVENESS_FILE, None)
+
+    except OSError:
+        pass
+
+
 def heartbeat(conn: redis.Redis) -> None:
     """Tell the gateway this worker is alive. Expiry does the deregistering."""
+    touch_liveness()
+
     try:
         conn.set(WORKER_KEY, str(int(time.time())), ex=HEARTBEAT_TTL)
     except redis.RedisError:
@@ -2108,7 +2166,8 @@ def main() -> int:
             #
             # Short timeout rather than blocking forever, so the SIGTERM flag
             # is noticed promptly instead of at the end of the grace period.
-            raw = conn.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=5, src="RIGHT", dest="LEFT")
+            raw = conn.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=QUEUE_POLL_TIMEOUT,
+                              src="RIGHT", dest="LEFT")
 
             if raw is None:
                 continue
