@@ -111,16 +111,3 @@ spec:
         databaseIndex: "0"
       authenticationRef:
         name: comfy-redis-auth
----
-# Keep at least one gateway serving during voluntary disruptions (node drains,
-# cluster upgrades). Without this, a drain can take both replicas at once and
-# every open WebSocket dies together.
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: comfy-gateway
-spec:
-  minAvailable: 1
-  selector:
-    matchLabels:
-      app: comfy-gateway

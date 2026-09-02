@@ -29,7 +29,7 @@ oc delete servicemonitor comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found 2>
 oc delete route comfy -n "$APP_NAMESPACE" --ignore-not-found
 oc delete deployment comfy-gateway comfy-worker -n "$APP_NAMESPACE" --ignore-not-found
 oc delete service comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
-oc delete pdb comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
+oc delete pdb comfy-gateway comfy-worker -n "$APP_NAMESPACE" --ignore-not-found
 oc delete sa comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
 oc delete bc,is comfy-gateway comfy-worker -n "$APP_NAMESPACE" --ignore-not-found
 
@@ -46,6 +46,7 @@ if [[ "$PURGE" == "true" ]]; then
     log "Purging Redis and secrets"
 
     oc delete deployment redis -n "$APP_NAMESPACE" --ignore-not-found
+    oc delete pdb redis -n "$APP_NAMESPACE" --ignore-not-found
     oc delete service redis -n "$APP_NAMESPACE" --ignore-not-found
     oc delete pvc redis-data -n "$APP_NAMESPACE" --ignore-not-found
     oc delete secret comfy-redis comfy-gateway-session comfy-gateway-tls \

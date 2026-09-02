@@ -18,8 +18,28 @@ spec:
   # manifests before the autoscaler exists does not start an $0.80/hour node.
   replicas: 0
 
+  # RollingUpdate with NO surge, which is the opposite of the usual default and
+  # is the only setting a GPU pool can hold.
+  #
+  # It was Recreate. On an autoscaled pool that means an image update deletes
+  # every worker, then waits for new ones — and a new one waits on a GPU node,
+  # a ~10 GB image pull, CUDA init and a model load, which is the 8-17 minutes
+  # this whole design is arranged around. Times the pool. Deploying a one-line
+  # change to worker_agent.py emptied the pool for most of half an hour, and
+  # the symptom is jobs queueing with no worker to take them.
+  #
+  # maxSurge MUST be 0. Surge means "start the replacement before stopping the
+  # old one", and a replacement worker needs a whole GPU: with N workers on N
+  # cards, a surge pod is Pending until the cluster autoscaler provisions
+  # another node — so a rollout that was meant to replace pods instead buys an
+  # extra $0.80/hour node per surge, waits ~10 minutes for it, and only then
+  # starts. maxUnavailable 1 with maxSurge 0 replaces them one at a time, in
+  # place, and the pool keeps serving from the rest.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
 
   selector:
     matchLabels:
@@ -247,3 +267,27 @@ spec:
             claimName: comfyui-output
         - name: scratch
           emptyDir: {}
+---
+# Keep the pool from being drained all at once.
+#
+# maxUnavailable: 1 rather than minAvailable: N, because N is not a number this
+# file knows — KEDA owns the replica count and it is legitimately 0 most of the
+# time. A minAvailable of anything above 0 against a pool that is deliberately
+# empty would block every node drain in the namespace forever; minAvailable: 0
+# would be a no-op with a comment.
+#
+# What this actually buys, and it is worth being precise because a PDB on an
+# autoscaled Deployment is easy to write and easy to overrate: a cluster
+# upgrade draining several GPU nodes at once takes them one at a time instead
+# of together, and a drain cannot land on a pool that is already down a worker.
+# Each eviction still costs whatever job that worker was running — the pod's
+# 1980-second grace period is what protects the job, not this.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: comfy-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: comfy-worker

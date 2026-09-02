@@ -44,6 +44,27 @@ spec:
                   - key: feature.node.kubernetes.io/pci-10de.present
                     operator: DoesNotExist
 
+        # Two replicas on one node are one replica with extra steps. The whole
+        # argument for replicas: 2 above is that a node going away — a drain,
+        # an upgrade, a spot reclaim — does not drop every open WebSocket at
+        # once, and the scheduler will happily co-locate them if nothing says
+        # otherwise.
+        #
+        # PREFERRED, not required. On a cluster with a single base node —
+        # BASE_REPLICAS is 2 in .env.example but a single-node OpenShift is a
+        # supported target here — a required rule leaves the second replica
+        # Pending forever, which trades an availability nicety for half a
+        # gateway. Preferred spreads them when there is somewhere to spread to
+        # and schedules anyway when there is not.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: comfy-gateway
+
       # No Kubernetes API client lives in this pod, so the projected
       # ServiceAccount token is nothing but a credential sitting in the
       # filesystem waiting to be read. Verified against the source rather than
@@ -106,8 +127,27 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+            # The gateway writes nothing to its own filesystem. It reads
+            # static/index.html, serves /output from a read-only mount, and
+            # keeps everything else in Redis; PYTHONDONTWRITEBYTECODE=1 in the
+            # image means not even a .pyc. So the image layer can be immutable,
+            # and a bug or a dependency that lets someone drop a file into the
+            # application directory has nowhere to put it.
+            #
+            # /tmp is an emptyDir below rather than left unwritable: it costs
+            # nothing, and "read-only root filesystem" failures in a Python
+            # process are usually a library reaching for a temp file, reported
+            # as a traceback nobody connects to this line.
+            #
+            # Not applied to the oauth-proxy sidecar in
+            # 05-oauth-proxy-patch.yaml — that is a different vendor's binary
+            # and a separate thing to prove.
+            readOnlyRootFilesystem: true
 
           volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
             # Read-only: the gateway serves finished images, it never writes.
             # This is the whole reason the enterprise configuration needs
             # ReadWriteMany storage — this pod and the worker pods are on
@@ -132,6 +172,8 @@ spec:
             periodSeconds: 10
 
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: output
           persistentVolumeClaim:
             claimName: comfyui-output
@@ -149,3 +191,24 @@ spec:
     - name: http
       port: 8000
       targetPort: http
+---
+# Keep at least one gateway serving during voluntary disruptions (node drains,
+# cluster upgrades). Without this, a drain can take both replicas at once and
+# every open WebSocket dies together — which the anti-affinity above makes less
+# likely and does not prevent, since a cluster upgrade drains every node
+# eventually.
+#
+# It lives here rather than in 03-autoscale.yaml, where it used to, because
+# 03 is applied only when SCALE_TO_ZERO=true. A gateway pair does not become
+# less worth protecting because the GPU pool is pinned at one worker, and the
+# budget quietly not existing in that configuration was the kind of gap nobody
+# notices until the upgrade.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: comfy-gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: comfy-gateway

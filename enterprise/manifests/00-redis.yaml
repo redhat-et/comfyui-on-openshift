@@ -233,3 +233,28 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: redis-data
+---
+# One replica, so this budget is deliberately the permissive one, and the
+# reason is worth writing down because the tempting value is wrong.
+#
+# maxUnavailable: 0 would make this pod unevictable: every node drain and every
+# cluster upgrade touching its node would hang forever waiting for a disruption
+# that policy has forbidden. That is not availability, it is an outage with a
+# longer fuse — and it would be protecting a single-replica Deployment on a
+# ReadWriteOnce volume, which cannot be made highly available by a PDB in any
+# case. AOF persistence on the PVC is what actually protects the queue across a
+# restart.
+#
+# maxUnavailable: 1 never blocks a routine drain. What it does do is stop a
+# SECOND voluntary disruption landing on a Redis that is already unhealthy —
+# with the pod not Ready the budget allows nothing — which is the case where
+# losing it costs the in-flight queue rather than four seconds.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: redis
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: redis
