@@ -1738,7 +1738,7 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             if data.get("prompt_id") not in (None, prompt_id):
                 continue
 
-            emit(conn, job_id, message)
+            emit(conn, job_id, forwardable(message))
 
             kind = message.get("type")
 
@@ -1761,6 +1761,43 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def forwardable(message: dict) -> dict:
+    """
+    The copy of a ComfyUI event that leaves this pod.
+
+    Everything is forwarded as-is except one field: an `executed` event's
+    data.output, which is the finished node's manifest in the same raw
+    {filename, subfolder, type} shape as /history — unconfined, and reported
+    BEFORE collect_outputs() has moved or refused anything. Stripped rather
+    than confined, for three reasons that add up to "nothing wants it":
+
+      - Nobody reads it. The browser renders the terminal event's `images`
+        (index.html); the per-node copy was only ever turned into
+        /outputs/ URLs by hub.py's rewrite_image_urls(), naming wherever
+        the node wrote — the shared root, or another submitter's workspace
+        — a URL that is wrong until the terminal collect runs and that
+        leaks the other directory's name either way.
+      - Confining here would mean running output_subfolder() — an
+        os.replace — per node, mid-execution, with the node's siblings
+        still writing beside the file, and the terminal collect then
+        finding it already moved. One place confines; this place reports
+        nothing.
+      - It is the one event whose size is the workflow's to choose (a
+        batch of 64 is 64 entries per save node), forwarded through Redis
+        for no reader.
+
+    The node id stays, so the event is still the per-node progress signal
+    it was. The terminal event carries the confined manifest.
+    """
+    if message.get("type") != "executed":
+        return message
+
+    data = dict(message.get("data") or {})
+    data.pop("output", None)
+
+    return dict(message, data=data)
 
 
 def prompt_finished(prompt_id: str) -> bool:

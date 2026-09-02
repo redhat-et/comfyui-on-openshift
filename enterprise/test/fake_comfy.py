@@ -291,6 +291,14 @@ async def run(client_id, pid, slow=False, vram_oom=False, die=False,
 
     history[pid] = {"outputs": {"9": {"images": images}}}
 
+    # What the real ComfyUI puts on the socket as each node finishes: the
+    # node's outputs in the same raw {filename, subfolder, type} shape as the
+    # manifest above, unconfined, BEFORE the agent has collected anything.
+    # check-65 scenario (i) reads the copy the agent forwards onto the job's
+    # stream and asserts these paths are not on it.
+    await send(ws, {"type": "executed", "data": {
+        "node": "9", "output": {"images": images}, "prompt_id": pid}})
+
     # A foreign terminal event first: the naive agent ends the job here.
     await send(ws, {"type": "executing", "data": {"node": None, "prompt_id": "other-prompt"}})
     await asyncio.sleep(0.05)

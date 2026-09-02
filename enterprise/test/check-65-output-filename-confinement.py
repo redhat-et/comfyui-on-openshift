@@ -50,6 +50,7 @@ naive join would resolve to.
     slash inside filename itself is never legitimate.
 """
 import json, os, pathlib, stat, sys, urllib.request
+import redis
 import websocket
 
 GW = "http://127.0.0.1:8100"
@@ -57,6 +58,23 @@ COMFY = "http://127.0.0.1:8999"
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
 failures = []
 
+r = redis.from_url(
+    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
+    password=os.environ.get("REDIS_PASSWORD") or None,
+    decode_responses=True,
+)
+
+
+def stream_events(job_id):
+    """Every event on the job's own stream, in order -- what the worker
+    actually forwarded, before the gateway's per-socket rewrite touches it."""
+    events = []
+    for _entry_id, fields in r.xrange(f"comfy:job:{job_id}:events"):
+        try:
+            events.append(json.loads(fields["data"]))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return events
 
 
 def check(name, cond, detail=""):
@@ -352,6 +370,33 @@ check("no directory named after OUTPUT_ROOT was created inside it -- the "
       not (OUTPUT_ROOT / OUTPUT_ROOT.name).exists(), OUTPUT_ROOT / OUTPUT_ROOT.name)
 check("and the file is still where it was, not moved out of the workspace tree",
       (OUTPUT_ROOT / "out_0001.png").exists(), OUTPUT_ROOT / "out_0001.png")
+
+# ---------------------------------------------------------------------------
+# (i) the per-node `executed` event the worker forwards carries no raw paths
+# ---------------------------------------------------------------------------
+print("\n== (i) the forwarded 'executed' event carries no raw, unconfined output paths")
+
+# ComfyUI reports each node's outputs on the socket as it finishes, in an
+# `executed` event whose data.output.images is the same {filename, subfolder}
+# shape as the /history manifest -- unconfined, and BEFORE collect_outputs()
+# has moved or refused anything. The worker forwards every prompt event
+# verbatim onto the job's stream; the gateway turns those into /outputs/ URLs
+# for the browser. So the stub now emits one, carrying the same hostile
+# manifest as scenario (g), and the copy on the stream must not carry it.
+seed_output()
+set_next_output("private_0001.png", subfolder=control_workspace)
+job_id, terminal = submit_and_wait("sven")
+executed = [e for e in stream_events(job_id) if e.get("type") == "executed"]
+check("the stub emitted an 'executed' event and the worker forwarded it "
+      "(the per-node progress signal is kept)",
+      len(executed) >= 1, [e.get("type") for e in stream_events(job_id)])
+raw_paths = [img for e in executed
+             for img in ((e.get("data") or {}).get("output") or {}).get("images", [])]
+check("the forwarded copy carries no output paths at all -- the terminal "
+      "event is the only place a path leaves this worker, and it is confined",
+      raw_paths == [], raw_paths)
+check("but still names the node that finished",
+      all((e.get("data") or {}).get("node") for e in executed), executed)
 
 print()
 if failures:
