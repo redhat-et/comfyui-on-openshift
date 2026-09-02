@@ -57,7 +57,13 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     COMFY_ROOT=/opt/comfyui
 
-RUN dnf install -y --setopt=install_weak_deps=False \
+# `dnf update` first: the nightly Trivy scan gates on HIGH/CRITICAL CVEs that
+# have a fixed build, and the base image's python3, urllib3 and vim-minimal
+# packages trail their el9 fixes by months. Updating here is what makes the
+# scan's finding actionable — the alternative is an ignore list that only
+# grows.
+RUN dnf update -y --setopt=install_weak_deps=False \
+    && dnf install -y --setopt=install_weak_deps=False \
         python3.11 python3.11-pip python3.11-devel \
         git mesa-libGL glib2 \
     && dnf clean all \
@@ -80,6 +86,29 @@ RUN python3 -m pip install --upgrade pip setuptools wheel \
         torchvision==${TORCHVISION_VERSION} \
         torchaudio==${TORCHAUDIO_VERSION}
 
+# The nvidia-*-cu12 wheels torch vendors declare themselves pure-Python, so on
+# a RHEL layout pip puts them under /usr/local/lib/python3.11/site-packages,
+# while torch itself, a platform package, lands under /usr/local/lib64/....
+# torch's shared objects find those libraries through a RUNPATH relative to
+# their own directory ($ORIGIN/../../nvidia/<lib>/lib), which on that split
+# points at nothing. torch has a fallback that preloads the wheels off
+# sys.path, but it only runs when its global-deps library fails to load, and
+# the -base- image already provides a system libcudart, so it loads and the
+# fallback never runs — and the first library -base- does NOT ship, cuDNN,
+# surfaces at boot as "ImportError: libcudnn.so.9". The nightly caught it.
+#
+# One symlink puts the wheels where the RUNPATH looks, so every vendored
+# library resolves from the wheel (consistently versioned, ahead of the
+# system copies), exactly as it does on a Debian layout. The import below
+# turns a repeat of this into a build failure rather than a boot failure; it
+# needs no GPU, a driver is only looked for at first CUDA use.
+RUN purelib="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && platlib="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["platlib"])')" \
+    && if [ "$purelib" != "$platlib" ] && [ -d "$purelib/nvidia" ] && [ ! -e "$platlib/nvidia" ]; then \
+           ln -s "$purelib/nvidia" "$platlib/nvidia"; \
+       fi \
+    && python3 -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
 # init + fetch + checkout rather than `git clone --branch`: --branch takes a
 # ref name and refuses a bare commit SHA, which is what COMFYUI_REF now is by
 # default. A fetch of an explicit object works for a SHA, a tag and a branch
@@ -89,7 +118,8 @@ RUN git init -q . \
     && git remote add origin ${COMFYUI_REPO} \
     && git fetch --depth 1 origin ${COMFYUI_REF} \
     && git checkout -q FETCH_HEAD \
-    && python3 -m pip install -r requirements.txt
+    && python3 -m pip install -r requirements.txt \
+    && python3 -m pip install --upgrade "setuptools>=78.1.1" "msgpack>=1.2.1"
 
 # Pinned to MANAGER_REF, and pointed at Comfy-Org/ (ltdrdata/ moved there
 # upstream; the old URL still redirects today, but don't depend on that
