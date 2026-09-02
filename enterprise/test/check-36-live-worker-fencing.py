@@ -77,10 +77,13 @@ either way and pass on HEAD.
      stamped. The claim has to be a compare-and-set that fails there —
      ComfyUI handed the workflow once, one terminal event, the retry's.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, uuid
-import redis
-import websocket
+import os, signal, sys, time, uuid
 
+from harness import (
+    COMFY, GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, alive, check,
+    connect_redis, drain as _drain, failures, handoffs, start_agent as _start_agent,
+    state_key, terminal_events as _terminal_events, wait_gone,
+)
 from queue_watch import QueueWriteWatcher
 from worker_ids import heartbeat_keys, processing_keys
 
@@ -88,11 +91,8 @@ from worker_ids import heartbeat_keys, processing_keys
 # CHECK_TIMEOUT loses every buffered PASS/FAIL line with it.
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
+get, post = GW.get, GW.post
+
 HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
 
 # Longer than HEARTBEAT_TTL, and well inside worker_agent.py's own 30s connect
@@ -102,74 +102,11 @@ HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
 # that TTL cannot quietly turn this into a window nothing lapses inside.
 STALL_S = HEARTBEAT_TTL + 5
 
-TERMINAL_TYPES = {"completed", "failed", "cancelled"}
-
-failures = []
-
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body=None, base=GW):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(base + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path, base=GW):
-    return json.loads(urllib.request.urlopen(base + path, timeout=10).read())
-
-
-def handoffs(probe):
-    """How many times the stub ComfyUI has been handed a workflow carrying this
-    node key. It appends to that list as POST /prompt is ENTERED, so this
-    counts GPU work actually started, not work that finished."""
-    return get("/__received__", base=COMFY)["nodes"].count(probe)
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-def stream_key(job_id):
-    return f"comfy:job:{job_id}:events"
+r = connect_redis()
 
 
 def terminal_events(job_id):
-    """Every terminal event on the job's stream, over its whole history.
-    A tailing browser stops at the first; this is what came after it."""
-    kinds = []
-
-    for _entry_id, fields in r.xrange(stream_key(job_id)):
-        try:
-            kind = json.loads(fields["data"]).get("type")
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
-
-        if kind in TERMINAL_TYPES:
-            kinds.append(kind)
-
-    return kinds
-
-
-def alive(pid):
-    """Same test as run.sh's agent_alive(): a child bash has not reaped still
-    answers kill -0, so state Z is the conclusive one."""
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-
-    state = subprocess.run(["ps", "-p", str(pid), "-o", "state="],
-                           capture_output=True, text=True).stdout.strip()
-
-    return not state.startswith("Z")
+    return _terminal_events(r, job_id)
 
 
 def await_pickup(job_id, timeout=20):
@@ -189,43 +126,9 @@ def await_pickup(job_id, timeout=20):
 
 
 def drain(job_id, timeout=90):
-    """Tail the gateway WebSocket to the job's first terminal event — what a
-    browser sees. `retry` is not terminal, so a requeue is read past rather
-    than special-cased, and hub.py's 15s keepalive ping is skipped. The
-    deadline is recomputed before every recv() so a stream of pings cannot
-    extend it (see check-30-sigkill.py)."""
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    deadline = time.time() + timeout
-    seen, terminal = [], None
-
-    while True:
-        remaining = deadline - time.time()
-
-        if remaining <= 0:
-            print(f"  drain({job_id}): no terminal event within {timeout}s; "
-                  f"events seen so far: {seen}")
-            break
-
-        ws.settimeout(remaining)
-
-        try:
-            m = json.loads(ws.recv())
-        except Exception:  # noqa: BLE001
-            break
-
-        if m.get("type") == "ping":
-            continue
-
-        seen.append(m["type"])
-
-        if m["type"] in TERMINAL_TYPES:
-            terminal = m
-            break
-
-    ws.close()
-
-    return seen, terminal
+    """harness.drain, verbose (prints "no terminal event ... gave up" on
+    timeout, as this file's original copy did)."""
+    return _drain(job_id, timeout, verbose=True)
 
 
 def wait_idle(worker_id, stable=2.0, cap=40):
@@ -280,7 +183,7 @@ print("\n== A: a live worker parked past its heartbeat TTL keeps its job")
 # cannot see the difference — an abandoned handshake still runs its endpoint
 # to completion — so the park is measured out here, by the clock.
 stall_armed_at = time.time()
-post("/__stall_next_ws__", {"seconds": STALL_S}, base=COMFY)
+COMFY.post("/__stall_next_ws__", {"seconds": STALL_S})
 
 probe_a = f"live-{uuid.uuid4().hex[:8]}"
 job_a = post("/api/generate", {"workflow": {probe_a: {"class_type": "KSampler"}}})["job_id"]
@@ -355,7 +258,7 @@ print("\n== B: a live worker whose job IS requeued under it abandons rather "
       "than running it twice")
 
 stall_armed_at = time.time()
-post("/__stall_next_ws__", {"seconds": STALL_S}, base=COMFY)
+COMFY.post("/__stall_next_ws__", {"seconds": STALL_S})
 
 probe_b = f"fence-{uuid.uuid4().hex[:8]}"
 job_b = post("/api/generate", {"workflow": {probe_b: {"class_type": "KSampler"}}})["job_id"]
@@ -442,35 +345,13 @@ check("the worker survived the whole scenario", alive(agent_pid), agent_pid)
 print("\n== C: a reap that lands between the ownership read and the claim "
       "is noticed by the claim itself")
 
-WORKER_AGENT = os.environ["WORKER_AGENT"]
-
 # Long enough for the reaper to act inside it (a deleted heartbeat plus one
 # REAPER_INTERVAL tick), short enough to stay well inside the drain budget.
 CLAIM_DELAY_S = HEARTBEAT_TTL
 
 
-def wait_gone(pid, timeout=30):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not alive(pid):
-            return True
-        time.sleep(0.1)
-    return False
-
-
 def start_agent(hostname, env_extra, timeout=30):
-    env = dict(os.environ)
-    env["HOSTNAME"] = hostname
-    env.update(env_extra)
-    log_file = open(f"agent-{hostname}.log", "w")
-    proc = subprocess.Popen([sys.executable, WORKER_AGENT], env=env,
-                            stdout=log_file, stderr=subprocess.STDOUT)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if heartbeat_keys(r, hostname) or proc.poll() is not None:
-            break
-        time.sleep(0.2)
-    return proc
+    return _start_agent(hostname, env_extra, timeout=timeout, r=r)
 
 
 # The suite's agent stands down (SIGTERM while idle — it exits and deletes

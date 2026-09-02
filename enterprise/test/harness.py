@@ -137,6 +137,29 @@ GW = Client("http://127.0.0.1:8100")
 COMFY = Client(COMFY_HTTP)
 
 
+def comfy_received_nodes():
+    """Every workflow node key the stub ComfyUI has ever been handed
+    (GET /__received__ on COMFY). It records them as POST /prompt is
+    entered, so this answers "does ComfyUI have it", not "has it finished"
+    or "has the agent heard back" -- the question the retry decision
+    (check-30-sigkill.py, check-32-worker-restart.py, check-90-showback.py)
+    and the handoff count (check-36-live-worker-fencing.py,
+    check-67-job-timeout-interrupt.py) both need."""
+    return COMFY.get("/__received__")["nodes"]
+
+
+def comfy_saw(probe):
+    """Has the stub ComfyUI been handed a workflow carrying this node key at
+    all? check-30/check-32/check-90's copies of this were identical."""
+    return probe in comfy_received_nodes()
+
+
+def handoffs(probe):
+    """How many times the stub ComfyUI has been handed a workflow carrying
+    this node key -- check-36's and check-67's copies of this."""
+    return comfy_received_nodes().count(probe)
+
+
 # ---------------------------------------------------------------------------
 # Redis key builders. Ten copies of state_key()/stream_key() alone.
 # ---------------------------------------------------------------------------

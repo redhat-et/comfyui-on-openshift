@@ -1,23 +1,11 @@
 """Assertions against the running gateway + worker."""
 import json, os, socket, struct, sys, time, urllib.request, uuid
-import redis
 import websocket
 
-GW = "http://127.0.0.1:8100"
-failures = []
+from harness import GW, check, connect_redis, failures
 
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-def post(path, body):
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
+GW_URL = GW.base_url
+get, post = GW.get, GW.post
 
 print("\n== readiness")
 check("readyz reports Redis reachable", get("/readyz")["ok"])
@@ -129,11 +117,11 @@ check("image url is scoped under a per-submitter output workspace "
       workspace_depth >= 1, images)
 
 print("\n== serving the image off the shared volume")
-body = urllib.request.urlopen(GW + images[0]["url"], timeout=10).read()
+body = urllib.request.urlopen(GW_URL + images[0]["url"], timeout=10).read()
 check("image is served", b"fake png" in body)
 
 try:
-    urllib.request.urlopen(GW + "/outputs/../../etc/passwd", timeout=10)
+    urllib.request.urlopen(GW_URL + "/outputs/../../etc/passwd", timeout=10)
     check("path traversal is blocked", False, "it was NOT blocked")
 except urllib.error.HTTPError as exc:
     check("path traversal is blocked", exc.code in (403, 404), exc.code)
@@ -144,7 +132,7 @@ check("job state is completed", state.get("status") == "completed", state)
 
 print("\n== attribution and metrics")
 req = urllib.request.Request(
-    GW + "/api/generate",
+    GW_URL + "/api/generate",
     data=json.dumps({"workflow": {"3": {"class_type": "KSampler", "inputs": {}}}}).encode(),
     headers={"Content-Type": "application/json", "X-Forwarded-User": "alice"})
 job2 = json.loads(urllib.request.urlopen(req, timeout=10).read())
@@ -152,7 +140,7 @@ state2 = get(f"/api/jobs/{job2['job_id']}")
 check("the authenticated user is stamped onto the job",
       state2.get("user") == "alice", state2)
 
-metrics = urllib.request.urlopen(GW + "/metrics", timeout=10).read().decode()
+metrics = urllib.request.urlopen(GW_URL + "/metrics", timeout=10).read().decode()
 check("prometheus metrics are served",
       "comfy_queue_depth" in metrics and "comfy_workers_registered" in metrics,
       metrics.splitlines()[:2])
@@ -191,7 +179,7 @@ except urllib.error.HTTPError as exc:
 
 def raw_post(path, data, headers):
     """Like post(), but returns (status, body) for error responses too."""
-    req = urllib.request.Request(GW + path, data=data, headers=headers, method="POST")
+    req = urllib.request.Request(GW_URL + path, data=data, headers=headers, method="POST")
     try:
         resp = urllib.request.urlopen(req, timeout=30)
         return resp.getcode(), resp.read()
@@ -235,7 +223,7 @@ check("a body declared larger than MAX_BODY_BYTES is refused with 413 before it 
       b" 413 " in status_line, status_line)
 
 print("\n== the landing page is served")
-page = urllib.request.urlopen(GW + "/", timeout=10).read().decode()
+page = urllib.request.urlopen(GW_URL + "/", timeout=10).read().decode()
 check("GET / serves index.html", "ComfyUI" in page and "/api/generate" in page, page[:80])
 
 print("\n== a WebSocket for a job that does not exist is closed, not held open")
@@ -270,8 +258,7 @@ print("\n== url rewriting confines what a raw ComfyUI event reports")
 # a worker produces one. A filename or subfolder component that is not a bare
 # single path component must lose its URL (the event itself is still
 # delivered); ordinary shapes must still get one.
-r = redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-                   password=os.environ.get("REDIS_PASSWORD") or None, decode_responses=True)
+r = connect_redis()
 fake_job = f"rewrite-{uuid.uuid4().hex[:12]}"
 state_k, stream_k = f"comfy:job:{fake_job}:state", f"comfy:job:{fake_job}:events"
 r.hset(state_k, mapping={"status": "running"})

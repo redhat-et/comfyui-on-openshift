@@ -39,50 +39,14 @@ HEARTBEAT_TTL / REAPER_INTERVAL make worker-death assertions resolve in
 seconds, argv[1] is a live agent's pid, and this check may leave it dead
 (scenario A kills it) because run.sh starts a fresh one before the next check.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, uuid
-import redis
+import json, os, signal, sys, time, uuid
 
-from worker_ids import heartbeat_keys
-
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-WORKER_AGENT = os.environ["WORKER_AGENT"]
-failures = []
-
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
+from harness import (
+    GW, QUEUE_KEY, check, comfy_saw, connect_redis, failures, payload_key,
+    start_agent as _start_agent, state_key, stop_agent, stream_key, wait_for,
 )
 
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(url, body=None):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(url):
-    return json.loads(urllib.request.urlopen(url, timeout=10).read())
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-def stream_key(job_id):
-    return f"comfy:job:{job_id}:events"
-
-
-def payload_key(job_id):
-    return f"comfy:job:{job_id}:payload"
+r = connect_redis()
 
 
 def probe_workflow(*markers):
@@ -93,10 +57,6 @@ def probe_workflow(*markers):
     workflow[probe] = {"class_type": "KSampler"}
 
     return probe, workflow
-
-
-def comfy_saw(probe):
-    return probe in get(f"{COMFY}/__received__")["nodes"]
 
 
 def event_types(job_id):
@@ -120,49 +80,11 @@ def queued_raw(job_id):
     return None
 
 
-def wait_for(predicate, timeout=45, interval=0.2):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-
-    return False
-
-
 def start_extra_agent(hostname, timeout=30):
     """A worker agent of this check's own, identified by a fixed HOSTNAME so
-    its heartbeat key is findable — by a prefix match on the identity, since
-    the key itself is named from the agent's INCARNATION and carries a nonce
-    this process cannot know (worker_agent.py, note 9; worker_ids.py). Named
-    to match run.sh's agent*.log glob so a failure dumps its log too."""
-    env = dict(os.environ)
-    env["HOSTNAME"] = hostname
-    log = open(f"agent-{hostname}.log", "w")
-    proc = subprocess.Popen([sys.executable, WORKER_AGENT], env=env,
-                            stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if heartbeat_keys(r, hostname):
-            return proc
-        if proc.poll() is not None:
-            return proc  # died on startup; later assertions will show it
-        time.sleep(0.2)
-
-    return proc
-
-
-def stop_agent(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=10)
-    except Exception:  # noqa: BLE001
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+    its heartbeat key is findable (worker_ids.py, harness.start_agent's
+    ready="heartbeat" default) rather than parsed off log output."""
+    return _start_agent(hostname, timeout=timeout, r=r)
 
 
 agent_pid = int(sys.argv[1])
@@ -175,7 +97,7 @@ try:
     # the stub has recorded the workflow, which is the whole window: ComfyUI
     # has it, the agent has not been told so yet.
     probe, workflow = probe_workflow("__slow_prompt__")
-    job_id = post(f"{GW}/api/generate", {"workflow": workflow})["job_id"]
+    job_id = GW.post("/api/generate", {"workflow": workflow})["job_id"]
 
     check("the worker picked the job up",
           wait_for(lambda: r.hget(state_key(job_id), "status") == "running", timeout=15),
@@ -193,7 +115,7 @@ try:
     os.kill(agent_pid, signal.SIGKILL)
 
     settled = wait_for(lambda: r.hget(state_key(job_id), "status") in ("failed", "completed", "cancelled")
-                       or "retry" in event_types(job_id))
+                       or "retry" in event_types(job_id), timeout=45)
     kinds = event_types(job_id)
     state = r.hgetall(state_key(job_id))
 
@@ -214,12 +136,12 @@ try:
     # list -- which is precisely the state a SIGKILLed worker leaves behind:
     # an entry parked in comfy:processing:<worker> with no heartbeat key.
     probe_b1, workflow = probe_workflow("__slow__")
-    job_b1 = post(f"{GW}/api/generate", {"workflow": workflow})["job_id"]
+    job_b1 = GW.post("/api/generate", {"workflow": workflow})["job_id"]
 
     raw = queued_raw(job_b1)
     check("the submitted job is on comfy:queue, unclaimed", raw is not None, r.llen(QUEUE_KEY))
 
-    post(f"{GW}/api/jobs/{job_b1}/cancel")
+    GW.post(f"/api/jobs/{job_b1}/cancel")
     check("cancel_requested is set on the job",
           r.hget(state_key(job_b1), "cancel_requested") == "1", r.hgetall(state_key(job_b1)))
 
@@ -258,8 +180,8 @@ try:
     print("\n== B2: a job cancelled before any worker picked it up is never handed to ComfyUI (the worker's door)")
 
     probe_b2, workflow = probe_workflow("__slow__")
-    job_b2 = post(f"{GW}/api/generate", {"workflow": workflow})["job_id"]
-    post(f"{GW}/api/jobs/{job_b2}/cancel")
+    job_b2 = GW.post("/api/generate", {"workflow": workflow})["job_id"]
+    GW.post(f"/api/jobs/{job_b2}/cancel")
 
     check("the job is cancelled and still queued, with no worker on it",
           r.hget(state_key(job_b2), "cancel_requested") == "1"
