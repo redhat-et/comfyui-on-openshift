@@ -57,6 +57,16 @@ spec:
           value: "${COMFYUI_REF}"
         - name: ENABLE_MANAGER
           value: "${ENABLE_MANAGER}"
+        - name: MANAGER_REF
+          value: "${MANAGER_REF}"
+        - name: TORCH_INDEX
+          value: "${TORCH_INDEX}"
+        - name: TORCH_VERSION
+          value: "${TORCH_VERSION}"
+        - name: TORCHVISION_VERSION
+          value: "${TORCHVISION_VERSION}"
+        - name: TORCHAUDIO_VERSION
+          value: "${TORCHAUDIO_VERSION}"
   output:
     to:
       kind: ImageStreamTag

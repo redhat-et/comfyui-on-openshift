@@ -235,18 +235,30 @@ efs_filesystem()
     ok "security group $security_group_id (NFS 2049 from $vpc_cidr)"
 
     # One mount target per subnet the nodes live in.
-    local subnet_id
+    #
+    # "Already exists" is only a safe read of a failure when AWS actually says
+    # MountTargetConflict — that is the one error CreateMountTarget returns
+    # for "there is already a mount target for this file system in this AZ".
+    # Anything else (wrong security group, subnet in a different VPC than the
+    # filesystem, IAM denied, a throttled call) used to be swallowed here right
+    # along with it, so a pod in that AZ would sit hung on the NFS mount with
+    # no clue this step ever failed. Capture stderr instead of discarding it,
+    # so a real failure gets the operator's message and dies loudly.
+    local subnet_id create_err
     for subnet_id in $(aws ec2 describe-subnets \
         --filters "Name=vpc-id,Values=${vpc_id}" "Name=map-public-ip-on-launch,Values=false" \
         --query 'Subnets[].SubnetId' --output text); do
 
-        if aws efs create-mount-target \
+        if create_err="$(aws efs create-mount-target \
             --file-system-id "$file_system_id" \
             --subnet-id "$subnet_id" \
-            --security-groups "$security_group_id" >/dev/null 2>&1; then
+            --security-groups "$security_group_id" 2>&1 >/dev/null)"; then
             ok "mount target in $subnet_id"
-        else
+        elif [[ "$create_err" == *"MountTargetConflict"* ]]; then
             ok "mount target in $subnet_id already exists"
+        else
+            die "Could not create an EFS mount target in $subnet_id:
+          $create_err"
         fi
     done
 

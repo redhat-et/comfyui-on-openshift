@@ -424,6 +424,85 @@ trap - EXIT
 rm -f "$HUB_PY_BACKUP" "$ENVELOPE_LOG"
 
 # ---------------------------------------------------------------------------
+# Wave 2C additions below (S3, S4 in the audit plan).
+# ---------------------------------------------------------------------------
+
+log "scripts/06-status.sh — ec2_hourly_rate on an unknown instance type (S3)"
+
+# ec2_hourly_rate() used to return 0 for anything not in its case statement,
+# indistinguishable from a genuinely free line and silently under-reporting
+# the burn rate exactly when someone changes GPU_INSTANCE_TYPE to something
+# new. It now warns by name and returns empty instead. Source only the
+# function under test, in a subshell, rather than running the rest of
+# 06-status.sh — that assumes aws/rosa/oc are on PATH and a cluster exists,
+# neither of which this suite has.
+STATUS_SH="$REPO_ROOT/scripts/06-status.sh"
+
+extract_ec2_hourly_rate()
+{
+    sed -n '/^ec2_hourly_rate()/,/^}/p' "$STATUS_SH"
+}
+
+ec2_hourly_rate_unknown_warns()
+{
+    (
+        eval "$(extract_ec2_hourly_rate)"
+        ec2_hourly_rate m5.not-a-real-type 2>&1 >/dev/null \
+            | grep -qi "no on-demand rate on file for instance type 'm5.not-a-real-type'"
+    )
+}
+
+expect_true "an unknown instance type prints a warning naming the type" \
+    ec2_hourly_rate_unknown_warns
+
+ec2_hourly_rate_unknown_is_empty()
+{
+    (
+        eval "$(extract_ec2_hourly_rate)"
+        [[ -z "$(ec2_hourly_rate m5.not-a-real-type 2>/dev/null)" ]]
+    )
+}
+
+expect_true "an unknown instance type returns nothing rather than a silent 0" \
+    ec2_hourly_rate_unknown_is_empty
+
+ec2_hourly_rate_known_type_unaffected()
+{
+    (
+        eval "$(extract_ec2_hourly_rate)"
+        [[ "$(ec2_hourly_rate g6.xlarge 2>/dev/null)" == "0.805" ]]
+    )
+}
+
+expect_true "a known instance type still returns its rate with no warning" \
+    ec2_hourly_rate_known_type_unaffected
+
+# ---------------------------------------------------------------------------
+
+log "lib/common.sh — ASSUME_YES only comes from --yes, never from the environment (S4)"
+
+# The comment on confirm_destructive claims ASSUME_YES is set only by an
+# explicit --yes argument, never by an environment default. Before this fix
+# that was aspirational: `set -a; source .env; set +a` exports whatever .env
+# happens to set, and an ASSUME_YES already exported by the calling shell
+# survived untouched. load_env now unsets ASSUME_YES both before and after
+# sourcing .env, so simulate the exact scenario the comment promises against
+# — ASSUME_YES exported in the environment before a script ever looks at its
+# own argv — and confirm confirm_destructive still asks (and, with no
+# terminal attached, still refuses) rather than silently proceeding.
+assume_yes_env_does_not_bypass_confirm()
+{
+    (
+        export ASSUME_YES=true
+        load_env
+        CLUSTER_NAME=test-cluster confirm_destructive "test" </dev/null >/dev/null 2>&1
+    )
+}
+
+expect_false "ASSUME_YES=true in the environment does not bypass confirm_destructive" \
+    assume_yes_env_does_not_bypass_confirm
+
+# ---------------------------------------------------------------------------
 
 log "scripts/lint.sh — namespace hardening shapes (W4, P8, P9)"
 

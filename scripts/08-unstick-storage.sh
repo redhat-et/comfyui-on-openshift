@@ -318,4 +318,9 @@ fi
 
 log "Re-checking"
 sleep 20
-exec "$0"
+# `exec "$0"` alone depends on the file's own execute bit surviving however it
+# got here (a fresh checkout, a copy, tar without permissions) and, more to
+# the point, drops every argument — so a re-run started with --repair would
+# silently fall back to diagnose-only on this self re-exec. Invoke it through
+# bash explicitly and forward argv.
+exec bash "$0" "$@"
