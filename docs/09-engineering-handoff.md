@@ -475,12 +475,12 @@ records this as I1, landed.
 
 ## 9. What I would do next, if I were staying
 
-The full list is in the README under **Ideas worth doing next**, and
-[`10-roadmap.md`](10-roadmap.md) turns it into a work plan — what each item
-touches, what proves it, what order they can safely land in, and which of them
-need a real cluster. The short version, in the order I would take them —
-shipped and decided-against items kept on the list rather than deleted, the
-way the README's version keeps them, because the reasoning is the useful part:
+The full list is in [`10-roadmap.md`](10-roadmap.md) — "The list, as the
+README carried it" — which turns it into a work plan: what each item touches,
+what proves it, what order they can safely land in, and which of them need a
+real cluster. The short version, in the order I would take them — shipped and
+decided-against items kept on the list rather than deleted, because the
+reasoning is the useful part:
 
 1. **Schedule the warm window — landed** (`10-roadmap.md`, I1). It shipped as
    a KEDA `cron` trigger driven by `WARM_WORKERS`/`WARM_START`/`WARM_END`/

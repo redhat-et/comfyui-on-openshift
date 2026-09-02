@@ -24,6 +24,21 @@ on top of what you pay AWS for the card.
 
 `make status` computes this live from your actual machine pools.
 
+```mermaid
+stateDiagram-v2
+    Running: Running · ~$2.04/hr
+    Parked: GPU parked · ~$1.06/hr
+    Down: Cluster deleted · ~$0.05/hr
+    Gone: Everything deleted · $0
+
+    [*] --> Running: make up
+    Running --> Parked: make park
+    Parked --> Running: back in ~5 min
+    Running --> Down: make down
+    Down --> Running: back in ~15 min
+    Down --> Gone: make destroy
+```
+
 ## What that means in practice
 
 | Pattern | Monthly |

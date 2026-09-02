@@ -490,6 +490,118 @@ outage. What it cannot see is the *shape* of that separation — a health
 endpoint that reads the quota is green whenever its reader is under the cap —
 so `scripts/lint.sh` walks `hub.py`'s call graph for it.
 
+## The output path has been attacked, and the attack is in the suite
+
+Every path that ends on the shared volume begins as something a caller chose.
+The submitter's name arrives in a request header, a save node's
+`filename_prefix` arrives inside the workflow, and the output filename comes
+back from ComfyUI. All three are handled as hostile, and ten hostile strings
+are driven through the running system on every `make test`: four usernames (an
+eight-deep traversal, an absolute path, an empty value, 2000 characters), a
+`filename_prefix` carrying `..`, two reported output filenames
+(`../../OUTSIDE/secret.txt`, and a bare `sub/evil.png` that never spells `..`
+at all), a `/outputs/../../etc/passwd` request, and two hostile submitter
+identities pushed through the showback accounting. None of them escapes
+`OUTPUT_ROOT`. The legitimate cases are asserted in the same files —
+`alice.smith@example.com` and a filename with parentheses must still
+round-trip to a real, servable URL — because sanitizing hard enough to break
+the usernames an IdP actually issues is its own failure.
+
+There are two layers, and the second one has already caught what the first one
+missed. Sanitization makes a separator unrepresentable in a workspace name;
+the join is then resolved and re-verified against `OUTPUT_ROOT`, and the
+gateway independently refuses to serve any `/outputs/...` path that resolves
+outside it. `check-65-output-filename-confinement.py` exists because subfolder
+confinement alone was not enough: `output_subfolder()` confined the subfolder
+correctly and `collect_outputs()` then concatenated the raw reported filename
+onto it, so the escape lived in how the URL's two halves were joined rather
+than in what either half returned. That check reproduces the escape against the
+live agent's own output first, and only then asserts the fix — a hostile
+filename produces no image entry at all, rather than one served from a
+rewritten name.
+
+One part of this is reasoned rather than tested, and it is worth saying so:
+resolve-then-verify is what would catch a symlink already planted in the output
+volume, which no string rule can see, and nothing in the suite plants one. The
+order of operations is the argument there (`worker_agent.py`,
+`workspace_path()`), not a green check.
+
+## The assertions that could not fail, and what replaced them
+
+An assertion nobody has watched fail is a decoration, and this suite has
+caught ten of its own being exactly that, plus two behaviours no assertion
+reached at all:
+
+- Three assertions of the form "`comfy:queue` is empty afterwards" were
+  **proven unable to fail** by mutation testing. One agent polls one queue
+  here, so an entry a wrong implementation put back has already been popped
+  again by the time a check looks — `LLEN` reads 0 either way. They were
+  replaced by counting the command Redis actually executed
+  (`enterprise/test/queue_watch.py`).
+- The worker's guard for a server-side socket close was **deleted outright and
+  the whole suite stayed green**: no check reached it, because the one
+  dead-ComfyUI fixture closed in a way that made the client raise instead.
+  That is what `check-75-closed-socket.py` was written for.
+- A re-gate against a live mutation that really did requeue a rejected job
+  found the assertion still passing, because the watcher was armed after the
+  submit rather than before it (`check-20-failure-paths.py`, and the same
+  construction in `check-70-oom-paths.py`).
+- **"At least three progress events"** passed on an agent that filters progress
+  and not terminals: the stub's foreign terminal event arrives *after* all
+  three, so the job ends on somebody else's completion with three progress
+  events already delivered. `check-10-stream.py` now counts foreign events over
+  the job's whole stream and requires the one terminal event to carry this
+  job's own `prompt_id`.
+- **Every estimated-wait assertion — four of them — ran against a one-entry
+  queue**, where index `-1` and index `0` are the same entry — so nothing could
+  tell which end of the queue the gauge reads, and a gauge reading the head
+  reports ~0 on an hour-old backlog. `check-80-estimated-wait.py` now submits
+  a second job behind the manufactured stale one.
+- **A requeue that jumps the queue is invisible to every other check**: the job
+  is still requeued once, still completes, and `comfy:queue` still receives
+  exactly one write. Only its position changes.
+  `check-55-retry-placement.py` builds a two-lane backlog with a real middle
+  and asserts the whole service order afterwards.
+
+The harness itself had the same shape of hole, and it is worth naming beside
+them: `run.sh` folded only a check's exit status, so a check that kept printing
+its `FAIL` lines while its `sys.exit(1)` went missing left the suite — and CI,
+which reads the same status — green over its own output. It now reads each
+check's output for the shared `check()` helper's own line format as well.
+
+So the useful thing to do with this suite is to distrust the authors and check.
+Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM handler, or
+the workspace confinement, and run `make test`: something goes red, and which
+assertion goes red tells you what that code was actually holding. It is a
+faster way to find out what the suite is worth than reading it.
+`docs/10-roadmap.md` states the standing rule in the other direction — an
+existing assertion may be replaced only by one that is strictly stronger, in
+the same commit, with both shown in review.
+
+## The fair-enqueue cost was measured, not assumed
+
+Fair queueing means placing a new job relative to the jobs already queued,
+which means reading them, inside one Lua `EVAL`. Redis executes one command at
+a time, so that read is time no other client gets — including every worker
+parked in `BLMOVE`, which is to say the pool stops being handed work for the
+duration. One submitter's insert is therefore a cluster-wide cost, and it was
+measured rather than reasoned about.
+
+| One `/api/generate`, 499-deep queue | ~26 KB workflow | ~103 KB workflow |
+|---|---:|---:|
+| Whole envelope in the list | 117.7 ms | 1235 ms |
+| Ordering record in the list, workflow at `comfy:job:<id>:payload` | 1.6 ms | 2.2 ms |
+
+The second column is the more useful one: what the insert reads per entry is
+now fixed, so the cost has stopped tracking a size the *client* chooses.
+`bench-fair-enqueue.py` (above) imports the real `hub.py` rather than
+reimplementing the call shape, and uses its own key namespace, so the numbers
+are re-measurable against any Redis — the recorded ones are an M-series laptop
+with redis-server 8. This suite structurally cannot see this at all, since it
+runs a queue three jobs deep with a two-node workflow where every version of
+the insert is instant; `make lint` pins the shape the number depends on, and
+`docs/09-engineering-handoff.md` section 3 has the row.
+
 ## What it does not cover
 
 Anything requiring a real cluster: KEDA actually scaling, the machine pool
