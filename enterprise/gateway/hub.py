@@ -53,6 +53,12 @@ QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 EVENT_STREAM_TTL = int(os.environ.get("EVENT_STREAM_TTL", "3600"))
 MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "500"))
 
+# Refused at import rather than tolerated: EXPIRE with a non-positive TTL
+# deletes the key on the spot, so an EVENT_STREAM_TTL of 0 is a gateway that
+# erases every job the instant it creates it and reports nothing wrong.
+if EVENT_STREAM_TTL <= 0:
+    raise ValueError(f"EVENT_STREAM_TTL must be a positive number of seconds, got {EVENT_STREAM_TTL}")
+
 # The queue carries an ordering record and the workflow itself sits beside it
 # at payload_key(job_id) — see BEGIN SHARED ENVELOPE. This is the backstop on
 # that key, not the reclaim path: the reclaim path is the explicit delete every
@@ -83,6 +89,11 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
 WORKER_KEY_PREFIX = "comfy:worker:"
 PROCESSING_KEY_PREFIX = "comfy:processing:"
 REAPER_INTERVAL = int(os.environ.get("REAPER_INTERVAL", "30"))
+
+# Same posture: a zero interval is a tight loop of keyspace SCANs against a
+# single-threaded Redis, which is an outage with a config-file cause.
+if REAPER_INTERVAL <= 0:
+    raise ValueError(f"REAPER_INTERVAL must be a positive number of seconds, got {REAPER_INTERVAL}")
 
 # How many times the reaper may put a job back on the queue (docs/10-roadmap.md,
 # Q2) — and only ever a job that died before ComfyUI saw the workflow, see
@@ -1148,8 +1159,20 @@ async def lifespan(_app: FastAPI):
     # the other replica's reaper. That bound comes from the atomic HINCRBY in
     # reap_stranded_job() below, not from this.
     reaper = asyncio.create_task(reap_orphaned_jobs())
+
     yield
+
+    # Cancel, then AWAIT the cancellation: a task cancelled and dropped is one
+    # uvicorn's shutdown logs as "Task was destroyed but it is pending", and
+    # its Redis connection stays checked out of a pool that is about to be
+    # closed underneath it.
     reaper.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await reaper
+
+    if _redis is not None:
+        await _redis.aclose()
 
 
 app = FastAPI(title="ComfyUI Gateway", lifespan=lifespan)
@@ -1794,6 +1817,15 @@ async def generate(request: Request):
     size can be capped while it streams in — by the time FastAPI hands over a
     parsed dict, an oversized body has already been buffered whole.
     """
+    # The body is parsed as JSON whatever the client says it is, so say what
+    # it must be: a form post, or a cross-site text/plain submission a browser
+    # will send without a preflight, must not be able to queue a job.
+    # index.html sends exactly this. Parameters (charset) are allowed.
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+    if media_type != "application/json":
+        raise HTTPException(415, "Content-Type must be application/json")
+
     declared = request.headers.get("content-length", "")
 
     if declared.isdigit() and int(declared) > MAX_BODY_BYTES:

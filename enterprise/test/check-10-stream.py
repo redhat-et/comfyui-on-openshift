@@ -1,5 +1,6 @@
 """Assertions against the running gateway + worker."""
-import json, sys, time, urllib.request
+import json, os, socket, struct, sys, time, urllib.request, uuid
+import redis
 import websocket
 
 GW = "http://127.0.0.1:8100"
@@ -186,6 +187,52 @@ try:
     check("unknown job is a 404", False)
 except urllib.error.HTTPError as exc:
     check("unknown job is a 404", exc.code == 404, exc.code)
+
+
+def raw_post(path, data, headers):
+    """Like post(), but returns (status, body) for error responses too."""
+    req = urllib.request.Request(GW + path, data=data, headers=headers, method="POST")
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return resp.getcode(), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+WORKFLOW_BYTES = json.dumps({"workflow": {"3": {"class_type": "KSampler", "inputs": {}}}}).encode()
+
+status, body = raw_post("/api/generate", b"{this is not json", {"Content-Type": "application/json"})
+check("a body that is not JSON is refused with 400, not a 500", status == 400, (status, body[:80]))
+
+status, body = raw_post("/api/generate", WORKFLOW_BYTES, {"Content-Type": "text/plain"})
+check("a POST whose Content-Type is not application/json is refused with 415 -- "
+      "the body is parsed as JSON whatever the header says, so a form post or a "
+      "cross-site text/plain submission must not be able to queue a job",
+      status == 415, (status, body[:80]))
+
+status, body = raw_post("/api/generate", WORKFLOW_BYTES,
+                        {"Content-Type": "application/json; charset=utf-8"})
+check("a Content-Type carrying a charset parameter is still application/json",
+      status == 200, (status, body[:80]))
+
+# The declared-length path: the handler refuses on Content-Length before it
+# reads a byte of the body, so the response is on the wire while this socket
+# has sent none of it -- which is why this is a raw socket rather than urllib,
+# whose sendall of two megabytes would hit the closed connection first.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+sock = socket.create_connection(("127.0.0.1", 8100), timeout=10)
+sock.sendall((f"POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+              f"Content-Type: application/json\r\n"
+              f"Content-Length: {MAX_BODY_BYTES + 1}\r\n\r\n").encode())
+sock.sendall(b"{")
+status_line = b""
+try:
+    status_line = sock.recv(64).split(b"\r\n", 1)[0]
+except OSError as exc:
+    status_line = repr(exc).encode()
+sock.close()
+check("a body declared larger than MAX_BODY_BYTES is refused with 413 before it is read",
+      b" 413 " in status_line, status_line)
 
 print()
 if failures:
