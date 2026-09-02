@@ -108,7 +108,10 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      to a stranded entry, and this agent re-reads it at the two moments its
      next action would become other people's business — before handing the
      workflow to ComfyUI, and before writing a terminal outcome. Reaped means
-     abandon: no submit, no terminal event, no accrual. See still_ours().
+     abandon: no submit, no terminal event, no accrual. See still_ours(), and
+     claim_executing(): the first of those two reads is folded into the
+     write it authorises, because a reap can land between a read and a
+     separate write, and did.
 """
 
 from __future__ import annotations
@@ -151,6 +154,18 @@ COMFY_ADDR = f"{COMFY_HOST}:{COMFY_PORT}"
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "60"))
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
+
+# TEST-ONLY. Never set this in a manifest. A pause, in seconds, immediately
+# before the point-10 claim that turns "dispatched" into "executing" — the
+# last instant at which a reap can still be free. The window between reading
+# the owner and writing the phase is microseconds in production, and
+# enterprise/test/check-36-live-worker-fencing.py scenario C needs the
+# gateway's reaper to act INSIDE it, deterministically, to prove that a
+# requeue landing there is noticed rather than raced. There is no stub-side
+# hook that can widen this window: ComfyUI is not involved until the
+# submit, which is after it. Zero, the default, is no pause and no code
+# path — the sleep is not called.
+TEST_DELAY_BEFORE_CLAIM_S = float(os.environ.get("TEST_DELAY_BEFORE_CLAIM_S", "0"))
 
 # The shared output volume, as this container sees it. It must be the same
 # directory start.sh hands ComfyUI as --output-directory — start.sh reads this
@@ -1288,17 +1303,75 @@ def still_ours(conn: redis.Redis, job_id: str) -> bool:
     """
     Is this job still mine to act on? See point 10, and OWNER_FIELD.
 
-    Read immediately before the two acts a reaped worker must not perform:
-    handing the workflow to ComfyUI, and writing a terminal outcome. Everything
-    between them is this process talking to its own ComfyUI about work that has
-    already started, which a second opinion from Redis cannot undo.
+    Read immediately before writing a terminal outcome — the second of the
+    two acts a reaped worker must not perform. The first, handing the
+    workflow to ComfyUI, is guarded by claim_executing() below, which asks
+    the same question inside the write it protects rather than before it.
+    Everything between the two is this process talking to its own ComfyUI
+    about work that has already started, which a second opinion from Redis
+    cannot undo.
 
     Unowned is OURS. A hash written before this field existed, or recreated by
     an HSET after expiring, carries no owner — and a missing field that
     suppressed a terminal event would strand exactly the jobs this whole
-    mechanism exists to stop stranding.
+    mechanism exists to stop stranding. claim_executing() applies the same
+    rule, in Lua, for the same reason.
     """
     return conn.hget(state_key(job_id), OWNER_FIELD) in (None, "", WORKER_INCARNATION)
+
+
+# The claim: "executing" is written only if this incarnation still owns the
+# job, in one script, so nothing can land between the check and the write.
+#
+# This used to be still_ours() followed by an HSET — a read, then separately
+# a write that the read had supposedly authorised. Between them the reaper
+# could requeue the job (it stamps REAPED_OWNER first, then writes
+# phase=queued and pushes the entry back); the HSET then wrote "executing"
+# over the retry's "queued" and the submit that followed handed ComfyUI the
+# workflow beside the retry's own — the exact replay the fence exists to
+# prevent, arriving one line below it. The window was microseconds, which is
+# why it survived every check that parks a worker in front of the fence
+# (check-36 A/B) and why check-36 C needs TEST_DELAY_BEFORE_CLAIM_S to
+# reach it.
+#
+# Absence is not a fence, here as in still_ours(): a hash with no owner
+# field is claimed. The EXPIRE is inside the script for the reason
+# arm_state_ttl() gives in hub.py — an HSET recreates an expired hash with
+# no TTL — and because the caller used to issue it as a second round trip.
+CLAIM_EXECUTING_LUA = """
+local owner = redis.call('HGET', KEYS[1], ARGV[1])
+
+if owner and owner ~= '' and owner ~= ARGV[2] then
+  return 0
+end
+
+redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+
+return 1
+"""
+
+_claim_script = None
+
+
+def claim_executing(conn: redis.Redis, job_id: str) -> bool:
+    """
+    Write PHASE_EXECUTING iff OWNER_FIELD is still this incarnation (or
+    absent). True means the claim held and ComfyUI may be handed the
+    workflow; False means somebody reaped this job in the meantime, and the
+    caller abandons exactly as it would have on a failed still_ours().
+    """
+    global _claim_script
+
+    if _claim_script is None:
+        _claim_script = conn.register_script(CLAIM_EXECUTING_LUA)
+
+    held = _claim_script(
+        keys=[state_key(job_id)],
+        args=[OWNER_FIELD, WORKER_INCARNATION, PHASE_FIELD, PHASE_EXECUTING, EVENT_STREAM_TTL],
+    )
+
+    return int(held) == 1
 
 
 def stream_key(job_id: str) -> str:
@@ -1461,31 +1534,34 @@ def run_job(conn: redis.Redis, job: dict) -> None:
         # terminal events on a stream the browser closed at the first, and two
         # accruals against one job_id.
         #
-        # Abandon rather than fail: the retry is running and will report for
-        # both of us, so a `failed` here would close a browser that is watching
-        # work which is going to succeed. Nothing is emitted, nothing is
-        # billed, and main()'s LREM already declines to delete a payload the
-        # reaper may have re-queued behind it.
-        if not still_ours(conn, job_id):
+        # Point 6, the other half, in the same write: ComfyUI is about to be
+        # handed the workflow, and "executing" is written BEFORE the POST
+        # rather than after it returns, because ComfyUI has the prompt from
+        # the moment the request is written — the round trip is a window in
+        # which a death would otherwise be read as "nothing ran" and replayed
+        # onto a second GPU, which is the one thing the narrow retry exists to
+        # prevent. The cost of being early is a job that dies inside the POST
+        # and is not retried; the cost of being late is a poison workflow
+        # walking the pool, so this errs early on purpose. Written BEFORE the
+        # `accepted` event for the same reason: this is the flag that decides
+        # a death's fate, and the event is only a thing to look at. From here
+        # on, every death this job suffers is terminal.
+        #
+        # One compare-and-set rather than a read and then a write, because a
+        # reap can land between the two (see CLAIM_EXECUTING_LUA). Abandon
+        # rather than fail when it does: the retry is running and will report
+        # for both of us, so a `failed` here would close a browser that is
+        # watching work which is going to succeed. Nothing is emitted, nothing
+        # is billed, and main()'s LREM already declines to delete a payload
+        # the reaper may have re-queued behind it.
+        if TEST_DELAY_BEFORE_CLAIM_S:
+            time.sleep(TEST_DELAY_BEFORE_CLAIM_S)  # see TEST_DELAY_BEFORE_CLAIM_S
+
+        if not claim_executing(conn, job_id):
             log(f"job {job_id}: reaped while this worker was still alive — "
                 f"another attempt owns it now, abandoning before submit "
                 f"(incarnation {WORKER_INCARNATION})")
             return
-
-        # Point 6, the other half: ComfyUI is about to be handed the workflow.
-        # BEFORE the POST rather than after it returns, because ComfyUI has the
-        # prompt from the moment the request is written — the round trip is a
-        # window in which a death would otherwise be read as "nothing ran" and
-        # replayed onto a second GPU, which is the one thing the narrow retry
-        # exists to prevent. The cost of being early is a job that dies inside
-        # the POST and is not retried; the cost of being late is a poison
-        # workflow walking the pool, so this errs early on purpose.
-        #
-        # Written BEFORE the `accepted` event for the same reason: this is the
-        # flag that decides a death's fate, and the event is only a thing to
-        # look at. From here on, every death this job suffers is terminal.
-        conn.hset(state_key(job_id), PHASE_FIELD, PHASE_EXECUTING)
-        conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
         prompt_id = submit_prompt(workflow)
 

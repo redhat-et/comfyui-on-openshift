@@ -61,8 +61,23 @@ Both scenarios wait for the system to go idle before counting, because on a
 broken implementation the second run happens AFTER the first terminal event
 that a tailing browser stops at — counting at the terminal event would read 1
 either way and pass on HEAD.
+
+  C. THE CLAIM ITSELF. (B) proves the fence works when the requeue lands
+     while the worker is parked BEFORE it. The fence used to be a bare HGET
+     followed, separately, by the HSET that writes "executing" and then the
+     submit — so a requeue landing between the read and the write was read
+     as "still mine", the phase was written over the retry's "queued", and
+     the workflow was submitted beside the retry: the exact replay (B)
+     exists to prevent, one line further down. The window is microseconds,
+     which is why (B) cannot reach it and why this scenario runs an agent of
+     its own with TEST_DELAY_BEFORE_CLAIM_S set (worker_agent.py; test-only,
+     documented there): the agent pauses inside the window, the check
+     deletes its heartbeat key until the reaper has genuinely requeued the
+     job, and the agent then reaches the claim with the reap already
+     stamped. The claim has to be a compare-and-set that fails there —
+     ComfyUI handed the workflow once, one terminal event, the retry's.
 """
-import json, os, subprocess, sys, time, urllib.request, uuid
+import json, os, signal, subprocess, sys, time, urllib.request, uuid
 import redis
 import websocket
 
@@ -422,6 +437,122 @@ check("the job's own state agrees it completed, once",
 check("attempt_count reads 1 — requeued once, and only once",
       state.get("attempt_count") == "1", state.get("attempt_count"))
 check("the worker survived the whole scenario", alive(agent_pid), agent_pid)
+
+
+print("\n== C: a reap that lands between the ownership read and the claim "
+      "is noticed by the claim itself")
+
+WORKER_AGENT = os.environ["WORKER_AGENT"]
+
+# Long enough for the reaper to act inside it (a deleted heartbeat plus one
+# REAPER_INTERVAL tick), short enough to stay well inside the drain budget.
+CLAIM_DELAY_S = HEARTBEAT_TTL
+
+
+def wait_gone(pid, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not alive(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def start_agent(hostname, env_extra, timeout=30):
+    env = dict(os.environ)
+    env["HOSTNAME"] = hostname
+    env.update(env_extra)
+    log_file = open(f"agent-{hostname}.log", "w")
+    proc = subprocess.Popen([sys.executable, WORKER_AGENT], env=env,
+                            stdout=log_file, stderr=subprocess.STDOUT)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if heartbeat_keys(r, hostname) or proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    return proc
+
+
+# The suite's agent stands down (SIGTERM while idle — it exits and deletes
+# its own key; run.sh restarts one for the next check), and an agent with
+# the pause in the window takes its place.
+os.kill(agent_pid, signal.SIGTERM)
+check("the suite's agent exited on SIGTERM", wait_gone(agent_pid), agent_pid)
+deadline = time.time() + 15
+while time.time() < deadline and r.keys("comfy:worker:*"):
+    time.sleep(0.1)
+check("no worker is registered before this scenario starts its own",
+      not r.keys("comfy:worker:*"), r.keys("comfy:worker:*"))
+
+hostname_c = f"claim-pod-{uuid.uuid4().hex[:6]}"
+agent_c = start_agent(hostname_c, {"TEST_DELAY_BEFORE_CLAIM_S": str(CLAIM_DELAY_S)})
+
+try:
+    check("this scenario's agent is up and heartbeating",
+          agent_c.poll() is None and bool(heartbeat_keys(r, hostname_c)), hostname_c)
+
+    probe_c = f"claim-{uuid.uuid4().hex[:8]}"
+    job_c = post("/api/generate", {"workflow": {probe_c: {"class_type": "KSampler"}}})["job_id"]
+    queue_watcher = watcher()
+
+    st = await_pickup(job_c)
+    check("the worker picked the job up (status running, phase 'dispatched')",
+          st.get("status") == "running" and st.get("phase") == "dispatched", st)
+
+    # It is now in the pause: past the connect, past the cancel check, past
+    # the read that said "still mine", and before the write that claims.
+    # Give it a moment to get there, then make the reaper act.
+    time.sleep(1.0)
+    check("and ComfyUI has not been handed the workflow — the agent is paused "
+          "before the claim", handoffs(probe_c) == 0, handoffs(probe_c))
+
+    requeued = False
+    deadline = time.time() + CLAIM_DELAY_S - 2
+    while time.time() < deadline:
+        for key in heartbeat_keys(r, hostname_c):
+            r.delete(key)
+        if r.hget(state_key(job_c), "attempt_count") == "1":
+            requeued = True
+            break
+        time.sleep(0.05)
+
+    check("the fixture reproduced: the reaper requeued the job while the "
+          "worker was paused between its ownership read and its claim "
+          "(attempt_count 1)", requeued, r.hgetall(state_key(job_c)))
+    check("and stamped the reaped owner on it, with ComfyUI still not handed "
+          "the workflow", r.hget(state_key(job_c), "owner") == "#reaped"
+          and handoffs(probe_c) == 0,
+          (r.hget(state_key(job_c), "owner"), handoffs(probe_c)))
+    check("the paused worker is alive — nothing killed it", agent_c.poll() is None)
+
+    kinds, terminal = drain(job_c)
+    check("the job reached a terminal state", terminal is not None, kinds)
+    check("and it completed — the requeued attempt ran it",
+          terminal and terminal["type"] == "completed", terminal["type"] if terminal else None)
+    check("the system went idle before anything below is counted",
+          wait_idle(hostname_c), hostname_c)
+
+    queue_writes, queue_write_cmds = queue_watcher.stop()
+    check("the reaper wrote this job back onto comfy:queue exactly once",
+          queue_writes == 1, queue_write_cmds)
+    check("ComfyUI was handed this workflow exactly once — the claim saw the "
+          "reap that landed after the ownership read and refused, so the "
+          "original attempt never submitted beside the retry",
+          handoffs(probe_c) == 1, handoffs(probe_c))
+    check("exactly one terminal event landed on the job's stream",
+          terminal_events(job_c) == ["completed"], terminal_events(job_c))
+    state = r.hgetall(state_key(job_c))
+    check("the job's own state agrees: completed, once, requeued once",
+          state.get("status") == "completed" and state.get("attempt_count") == "1", state)
+    check("this scenario's worker survived it", agent_c.poll() is None, agent_c.poll())
+
+finally:
+    if agent_c.poll() is None:
+        agent_c.terminate()
+        try:
+            agent_c.wait(timeout=15)
+        except Exception:  # noqa: BLE001
+            agent_c.kill()
 
 print()
 if failures:
