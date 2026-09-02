@@ -43,7 +43,7 @@ import json, os, signal, sys, time, uuid
 
 from harness import (
     GW, QUEUE_KEY, check, comfy_saw, connect_redis, failures, payload_key,
-    start_agent as _start_agent, state_key, stop_agent, stream_key, wait_for,
+    start_agent, state_key, stop_agent, stream_key, wait_for,
 )
 
 r = connect_redis()
@@ -78,13 +78,6 @@ def queued_raw(job_id):
             continue
 
     return None
-
-
-def start_extra_agent(hostname, timeout=30):
-    """A worker agent of this check's own, identified by a fixed HOSTNAME so
-    its heartbeat key is findable (worker_ids.py, harness.start_agent's
-    ready="heartbeat" default) rather than parsed off log output."""
-    return _start_agent(hostname, timeout=timeout, r=r)
 
 
 agent_pid = int(sys.argv[1])
@@ -190,8 +183,9 @@ try:
 
     # Only now is there anything to pick it up, so the cancel provably landed
     # first -- this is "cancelled while queued", the case hub.py's cancel()
-    # docstring says never starts.
-    agent2 = start_extra_agent("q2-cancel-agent")
+    # docstring says never starts. Findable by its fixed HOSTNAME
+    # (worker_ids.py) -- harness.start_agent's ready="heartbeat" default.
+    agent2 = start_agent("q2-cancel-agent", r=r)
 
     settled = wait_for(lambda: r.hget(state_key(job_b2), "status") in ("cancelled", "failed", "completed"),
                        timeout=45)

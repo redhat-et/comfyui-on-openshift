@@ -81,7 +81,7 @@ import os, signal, sys, time, uuid
 
 from harness import (
     COMFY, GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, alive, check,
-    connect_redis, drain as _drain, failures, handoffs, start_agent as _start_agent,
+    connect_redis, drain as _drain, failures, handoffs, start_agent,
     state_key, terminal_events as _terminal_events, wait_gone,
 )
 from queue_watch import QueueWriteWatcher
@@ -350,10 +350,6 @@ print("\n== C: a reap that lands between the ownership read and the claim "
 CLAIM_DELAY_S = HEARTBEAT_TTL
 
 
-def start_agent(hostname, env_extra, timeout=30):
-    return _start_agent(hostname, env_extra, timeout=timeout, r=r)
-
-
 # The suite's agent stands down (SIGTERM while idle — it exits and deletes
 # its own key; run.sh restarts one for the next check), and an agent with
 # the pause in the window takes its place.
@@ -366,7 +362,7 @@ check("no worker is registered before this scenario starts its own",
       not r.keys("comfy:worker:*"), r.keys("comfy:worker:*"))
 
 hostname_c = f"claim-pod-{uuid.uuid4().hex[:6]}"
-agent_c = start_agent(hostname_c, {"TEST_DELAY_BEFORE_CLAIM_S": str(CLAIM_DELAY_S)})
+agent_c = start_agent(hostname_c, {"TEST_DELAY_BEFORE_CLAIM_S": str(CLAIM_DELAY_S)}, r=r)
 
 try:
     check("this scenario's agent is up and heartbeating",

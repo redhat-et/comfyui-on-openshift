@@ -80,15 +80,6 @@ sys.stdout.reconfigure(line_buffering=True)
 
 r = connect_redis()
 
-# start_extra_agent(): a second, independent worker agent identified by a
-# fixed HOSTNAME so its heartbeat key is findable (worker_ids.py) rather than
-# parsed off log output, logging to its own agent-<hostname>.log (run.sh's
-# `cat agent*.log` picks it up too) -- harness.start_agent's ready="heartbeat"
-# default.
-def start_extra_agent(hostname, timeout=30):
-    return start_agent(hostname, timeout=timeout, r=r)
-
-
 agent_pid = int(sys.argv[1])
 agent2 = None
 
@@ -141,8 +132,10 @@ try:
     os.kill(agent_pid, signal.SIGKILL)
 
     # A fresh agent has to exist for the retried job to land on, or nothing on
-    # this laptop is polling comfy:queue once the original is dead.
-    agent2 = start_extra_agent("q2-retry-agent")
+    # this laptop is polling comfy:queue once the original is dead. Findable
+    # by its fixed HOSTNAME (worker_ids.py) rather than parsed off log output
+    # -- harness.start_agent's ready="heartbeat" default.
+    agent2 = start_agent("q2-retry-agent", r=r)
 
     kinds, terminal = drain(job_id, timeout=40)
 

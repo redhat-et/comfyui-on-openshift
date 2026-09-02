@@ -53,7 +53,7 @@ import os, signal, sys, time, uuid
 
 from harness import (
     check, comfy_saw, connect_redis, drain, excluded_total, failures, showback,
-    start_agent as _start_agent, state_key, stop_agent, user_total, wait_for,
+    start_agent, state_key, stop_agent, user_total, wait_for,
 )
 from harness import GW
 from worker_ids import heartbeat_keys, processing_keys
@@ -70,14 +70,12 @@ USER = f"restart-{uuid.uuid4().hex[:8]}@example.com"
 
 r = connect_redis()
 
-
-def start_agent(tag, timeout=40):
-    """An agent under this check's fixed HOSTNAME. ready="log": the whole
-    point of this check is a second incarnation under an identity whose
-    heartbeat key is ALREADY there, so heartbeat existence cannot tell 'the
-    replacement is up' from 'its predecessor's key has not expired yet' --
-    see harness.start_agent's own docstring on this exact fixture."""
-    return _start_agent(HOSTNAME, timeout=timeout, tag=tag, ready="log")
+# Both incarnations below start under this fixed HOSTNAME with ready="log":
+# the whole point of this check is a second incarnation under an identity
+# whose heartbeat key is ALREADY there, so heartbeat existence cannot tell
+# "the replacement is up" from "its predecessor's key has not expired yet" --
+# see harness.start_agent's own docstring on this exact fixture.
+AGENT_TIMEOUT = 40
 
 
 handed_pid = int(sys.argv[1])
@@ -100,7 +98,7 @@ try:
 
     print(f"\n== incarnation 1 of pod {HOSTNAME} picks up a job and gets it into ComfyUI")
 
-    first = start_agent("first")
+    first = start_agent(HOSTNAME, timeout=AGENT_TIMEOUT, tag="first", ready="log")
 
     hb = heartbeat_keys(r, HOSTNAME)
     check("incarnation 1 registered exactly one heartbeat under this pod name",
@@ -146,7 +144,7 @@ try:
     os.kill(first.pid, signal.SIGKILL)
     t_killed = time.time()
 
-    second = start_agent("second")
+    second = start_agent(HOSTNAME, timeout=AGENT_TIMEOUT, tag="second", ready="log")
     restart_gap = time.time() - t_killed
 
     check(f"incarnation 2 was polling {restart_gap:.1f}s after the kill, "

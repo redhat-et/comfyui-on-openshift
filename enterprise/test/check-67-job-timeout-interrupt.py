@@ -48,7 +48,7 @@ import os, signal, sys, time, uuid
 
 from harness import (
     COMFY, GW, alive, check, connect_redis, drain, failures, handoffs,
-    start_agent as _start_agent, stop_agent as _stop_agent, wait_gone,
+    start_agent, stop_agent as _stop_agent, wait_gone,
 )
 from worker_ids import heartbeat_keys
 
@@ -75,13 +75,6 @@ def interrupts():
 def comfy_queue():
     q = COMFY.get("/queue")
     return q.get("queue_running", []), q.get("queue_pending", [])
-
-
-def start_agent(hostname, env_extra, timeout=30):
-    """A worker agent of this check's own, under a fixed HOSTNAME so its
-    keys are findable (worker_ids.py), logging to agent-<hostname>.log so
-    run.sh's failure-path `cat agent*.log` shows it."""
-    return _start_agent(hostname, env_extra, timeout=timeout, r=r)
 
 
 def stop_agent(proc):
@@ -113,7 +106,7 @@ try:
 
     hostname = f"timeout-pod-{uuid.uuid4().hex[:6]}"
     agent = start_agent(hostname, {"JOB_TIMEOUT": str(JOB_TIMEOUT),
-                                   "INTERRUPT_DRAIN_TIMEOUT": str(DRAIN_TIMEOUT)})
+                                   "INTERRUPT_DRAIN_TIMEOUT": str(DRAIN_TIMEOUT)}, r=r)
     check("this check's agent is up and heartbeating",
           agent.poll() is None and bool(heartbeat_keys(r, hostname)), hostname)
 
