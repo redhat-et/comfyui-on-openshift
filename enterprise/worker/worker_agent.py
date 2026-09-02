@@ -1014,6 +1014,26 @@ signal.signal(signal.SIGINT, handle_sigterm)
 # defaults. See docs/09-engineering-handoff.md §3.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# BEGIN SHARED WORKSPACE — the submitter's directory name (docs/10-roadmap.md, Q3)
+#
+# worker_agent.py's BEGIN OUTPUT WORKSPACES gives every submitter one
+# directory under OUTPUT_ROOT, named from the envelope's `user`. This is the
+# NAMING half of that, and nothing else — the pure functions and the
+# constants they read. It is MIRRORED VERBATIM between enterprise/gateway/
+# hub.py and enterprise/worker/worker_agent.py for the same reason the
+# envelope and the showback accumulator are: hub.py's output_file() has to
+# compute the same name from the same identity to decide, under
+# AUTH_MODE=oauth, whether a caller is reading their own workspace, and
+# rewrite_image_urls() has to refuse the same filename shapes the worker
+# refuses — a gateway that spelled either rule differently would refuse
+# everyone their own files, or serve what the worker would not name, with
+# nothing failing anywhere to say so. scripts/lint.sh diffs the two copies
+# line for line. The directory mode, the prefix rewrite and everything that
+# touches the volume stay the worker's alone — the gateway mounts it
+# read-only.
+# ---------------------------------------------------------------------------
+
 # Where a job with no authenticated submitter goes. Deliberately not "" (which
 # would put anonymous output loose in the shared root again) and deliberately
 # not derivable from any username: a real workspace is always
@@ -1028,6 +1048,39 @@ WORKSPACE_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
 # before hub.py's own 256-character clamp on the header.
 MAX_WORKSPACE_SLUG_CHARS = 40
 WORKSPACE_DIGEST_CHARS = 12
+
+
+def workspace_name(user: str) -> str:
+    """The submitter's directory name. Total, never raises, never rejects."""
+    if not user:
+        return ANON_WORKSPACE
+
+    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
+    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
+
+    # .strip("-") again: the truncation above can leave a trailing separator.
+    # "user" when nothing readable survived — the digest still separates two
+    # such names from each other.
+    return f"{slug.strip('-') or 'user'}-{digest}"
+
+
+def is_bare_filename(name: str) -> bool:
+    """
+    True iff `name` is a single path component: no separator, no NUL, and not
+    "." or "..". This is the confinement rule for the REPORTED FILENAME,
+    mirroring what workspace_path() already enforces for the reported
+    workspace — a run of unsafe characters cannot be un-collapsed into a
+    traversal the way a raw "/" or ".." can.
+
+    ComfyUI's own manifest entries never put a separator in `filename`;
+    `subfolder` is the only field a save node uses to nest. So a `filename`
+    that fails this is not ComfyUI's own shape and is refused outright rather
+    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    """
+    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+
+# END SHARED WORKSPACE
+# ---------------------------------------------------------------------------
 
 # setgid + group-writable. Both halves are load-bearing under an arbitrary UID:
 # g+w is what lets the NEXT pod write here at all, and setgid is what makes the
@@ -1053,20 +1106,6 @@ OUTPUTS_URL_PREFIX = "/outputs/"
 # mechanism: ComfyUI is a long-lived process started with ONE fixed
 # --output-directory, so there is no per-job flag to set instead.
 FILENAME_PREFIX_INPUT = "filename_prefix"
-
-
-def workspace_name(user: str) -> str:
-    """The submitter's directory name. Total, never raises, never rejects."""
-    if not user:
-        return ANON_WORKSPACE
-
-    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
-    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
-
-    # .strip("-") again: the truncation above can leave a trailing separator.
-    # "user" when nothing readable survived — the digest still separates two
-    # such names from each other.
-    return f"{slug.strip('-') or 'user'}-{digest}"
 
 
 def workspace_path(workspace: str) -> pathlib.Path:
@@ -1227,22 +1266,6 @@ def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
         scoped += 1
 
     return scoped
-
-
-def is_bare_filename(name: str) -> bool:
-    """
-    True iff `name` is a single path component: no separator, no NUL, and not
-    "." or "..". This is the confinement rule for the REPORTED FILENAME,
-    mirroring what workspace_path() already enforces for the reported
-    workspace — a run of unsafe characters cannot be un-collapsed into a
-    traversal the way a raw "/" or ".." can.
-
-    ComfyUI's own manifest entries never put a separator in `filename`;
-    `subfolder` is the only field a save node uses to nest. So a `filename`
-    that fails this is not ComfyUI's own shape and is refused outright rather
-    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
-    """
-    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
 
 
 def is_confined_subfolder(subfolder: str) -> bool:
