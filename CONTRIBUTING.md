@@ -14,16 +14,17 @@ make test
 
 That runs the shell unit tests first (`scripts/unit-tests.sh` — instant, no
 dependencies, pins the parsing edge cases like AWS CLI's tab-separated
-output), then the e2e suite.
+output), then the pytest layer (`enterprise/test/unit/`, the pure functions
+in both Python files, under a second), then the e2e suite.
 
 Install from the requirements file rather than a bare `pip install redis` —
 the `redis<7` pin is load-bearing (redis-py 8 breaks blocking reads; the
 requirements file says why).
 
-289 assertions — 29 shell unit, 260 end-to-end across 17 check files — in
-about a minute. `enterprise/test/README.md` explains what each one is
-defending against and why. Run it before sending a change to `hub.py` or
-`worker_agent.py`.
+40 shell unit assertions, 210 pytest cases, and 369 end-to-end assertions
+across 21 check files, in about a minute. `enterprise/test/README.md`
+explains what each one is defending against and why. Run it before sending a
+change to `hub.py` or `worker_agent.py`.
 
 Adding an assertion means adding a file: `run.sh` discovers every
 `enterprise/test/check*.py`, so a new check needs no second edit anywhere. The
@@ -50,10 +51,20 @@ Service that regained the gateway's own port, a Containerfile that lost its
 `chgrp 0` block, a GPU pod whose memory limit no longer fits the smallest
 supported instance. The e2e suite runs no cluster and reads no manifest, so it
 cannot see any of them. `scripts/lint.sh` also pins shapes in the Python and
-shell the suite *does* run but cannot see the failure of — the twelve rules
+shell the suite *does* run but cannot see the failure of — the ten greps
 under "load-bearing file shapes", plus the retry counter, the fair-queueing
 insert, the showback accumulator and the quota breaker's distance from
-`readyz()`.
+`readyz()`. Three blocks are mirrored verbatim between `hub.py` and
+`worker_agent.py` because the two ship in different images — the queue
+envelope, the showback accrual and the workspace naming (`BEGIN/END SHARED
+WORKSPACE`) — and lint diffs each pair; a fourth rule compares the
+`state_key`/`stream_key`/`payload_key` bodies, the `EVENT_STREAM_TTL` default
+and the cancel field between the files by AST, so change both or neither. The
+manifest rules parse the YAML for the shapes the audit added: every
+Deployment selected by a NetworkPolicy, `automountServiceAccountToken: false`,
+the worker's `comfy-worker` ACL user starting from `-@all` and not widened,
+and a warm floor (`WARM_WORKERS`) that does not exceed `maxReplicaCount`.
+Each has a fixture under `scripts/lint-fixtures/` that must fail.
 CI (`.github/workflows/ci.yaml`) runs exactly `make lint` and `make test` on
 every pull request — a red check on those means the same command fails for
 you locally — plus two jobs that need more than a laptop usually has lying
@@ -61,7 +72,11 @@ around: `comfyui-smoke` boots the real pinned ComfyUI on CPU and asserts the
 `--models-directory` path contract (runnable locally:
 `MODELS_DIR=/tmp/m OUTPUT_DIR=/tmp/o scripts/ci-smoke-comfyui.sh`), and
 `image-uid` builds the gateway image and runs it as an arbitrary high UID,
-the way OpenShift's restricted-v2 SCC will.
+the way OpenShift's restricted-v2 SCC will, then scans it for known CVEs
+without blocking the PR. The `lint` job also validates every manifest against
+the Kubernetes, OpenShift and KEDA schemas with kubeconform. The two GPU
+images are too large for a PR job; `nightly.yaml` builds each once a night,
+boots it as an arbitrary UID on CPU, and runs the scan that does gate.
 
 Shell is Allman-braced with blank lines between logical sections; keep it that
 way. Variable names are descriptive except for loop counters and well-known

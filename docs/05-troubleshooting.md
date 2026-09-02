@@ -140,6 +140,64 @@ oc get secret aws-efs-cloud-credentials -n openshift-cluster-csi-drivers \
 Timeout on mount → no mount target in the node's subnet, or the security group
 does not allow 2049 from the VPC CIDR.
 
+## The namespace is default-deny (multi-user)
+
+`enterprise/manifests/06-network-policy.yaml` denies everything in both
+directions and then allows six specific flows. The failures it produces all
+look the same from the outside — a pod that is `Running` and `Ready`, probes
+green, and every connection it opens or should receive timing out with no
+event anywhere — so check the policy before the application.
+
+**The Route stops answering right after `setup.sh`, gateway pod healthy.**
+The `gateway-ingress` policy admits the router's traffic from a pod in
+`openshift-ingress`. That is right on ROSA and on any cluster whose
+IngressController publishes through a LoadBalancer Service. Where the router
+runs on the **host network** — some bare-metal and single-node installs — the
+traffic arrives from a node address, no `namespaceSelector` matches it, and
+the browser times out. Confirm with `oc get pods -n openshift-ingress -o wide`
+(host-network routers show the node's own IP), then either replace the first
+`from` entry with an `ipBlock` for your node network or, to prove the
+diagnosis, `oc delete networkpolicy gateway-ingress -n comfyui` and reload.
+
+**A second `setup.sh` run hangs on the image build, at `git fetch`.** Build
+pods need the internet — that is what `allow-build-egress` is for, matched on
+the `openshift.io/build.name` label every BuildConfig pod carries. If that
+policy is missing, or your build pods are labelled differently, the clone
+inside the build hangs rather than failing. `oc get networkpolicy -n comfyui`
+should list seven objects; `oc logs -n comfyui bc/comfy-worker` sitting on a
+fetch with no error is the tell.
+
+**The ScaledObject sits in `ScalerFailed`, queue growing, no workers.** The
+KEDA scaler dials Redis from its own operator pod in `openshift-keda`, and a
+bare `podSelector` means "pods in this namespace". `redis-allow-app-only`
+carries an explicit `openshift-keda` exception for exactly this; if someone
+tidied it away, this is the symptom.
+
+**`ENABLE_MANAGER=true` hangs, or a workflow's downloader node never
+finishes.** By design. `worker-egress-redis-only` gives a GPU pod a route to
+Redis and DNS and nothing else — not the internet, not S3, not the instance
+metadata service. Manager's node list and model downloads cannot fetch;
+`docs/06-enterprise-architecture.md` says why that is the stance and what to
+do instead.
+
+**A pod you added yourself can reach nothing.** Same cause. Every Deployment
+in the namespace must be selected by a policy of its own; `make lint` fails
+one that is not, but lint reads the manifests in this repository, not what
+you applied by hand.
+
+## A worker is restarted every few minutes with ComfyUI healthy (multi-user)
+
+The worker's liveness probe is two assertions in one `exec`: ComfyUI answers
+on loopback, *and* `AGENT_LIVENESS_FILE` (`/tmp/comfy-agent-alive`) is under
+120 seconds old. The agent touches that file on every pass of its loop, idle
+and mid-job, so a restart here means the agent stopped going round — parked
+on a Redis connection that is blackholed rather than refused, usually.
+`oc describe pod` shows the probe's output; `oc logs -c` the previous
+container shows where the agent was. If the restarts coincide with long
+generations, that is a regression in the agent's in-job touch, not a tuning
+problem: `check-68-agent-liveness-file.py` in `make test` asserts the mtime
+advances mid-job.
+
 ## Build fails
 
 ```bash

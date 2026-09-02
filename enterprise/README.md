@@ -39,6 +39,7 @@ Everything comes from the repo's `.env`. The variables this configuration adds:
 | `ENABLE_MANAGER` | `false` | bake in ComfyUI-Manager; read the security note first |
 | `COMFYUI_REF` | a commit SHA | the ComfyUI revision to build; the default is the commit `v0.32.0` points at, and a tag or branch works too |
 | `QUOTA_GPU_SECONDS` | `0` (off) | per-user GPU-second quota per UTC month; over it, `/api/generate` refuses with 429 and says when it resets. Reads the same accounting `/api/showback` reports, and fails open |
+| `SHOWBACK_OPERATORS` | empty | comma-separated identities, as oauth-proxy reports them, who may read every submitter's row of `/api/showback` under `AUTH_MODE=oauth`. Everyone else gets their own row plus the pool totals. Ignored under `none` |
 
 Changing `AUTH_MODE` is also just an edit-and-re-run: switching oauth → none,
 `setup.sh` detects the leftover oauth-proxy sidecar and recreates the gateway
@@ -162,6 +163,16 @@ No separate user database, and access shows up in the cluster audit log. Each
 job also records who submitted it — the gateway stamps the oauth-proxy's
 authenticated username into the job state, so `GET /api/jobs/<id>` answers
 "whose job is this?" when the GPU bill asks.
+
+Under `oauth` that identity also scopes what a caller can read: `/outputs/...`
+serves only files inside the caller's own workspace (anyone else's is a 403),
+and `/api/showback` returns only the caller's row and the pool totals unless
+they are in `SHOWBACK_OPERATORS`. Under `none` neither is scoped, because the
+identity is a header the caller wrote. The workspace a user lands in is a
+pure function of their username — an allowlist slug plus twelve hex of its
+`sha256`, computed after NFC-normalising the string so that the composed and
+decomposed spellings of one accented name share one directory — and the same
+function is mirrored into the gateway so it can make the check.
 
 ## Custom nodes
 

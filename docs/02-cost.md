@@ -29,9 +29,16 @@ on top of what you pay AWS for the card.
 | Pattern | Monthly |
 |---|---:|
 | Left running 24/7 | ~$1,490 |
-| Weekdays 9–6, `make park` nightly | ~$800 |
-| Weekdays 9–6, `make down` nightly | ~$370 |
-| Occasional — up for a day a week | ~$85 |
+| Weekdays 9–6, `make park` nightly | ~$965 |
+| Weekdays 9–6, `make down` nightly | ~$425 |
+| Occasional — up for a day a week | ~$114 |
+
+Every row is the three rates above against a 730-hour month. Weekdays 9–6 is
+~195 running hours (730 × 5/7 × 9/24); the other 535 are billed at the parked
+or the torn-down rate. One day a week is ~39 running hours. So: 2.04 × 730;
+2.04 × 195 + 1.06 × 535; 2.04 × 195 + 0.05 × 535; 2.04 × 39 + 0.05 × 691.
+The nightly teardown row is a **~70% cut** from the first row, and it is one
+cron line.
 
 Plus AWS Business support at the greater of $100/month or 10% of usage, which
 bills whether or not a cluster exists.
@@ -41,7 +48,7 @@ bills whether or not a cluster exists.
 `make park` scales the GPU pool to zero. Takes seconds, comes back in ~5
 minutes, keeps your volumes and models. But it only removes $0.98/hour — the
 control plane fee, two base workers, and NAT gateway are $1.06/hour on their
-own, which is $760/month of doing nothing.
+own, which is ~$775/month of doing nothing.
 
 `make down` deletes the cluster. Takes ~10 minutes, comes back in ~15, and drops
 you to ~$0.05/hour. It destroys gp3 volumes, so your models go with it.
@@ -84,6 +91,19 @@ Three caveats before trusting it:
 - **Monday's `make up` rebuilds the single-user stack.** For the multi-user
   configuration, use `make cluster gpu storage && enterprise/setup.sh` in that
   line instead.
+
+## The warm floor, priced
+
+The multi-user configuration has one more knob that spends money on a
+schedule: `WARM_WORKERS` holds N GPU workers between `WARM_START` and
+`WARM_END` so the first job of the morning does not pay the 8–17 minute cold
+start (`enterprise/README.md`). Price it the same way as the rows above: one
+`g6.xlarge` is $0.976/hour all-in — $0.805 to AWS and $0.171 to Red Hat for
+its four vCPUs — so one warm card on weekdays 9–6 is 0.976 × 195 ≈ **$190 a
+month**, and N cards are N times that, on top of whatever the queue itself
+provokes. It is off by default. The README's "Sizing the pool" section says
+how many to hold for a given team, and when holding them stops being cheaper
+than a card each.
 
 ## Where the money actually goes if you are not careful
 
