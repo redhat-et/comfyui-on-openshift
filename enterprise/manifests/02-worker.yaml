@@ -134,6 +134,18 @@ spec:
             - name: TORCH_HOME
               value: /models/.cache/torch
 
+            # The file worker_agent.py touches on every pass of its main loop,
+            # and the file the liveness probe below stats. Named here rather
+            # than left to the agent's default so that the two halves of one
+            # health check are wired from one place — a probe pointed at a path
+            # nothing writes fails every worker in the pool, sixty seconds
+            # apart, forever.
+            #
+            # It lives on the scratch emptyDir, which is the only writable path
+            # in the container that is not shared with another pod.
+            - name: AGENT_LIVENESS_FILE
+              value: /tmp/comfy-agent-alive
+
           # Requests equal limits on every resource, which is not a style
           # choice — it is the QoS class. Read the numbers first, then why
           # they are equal.
@@ -244,17 +256,44 @@ spec:
             periodSeconds: 10
             failureThreshold: 90
 
+          # TWO processes, ONE container, and therefore one liveness probe that
+          # has to answer for both. start.sh runs ComfyUI and the agent side by
+          # side; a container may only declare one livenessProbe, so the two
+          # assertions are `sh -ec` and two lines rather than two probes.
+          #
+          # The first line is the original: can ComfyUI answer? It binds
+          # loopback, so nothing outside the container can ask — an exec probe
+          # runs in the container's network namespace and can.
+          #
+          # The second line is the half that was missing, and it is the one
+          # that catches the expensive failure. The agent can be alive,
+          # connected and completely wedged — parked in a BLMOVE against a
+          # blackholed TCP connection, say — while ComfyUI answers /system_stats
+          # perfectly. The pod stays Ready, holds a card at ~$0.80/hour, and
+          # takes no work, indefinitely. worker_agent.py touches
+          # AGENT_LIVENESS_FILE on every pass of its main loop; if that file is
+          # more than two minutes old the agent has stopped going round.
+          #
+          # THE CONTRACT THIS DEPENDS ON: the touch must happen on every pass
+          # INCLUDING while a job is running. Jobs legitimately run for
+          # JOB_TIMEOUT — 1800 seconds — so an agent that touched the file only
+          # between jobs would fail this probe in the middle of every long
+          # generation and be killed for working. That is a property of
+          # worker_agent.py, not of this file, and it is why the threshold is
+          # written in seconds here rather than derived from JOB_TIMEOUT.
+          #
+          # `stat -c %Y` is GNU stat, which is what UBI9 has. `sh -ec` so the
+          # first line failing is the probe failing, without an explicit exit.
+          # No initialDelaySeconds: the startupProbe above already gates this
+          # one, and it does not pass until ComfyUI has finished loading.
           livenessProbe:
             exec:
               command:
-                - python3
-                - -c
+                - sh
+                - -ec
                 - |
-                  import urllib.request, sys
-                  try:
-                      urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=10)
-                  except Exception:
-                      sys.exit(1)
+                  python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=10)"
+                  test $(( $(date +%s) - $(stat -c %Y "$AGENT_LIVENESS_FILE") )) -lt 120
             periodSeconds: 60
             failureThreshold: 3
 
