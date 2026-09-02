@@ -32,13 +32,28 @@ import redis
 WRITE_COMMANDS = {"LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LINSERT"}
 
 
+def is_queue_write(parts, key):
+    """The default test: one of WRITE_COMMANDS naming `key` as an argument.
+    `parts` is the executed command split on whitespace, its first element
+    the command name as MONITOR rendered it."""
+    return bool(parts) and parts[0].upper() in WRITE_COMMANDS and key in parts[1:]
+
+
 class QueueWriteWatcher:
     """Counts writes to `key` between start() and stop(), via a dedicated
     MONITOR connection -- a command log, so it cannot miss a write that gets
-    popped again before anything reads the list's length."""
+    popped again before anything reads the list's length.
 
-    def __init__(self, redis_url, password, key):
+    `matches` is the predicate applied to every command MONITOR renders,
+    called as matches(parts, key) with the command split on whitespace. It
+    defaults to is_queue_write(), so an existing caller sees exactly the
+    behaviour above; a check counting something else on the same command
+    log -- the gateway's check-15 counts SCANs -- passes its own rather than
+    overriding _run()."""
+
+    def __init__(self, redis_url, password, key, matches=is_queue_write):
         self._key = key
+        self._matches = matches
         self._conn = redis.from_url(redis_url, password=password, decode_responses=True)
         self._monitor = self._conn.monitor()
         self._count = 0
@@ -54,7 +69,7 @@ class QueueWriteWatcher:
                 for entry in m.listen():
                     cmd = entry.get("command") or ""
                     parts = cmd.split()
-                    if parts and parts[0].upper() in WRITE_COMMANDS and self._key in parts[1:]:
+                    if self._matches(parts, self._key):
                         self._count += 1
                         self._lines.append(cmd)
         except Exception:  # noqa: BLE001 - stop() closes the socket to end
