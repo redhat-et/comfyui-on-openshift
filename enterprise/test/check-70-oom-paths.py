@@ -40,66 +40,14 @@ Always`) and the gateway's reaper fails the stranded job regardless. There is
 no start.sh
 in this harness; that half is check-30's SIGKILL territory and cluster day's.
 """
-import json, os, time, urllib.request
-import redis
-import websocket
+import time
 
+from harness import GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, check, connect_redis, drain, failures, state_key
 from queue_watch import QueueWriteWatcher
 
-GW = "http://127.0.0.1:8100"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-failures = []
+get, post = GW.get, GW.post
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-def post(path, body=None):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(GW + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
-
-def drain(job_id, timeout=90):
-    """Tail one job to its terminal event, with a real wall-clock deadline.
-
-    The deadline is absolute rather than a socket timeout: the gateway sends
-    keepalives, and a per-recv timeout is reset by every one of them, so a job
-    that never terminates would hang until run.sh's CHECK_TIMEOUT killed this
-    process with its output still in the buffer. Same reasoning as check-30.
-    """
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    deadline = time.time() + timeout
-    seen, terminal = [], None
-    while time.time() < deadline:
-        ws.settimeout(max(1.0, deadline - time.time()))
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        seen.append(m["type"])
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
-    return seen, terminal
+r = connect_redis()
 
 
 # ---------------------------------------------------------------------------
@@ -108,11 +56,7 @@ print("\n== VRAM OOM: terminal, with ComfyUI's own message, and never retried")
 # Armed before the submit, and counted rather than asserted absent. A watcher
 # started after the submit misses a requeue that beats MONITOR to the key --
 # the wave-2a re-gate proved exactly that against a live mutation.
-watcher = QueueWriteWatcher(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    os.environ.get("REDIS_PASSWORD") or None,
-    QUEUE_KEY,
-).start()
+watcher = QueueWriteWatcher(REDIS_URL, REDIS_PASSWORD, QUEUE_KEY).start()
 
 job = post("/api/generate", {"workflow": {"__vram_oom__": {"class_type": "KSampler"}}})
 job_id = job["job_id"]

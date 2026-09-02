@@ -61,14 +61,15 @@ because an entry surviving a reap that failed somewhere earlier would prove
 nothing about the write this is actually about.
 """
 import hashlib, json, os, sys, time, uuid
-import redis
+
+from harness import (
+    TERMINAL_TYPES, check, connect_redis, events_of as _events_of, failures,
+    state_key, stream_key, terminal_events as _terminal_events, until,
+)
 
 # See check-30-sigkill.py: run.sh's stdout is a pipe, and a check killed by
 # CHECK_TIMEOUT loses every buffered PASS/FAIL line with it.
 sys.stdout.reconfigure(line_buffering=True)
-
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 
 # Both read the way hub.py reads them, so a run.sh that shrinks the tick or a
 # deployment that widens the attempt cap moves this check's budgets with it
@@ -81,64 +82,18 @@ REAP_MAX_ATTEMPTS = int(os.environ.get("REAP_MAX_ATTEMPTS", "5"))
 # hub.py that nobody meant should fail something.
 DEAD_KEY = "comfy:reap:undeliverable"
 
-TERMINAL_TYPES = {"completed", "failed", "cancelled"}
-
-failures = []
-
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-def stream_key(job_id):
-    return f"comfy:job:{job_id}:events"
+r = connect_redis()
 
 
 def events_of(job_id, wanted):
-    """The types of every event on the job's stream that is one of `wanted`,
-    over its whole history, in order."""
-    kinds = []
-
-    for _entry_id, fields in r.xrange(stream_key(job_id)):
-        try:
-            kind = json.loads(fields["data"]).get("type")
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
-
-        if kind in wanted:
-            kinds.append(kind)
-
-    return kinds
+    return _events_of(r, job_id, wanted)
 
 
 def terminal_events(job_id):
     """Every terminal event on the job's stream. One is a reaped job; two is
     a job reaped twice, which is what an entry removed only after success can
     get wrong in the other direction."""
-    return events_of(job_id, TERMINAL_TYPES)
-
-
-def until(predicate, timeout):
-    """Poll until the predicate holds, and report whether it ever did. The
-    caller asserts on state it reads itself afterwards -- this only decides
-    how long to wait."""
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        if predicate():
-            return True
-
-        time.sleep(0.2)
-
-    return False
+    return _terminal_events(r, job_id)
 
 
 def stranded(tag, job_id):

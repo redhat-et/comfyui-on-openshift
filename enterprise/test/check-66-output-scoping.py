@@ -42,30 +42,21 @@ system under test is who may READ a file, not how one gets written, and
 check-60 already owns that half.
 """
 import json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request, uuid
-import redis
-import websocket
+
+from harness import GW, check, connect_redis, drain as _drain, failures
 
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
+GW = GW.base_url
 OGW_PORT = 8103
 OGW = f"http://127.0.0.1:{OGW_PORT}"
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 
 OPERATOR = "ops@example.com"
 ALICE = f"scope-alice-{uuid.uuid4().hex[:6]}@example.com"
 BOB = f"scope-bob-{uuid.uuid4().hex[:6]}@example.com"
 
-failures = []
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
+r = connect_redis()
 
 
 def request(method, path, base=GW, user=None, body=None):
@@ -92,21 +83,7 @@ def seed_output():
 
 
 def drain(job_id, timeout=20):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
-    terminal = None
-    while True:
-        try:
-            m = json.loads(ws.recv())
-        except Exception:  # noqa: BLE001
-            break
-        if m.get("type") == "ping":
-            continue
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
+    _, terminal = _drain(job_id, timeout)
     return terminal
 
 

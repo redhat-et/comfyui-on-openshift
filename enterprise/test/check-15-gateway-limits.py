@@ -41,17 +41,13 @@ the assertion that needs the production-shaped stats path uses it directly.
 """
 import json, os, signal, subprocess, sys, threading, time, urllib.error, urllib.request, uuid
 import struct
-import redis
 import websocket
 
+from harness import GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, check, connect_redis, failures
 from queue_watch import QueueWriteWatcher
 
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 STATS_CACHE_SECONDS = float(os.environ.get("STATS_CACHE_SECONDS", "5"))
 
 DGW_PORT = 8102
@@ -62,18 +58,11 @@ SUBMITS = 12
 
 WORKFLOW = {"3": {"class_type": "KSampler", "inputs": {}}}
 
-failures = []
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
+r = connect_redis()
 agent_pid = int(sys.argv[1])
 
 
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def request(method, path, body=None, base=GW, headers=None):
+def request(method, path, body=None, base=GW.base_url, headers=None):
     hdrs = {"Content-Type": "application/json"}
     hdrs.update(headers or {})
     data = json.dumps(body).encode() if body is not None else None

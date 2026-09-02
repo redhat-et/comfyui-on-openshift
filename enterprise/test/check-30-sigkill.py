@@ -53,12 +53,15 @@ check can start a second agent of its own — proving scenario A needs one,
 since the agent this check is handed (argv[1]) is the one that dies in
 scenario A, and nothing between checks in run.sh restarts one mid-check.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, uuid
-import redis
-import websocket
+import os, signal, sys, time, uuid
 
+from harness import (
+    COMFY, GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, check, comfy_saw, connect_redis,
+    drain, failures, start_agent, state_key, stop_agent,
+)
 from queue_watch import QueueWriteWatcher
-from worker_ids import heartbeat_keys
+
+get, post = GW.get, GW.post
 
 # Line-buffer stdout explicitly, rather than trust the interpreter to pick
 # line buffering on its own. It only does that for a TTY; run.sh's stdout is
@@ -75,135 +78,7 @@ from worker_ids import heartbeat_keys
 # after itself.
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-WORKER_AGENT = os.environ["WORKER_AGENT"]
-failures = []
-
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body=None, base=GW):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(base + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path, base=GW):
-    return json.loads(urllib.request.urlopen(base + path, timeout=10).read())
-
-
-def comfy_saw(probe):
-    """Has the stub ComfyUI been handed a workflow carrying this node? It
-    records them as POST /prompt is entered, so this answers the question the
-    retry decision turns on — not "has it finished", "has it answered", or
-    "has the agent heard back", but "does ComfyUI have it"."""
-    return probe in get("/__received__", base=COMFY)["nodes"]
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-def drain(job_id, timeout=60):
-    """Tail the WebSocket to its terminal event. A `retry` event is not one of
-    the terminal types below, so if the gateway emits one the loop simply
-    keeps reading past it — which is exactly the "a browser tailing the
-    stream does not stop at it" claim, proven structurally rather than by a
-    special case.
-
-    `timeout` is a wall-clock deadline, checked every iteration, not a value
-    handed to ws.settimeout() once and left there. hub.py's own /ws/{job_id}
-    sends a 'ping' every 15s whenever nothing new is on the stream (its own
-    keepalive, so a browser tab notices a socket that died silently) — and a
-    ping resets ws.recv()'s per-call timeout right back to its own full
-    length. Against a wrong implementation that never emits a terminal event
-    at all, that ping arrives well inside any reasonable per-call timeout, so
-    recv() never actually raises: the loop skips the ping, as it must, and
-    waits again — forever, regardless of what `timeout` says, until run.sh's
-    CHECK_TIMEOUT kills the whole process. Recomputing the remaining time
-    before every recv() and shrinking ws.settimeout() to match is what makes
-    `timeout` an actual ceiling on the wait: a run with no terminal event ends
-    at `timeout` seconds no matter how many pings land inside that window.
-    """
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    deadline = time.time() + timeout
-    seen, terminal = [], None
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            print(f"  drain({job_id}): no terminal event within {timeout}s "
-                  f"-- gave up; events seen so far: {seen}")
-            break
-        ws.settimeout(remaining)
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        seen.append(m["type"])
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
-    return seen, terminal
-
-
-def start_extra_agent(hostname, timeout=30):
-    """A second, independent worker agent, identified by a fixed HOSTNAME so
-    its heartbeat key is findable rather than parsed off log output. Logs
-    to its own file (run.sh dumps agent*.log on failure; this one is named
-    for what it is) rather than the log run.sh already tracks for argv[1].
-
-    Findable, not predictable: the heartbeat key is named from the agent's
-    INCARNATION (worker_agent.py, note 9), which carries a nonce this process
-    cannot know, so readiness is a prefix match on the identity rather than an
-    EXISTS on a spelled-out key. See worker_ids.py."""
-    env = dict(os.environ)
-    env["HOSTNAME"] = hostname
-    # Named to match run.sh's own "agent*.log" glob, so its failure-path
-    # `cat agent*.log` picks this one up too.
-    log = open(f"agent-{hostname}.log", "w")
-    proc = subprocess.Popen(
-        [sys.executable, WORKER_AGENT], env=env,
-        stdout=log, stderr=subprocess.STDOUT,
-    )
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if heartbeat_keys(r, hostname):
-            return proc
-        if proc.poll() is not None:
-            return proc  # died on startup; later assertions will show it
-        time.sleep(0.2)
-    return proc
-
-
-def stop_agent(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=10)
-    except Exception:  # noqa: BLE001
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-
+r = connect_redis()
 
 agent_pid = int(sys.argv[1])
 agent2 = None
@@ -218,7 +93,7 @@ try:
     # stub's accept holds the agent there with the workflow still in its own
     # memory -- for 15s, which is a window rather than a race, and well inside
     # the agent's own 30s connect timeout.
-    post("/__stall_next_ws__", {"seconds": 15}, base=COMFY)
+    COMFY.post("/__stall_next_ws__", {"seconds": 15})
 
     probe = f"probe-{uuid.uuid4().hex[:8]}"
     job = post("/api/generate", {"workflow": {probe: {"class_type": "KSampler"}}})
@@ -233,11 +108,7 @@ try:
     # existed is already gone (queue_watch.py). Watching the write itself
     # instead makes "exactly once" a count of commands actually issued, not
     # an inference from a length that reads 0 whichever way this went.
-    queue_watcher = QueueWriteWatcher(
-        os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-        os.environ.get("REDIS_PASSWORD") or None,
-        QUEUE_KEY,
-    ).start()
+    queue_watcher = QueueWriteWatcher(REDIS_URL, REDIS_PASSWORD, QUEUE_KEY).start()
 
     deadline = time.time() + 10
     picked_up = False
@@ -261,8 +132,10 @@ try:
     os.kill(agent_pid, signal.SIGKILL)
 
     # A fresh agent has to exist for the retried job to land on, or nothing on
-    # this laptop is polling comfy:queue once the original is dead.
-    agent2 = start_extra_agent("q2-retry-agent")
+    # this laptop is polling comfy:queue once the original is dead. Findable
+    # by its fixed HOSTNAME (worker_ids.py) rather than parsed off log output
+    # -- harness.start_agent's ready="heartbeat" default.
+    agent2 = start_agent("q2-retry-agent", r=r)
 
     kinds, terminal = drain(job_id, timeout=40)
 
@@ -304,11 +177,7 @@ try:
     # initial insert, so what it counts from here is only a wrongly-issued
     # requeue -- which must be zero, since this death happens after execution
     # began and must stay a single terminal failure.
-    queue_watcher = QueueWriteWatcher(
-        os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-        os.environ.get("REDIS_PASSWORD") or None,
-        QUEUE_KEY,
-    ).start()
+    queue_watcher = QueueWriteWatcher(REDIS_URL, REDIS_PASSWORD, QUEUE_KEY).start()
 
     time.sleep(3)          # let agent2 pick it up and get into the job, well
                             # past ComfyUI's acceptance of the prompt

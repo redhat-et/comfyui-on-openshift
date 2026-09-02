@@ -57,30 +57,13 @@ one; the two ends of the list are then minutes apart in age, and the gauge is
 required to match the one at the served-next end. Both ages are read back off
 the queue itself rather than restated from the constant this file chose.
 """
-import json, os, re, signal, sys, time, urllib.error, urllib.request, uuid
-import redis
+import json, os, re, signal, sys, time, urllib.request, uuid
 
-GW = "http://127.0.0.1:8100"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
+from harness import GW, QUEUE_KEY, check, connect_redis, failures, poll_status as _poll_status
+
+get, post = GW.get, GW.post
+
 GAUGE_NAME = "comfy_estimated_wait_seconds"
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body, headers=None):
-    hdrs = {"Content-Type": "application/json"}
-    hdrs.update(headers or {})
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(), headers=hdrs)
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
 
 
 # /metrics and /api/stats serve one shared snapshot per STATS_CACHE_SECONDS
@@ -106,7 +89,7 @@ def read_metrics():
             r.expire(key, HEARTBEAT_TTL)
         time.sleep(0.2)
 
-    return urllib.request.urlopen(GW + "/metrics", timeout=10).read().decode()
+    return urllib.request.urlopen(GW.base_url + "/metrics", timeout=10).read().decode()
 
 
 def gauge_value(text, name):
@@ -136,25 +119,11 @@ def exposed_as_gauge(text, name):
     )
 
 
-def poll_status(job_id, terminal=("completed", "failed", "cancelled"), timeout=30):
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        try:
-            last = get(f"/api/jobs/{job_id}").get("status")
-            if last in terminal:
-                return last
-        except urllib.error.HTTPError:
-            pass
-        time.sleep(0.5)
-    return last
+def poll_status(job_id):
+    return _poll_status(GW, job_id, timeout=30, interval=0.5)
 
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
+r = connect_redis()
 
 agent_pid = int(sys.argv[1])
 WORKFLOW = {"3": {"class_type": "KSampler", "inputs": {}}}

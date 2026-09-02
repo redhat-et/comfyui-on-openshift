@@ -65,19 +65,11 @@ text. The path-traversal assertion later in that same file
 that this endpoint's static guard holds for ANY path, not that outputs are
 namespaced per user.
 """
-import glob, json, os, pathlib, sys, time, urllib.error, urllib.request, uuid
-import websocket
+import glob, json, os, pathlib, sys, urllib.error, urllib.request, uuid
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
+from harness import COMFY, GW, check, drain as _drain, failures
+
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
 
 
 def seed_output():
@@ -92,21 +84,7 @@ def seed_output():
 
 
 def drain(job_id, timeout=15):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
-    terminal = None
-    while True:
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
+    _, terminal = _drain(job_id, timeout)
     return terminal
 
 
@@ -116,14 +94,8 @@ def submit_and_wait(user, timeout=15):
     which hub.py's request.headers.get(..., "") treats identically -- both
     are exercised below, deliberately, because they are different requests
     even though this endpoint currently treats them the same."""
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     workflow = {"3": {"class_type": "KSampler", "inputs": {}}}
-    req = urllib.request.Request(
-        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     terminal = drain(resp["job_id"], timeout=timeout)
     images = (terminal or {}).get("data", {}).get("images", [])
     return images[0]["url"] if images else None
@@ -142,18 +114,12 @@ def submit_with_save_node(user, prefix, timeout=15):
     Returns (terminal_event, node_id) -- not a URL, because the property
     under test here is what ComfyUI actually received, not what the gateway
     reported back afterward."""
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     node_id = f"save-{uuid.uuid4().hex[:8]}"
     workflow = {
         "3": {"class_type": "KSampler", "inputs": {}},
         node_id: {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix}},
     }
-    req = urllib.request.Request(
-        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     return drain(resp["job_id"], timeout=timeout), node_id
 
 
@@ -161,8 +127,7 @@ def received_prefix(node_id):
     """The filename_prefix fake_comfy actually saw for `node_id` on the most
     recent /prompt that carried it -- None if it never arrived (the traversal
     case below, which must fail before ever reaching ComfyUI)."""
-    body = json.loads(urllib.request.urlopen(COMFY + "/__received_prefixes__", timeout=10).read())
-    return body.get(node_id)
+    return COMFY.get("/__received_prefixes__").get(node_id)
 
 
 def workspace_dirs(url):
@@ -187,7 +152,7 @@ def confined(url):
 
 def fetch_ok(url):
     try:
-        return len(urllib.request.urlopen(GW + url, timeout=10).read()) > 0
+        return len(urllib.request.urlopen(GW.base_url + url, timeout=10).read()) > 0
     except Exception:
         return False
 

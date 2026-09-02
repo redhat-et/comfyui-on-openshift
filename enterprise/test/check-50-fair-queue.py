@@ -64,47 +64,18 @@ millisecond clock, so comparing them is exact and immune to how fast or slow
 this script happens to poll. Polling only decides *when* it is safe to look
 (once every job has reached a terminal state).
 """
-import json, os, signal, sys, time, urllib.error, urllib.request
-import redis
+import json, os, signal, sys, time
 
-GW = "http://127.0.0.1:8100"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
+from harness import GW, QUEUE_KEY, check, connect_redis, failures, poll_status as _poll_status
+
+get, post = GW.get, GW.post
+
 WORKFLOW = {"3": {"class_type": "KSampler", "inputs": {}}}
 N = 5  # matches docs/10-roadmap.md's "a 5-job batch from one user"
 
-failures = []
 
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body, user=None):
-    headers = {"Content-Type": "application/json"}
-    if user:
-        headers["X-Forwarded-User"] = user
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(), headers=headers)
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
-
-
-def poll_status(job_id, terminal=("completed", "failed", "cancelled"), timeout=60):
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        try:
-            last = get(f"/api/jobs/{job_id}").get("status")
-            if last in terminal:
-                return last
-        except urllib.error.HTTPError:
-            pass
-        time.sleep(0.2)
-    return last
+def poll_status(job_id):
+    return _poll_status(GW, job_id, timeout=60, interval=0.2)
 
 
 def started_event_id(job_id):
@@ -123,11 +94,7 @@ def started_event_id(job_id):
     return None
 
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
+r = connect_redis()
 
 agent_pid = int(sys.argv[1])
 

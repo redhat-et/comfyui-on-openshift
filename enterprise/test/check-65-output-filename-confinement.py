@@ -50,37 +50,24 @@ naive join would resolve to.
     slash inside filename itself is never legitimate.
 """
 import json, os, pathlib, stat, sys, urllib.request
-import redis
-import websocket
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
+from harness import COMFY, GW, check, connect_redis, drain as _drain, failures, stream_key
+
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
-failures = []
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
+r = connect_redis()
 
 
 def stream_events(job_id):
     """Every event on the job's own stream, in order -- what the worker
     actually forwarded, before the gateway's per-socket rewrite touches it."""
     events = []
-    for _entry_id, fields in r.xrange(f"comfy:job:{job_id}:events"):
+    for _entry_id, fields in r.xrange(stream_key(job_id)):
         try:
             events.append(json.loads(fields["data"]))
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
     return events
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
 
 
 def seed_output():
@@ -89,33 +76,13 @@ def seed_output():
 
 
 def drain(job_id, timeout=15):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
-    terminal = None
-    while True:
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
+    _, terminal = _drain(job_id, timeout)
     return terminal
 
 
 def submit_and_wait(user, timeout=15):
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     workflow = {"3": {"class_type": "KSampler", "inputs": {}}}
-    req = urllib.request.Request(
-        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     return resp["job_id"], drain(resp["job_id"], timeout=timeout)
 
 
@@ -125,12 +92,7 @@ def set_next_output(filename, subfolder="", type="output", images=None):
     scenario needs a manifest with more than one entry in it."""
     body = {"images": images} if images is not None else {
         "filename": filename, "subfolder": subfolder, "type": type}
-    req = urllib.request.Request(
-        COMFY + "/__set_next_output__",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    urllib.request.urlopen(req, timeout=10).read()
+    COMFY.post("/__set_next_output__", body)
 
 
 def confined(url):
@@ -144,7 +106,7 @@ def confined(url):
 
 def fetch_ok(url):
     try:
-        return len(urllib.request.urlopen(GW + url, timeout=10).read()) > 0
+        return len(urllib.request.urlopen(GW.base_url + url, timeout=10).read()) > 0
     except Exception:
         return False
 
