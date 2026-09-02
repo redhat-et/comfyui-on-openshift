@@ -65,7 +65,7 @@ text. The path-traversal assertion later in that same file
 that this endpoint's static guard holds for ANY path, not that outputs are
 namespaced per user.
 """
-import json, os, pathlib, sys, time, urllib.error, urllib.request, uuid
+import glob, json, os, pathlib, sys, time, urllib.error, urllib.request, uuid
 import websocket
 
 GW = "http://127.0.0.1:8100"
@@ -337,6 +337,36 @@ check("the rejected workflow never reached ComfyUI at all -- scoped_prefix() "
       "raises before the job is ever submitted, so nothing here spent a GPU "
       "on a workflow that was going to be refused",
       received_prefix(evil_node_id) is None, received_prefix(evil_node_id))
+
+print("\n== (e) a LINKED filename_prefix is replaced by the workspace default, and the agent says so")
+
+# In ComfyUI's API format an input can be a link -- [node_id, output_index],
+# the value arriving from another node (a string primitive, a text node) at
+# execution time. scoped_prefix() cannot follow one at submit time, so it
+# substitutes the default prefix inside the workspace: the confined answer,
+# and a silent change to what the user's workflow said. The substitution is
+# kept; what this scenario adds is that it is no longer silent -- the agent
+# logs one line naming the node, so "my prefix was ignored" has something to
+# find.
+seed_output()
+terminal_link, link_node_id = submit_with_save_node("erin", ["7", 0])
+check("a save node whose filename_prefix is a link still completes",
+      terminal_link and terminal_link["type"] == "completed", terminal_link)
+images = (terminal_link or {}).get("data", {}).get("images", [])
+erin_dirs = workspace_dirs(images[0]["url"]) if images else []
+got_link_prefix = received_prefix(link_node_id)
+check("the link reached ComfyUI replaced by the default prefix inside erin's "
+      "workspace -- a list is not a path, and an unconfined one is not an option",
+      erin_dirs and got_link_prefix == f"{erin_dirs[0]}/ComfyUI", got_link_prefix)
+
+# The agent's log is the only place the warning can land -- run.sh writes
+# every agent's stdout to agent*.log in this check's own working directory.
+agent_log_text = "".join(open(path, errors="replace").read() for path in glob.glob("agent*.log"))
+check("and the agent logged a warning naming that node, so the override is "
+      "visible to whoever is asked why the prefix in the workflow was not used",
+      f"node {link_node_id}" in agent_log_text and "filename_prefix" in agent_log_text
+      and "link" in agent_log_text,
+      [line for line in agent_log_text.splitlines() if link_node_id in line][:3])
 
 print()
 if failures:

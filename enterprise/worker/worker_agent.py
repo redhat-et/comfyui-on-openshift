@@ -128,6 +128,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -988,6 +989,10 @@ DEFAULT_FILENAME_PREFIX = "ComfyUI"
 # --temp-directory), which never reaches the shared volume at all.
 DURABLE_OUTPUT_TYPE = "output"
 
+# Where hub.py serves the shared volume from. The URL half of every manifest
+# entry is built under this; the path half is confined by output_subfolder().
+OUTPUTS_URL_PREFIX = "/outputs/"
+
 # The one input ComfyUI treats as a path relative to --output-directory. Save
 # nodes spell it this way (SaveImage, SaveAnimatedPNG/WEBP and the video nodes
 # that copy them), which is what makes rewriting it the whole per-job scoping
@@ -1125,7 +1130,7 @@ def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
     """
     scoped = 0
 
-    for node in workflow.values():
+    for node_id, node in workflow.items():
         if not isinstance(node, dict):
             continue
 
@@ -1134,7 +1139,21 @@ def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
         if not isinstance(inputs, dict) or FILENAME_PREFIX_INPUT not in inputs:
             continue
 
-        inputs[FILENAME_PREFIX_INPUT] = scoped_prefix(workspace, inputs[FILENAME_PREFIX_INPUT])
+        prefix = inputs[FILENAME_PREFIX_INPUT]
+
+        # A list here is a LINK — [node_id, output_index], the prefix coming
+        # from another node's output (a string primitive, a text node) —
+        # and scoped_prefix() cannot follow it at submit time, so it puts
+        # the default in its place. That is the confined answer, and it is
+        # also a silent change to what the user's workflow said; say so,
+        # naming the node, so a support ticket about "my prefix was ignored"
+        # has a line to find.
+        if isinstance(prefix, list):
+            log(f"warning: node {node_id}: {FILENAME_PREFIX_INPUT} is linked from "
+                f"another node ({prefix!r}); replaced by {DEFAULT_FILENAME_PREFIX!r} "
+                f"inside workspace {workspace}")
+
+        inputs[FILENAME_PREFIX_INPUT] = scoped_prefix(workspace, prefix)
         scoped += 1
 
     return scoped
@@ -1731,15 +1750,26 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
             if not filename:
                 continue  # refused as unsafe by output_subfolder() — never named in a URL
 
-            url = f"/outputs/{subfolder}/{filename}".replace("//", "/")
+            # Joined, then percent-encoded. A filename is caller-chosen text
+            # (it starts as a filename_prefix), so a space, a "#" or a "%" in
+            # it is ordinary — and each breaks a URL differently: a space is
+            # refused on the request line, "#" starts a fragment and drops
+            # everything after it, "%" is a malformed escape. quote() with
+            # "/" kept as the separator, which is safe because both halves
+            # are already bare components (no "/" inside a component to
+            # confuse with a separator). The gateway decodes the path before
+            # it resolves it, so the file is found under its real name.
+            relative = "/".join(part for part in (subfolder, filename) if part)
+            url = OUTPUTS_URL_PREFIX + urllib.parse.quote(relative, safe="/")
 
             # Defense in depth: output_subfolder() should already guarantee
             # this, but the URL is what actually reaches the browser, so it
             # is what gets checked, independently of the function that built
-            # it. A violation here means the confinement contract itself
-            # broke, so it is loud rather than swallowed into a "warning" log
-            # line the way a hostile INPUT is above.
-            resolved = (OUTPUT_ROOT / url[len("/outputs/"):]).resolve()
+            # it — decoded first, because the decoded path is the one the
+            # gateway will resolve. A violation here means the confinement
+            # contract itself broke, so it is loud rather than swallowed into
+            # a "warning" log line the way a hostile INPUT is above.
+            resolved = (OUTPUT_ROOT / urllib.parse.unquote(url[len(OUTPUTS_URL_PREFIX):])).resolve()
             if not resolved.is_relative_to(OUTPUT_ROOT):
                 raise RuntimeError(
                     f"confinement invariant broken: {url!r} (from subfolder={subfolder!r}, "

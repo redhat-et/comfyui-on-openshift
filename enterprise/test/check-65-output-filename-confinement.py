@@ -248,6 +248,36 @@ check("exactly one image is reported -- the durable output, not the preview "
 check("and that one is a real, confined, servable URL",
       workspace_ok(images[0]["url"]) if images else False, images)
 
+# ---------------------------------------------------------------------------
+# (f) a filename with URL-significant characters is percent-encoded, and
+#     still fetchable through the gateway
+# ---------------------------------------------------------------------------
+print("\n== (f) a filename with a space, '#' and '%' in it is served through a percent-encoded URL")
+
+# All three are legal in a filename and each breaks a URL differently: a
+# space is not allowed on the request line at all (http.client refuses to
+# send it), '#' starts a fragment so everything after it is dropped before
+# the request is made, and a bare '%' is a malformed escape. A save node's
+# filename_prefix is caller-chosen text, so these reach the manifest whenever
+# a user types them.
+seed_output()
+awkward_filename = "cat #1 100%.png"
+(OUTPUT_ROOT / awkward_filename).write_bytes(b"fake png bytes")
+set_next_output(awkward_filename, subfolder="")
+job_id, terminal = submit_and_wait("quentin")
+images = (terminal or {}).get("data", {}).get("images", [])
+url_awkward = images[0]["url"] if images else None
+check("the URL carries no raw space or '#' -- the characters are escaped, "
+      "not passed through for the browser to mis-split",
+      url_awkward and " " not in url_awkward and "#" not in url_awkward, url_awkward)
+check("and it is a real, confined URL the gateway actually serves the file "
+      "from -- the encoding round-trips, so the manifest names a file that "
+      "exists rather than a 404 with the right letters in it",
+      workspace_ok(url_awkward), url_awkward)
+check("the manifest's own `filename` is still the real, unencoded name -- the "
+      "escaping belongs to the URL and nowhere else",
+      images and images[0]["filename"] == awkward_filename, images)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")
