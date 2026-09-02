@@ -370,16 +370,46 @@ BURST_USERS = [
     f"burst-{uuid.uuid4().hex[:8]}@example.com" for _ in range(4)
 ] + ["../../../../tmp/evil", "a" * 300]
 
+burst_states = {}
+
 for burst_user in BURST_USERS:
     distinct_identities.add(burst_user)
     probe_burst = f"probe-burst-{uuid.uuid4().hex[:8]}"
     job_burst, _ = submit(burst_user, fast_workflow(probe_burst))
     state_burst, _ = poll_state(job_burst, timeout=20)
+    burst_states[burst_user] = state_burst or {}
     check(f"burst identity {burst_user[:24]!r}... completed without crashing "
           "the gateway (a hostile/oversized X-Forwarded-User must not break "
           "showback accounting, whatever it does with the value)",
           bool(state_burst) and state_burst.get("status") in ("completed", "failed"),
           state_burst)
+
+# The other half of the bound: the field COUNT is capped in Redis, but a field
+# NAME is built from the identity generate() wrote on the job's state hash,
+# and the envelope clamps that to MAX_ENVELOPE_FIELD_CHARS (256) on the way in.
+# If the state hash carries the raw header instead of the clamped envelope
+# value, the clamp never reaches the accumulator and a field name grows with
+# whatever a client sends -- an 8 KB header per submitter is a second,
+# uncounted way to grow the one Hash the cap exists to bound.
+MAX_ENVELOPE_FIELD_CHARS = 256
+LONG_USER = "a" * 300
+long_state_user = burst_states.get(LONG_USER, {}).get("user", "")
+
+check(f"the identity on the job's state hash is the CLAMPED envelope value "
+      f"({len(long_state_user)} chars), not the raw {len(LONG_USER)}-character header",
+      0 < len(long_state_user) <= MAX_ENVELOPE_FIELD_CHARS
+      and long_state_user == LONG_USER[:MAX_ENVELOPE_FIELD_CHARS],
+      len(long_state_user))
+
+after_burst = showback()
+longest_field = max((len(u) for u in users_of(after_burst)), default=0)
+check(f"no showback field name exceeds MAX_ENVELOPE_FIELD_CHARS -- the "
+      f"300-character submitter is billed under its clamped name (longest "
+      f"field: {longest_field} chars)",
+      longest_field <= MAX_ENVELOPE_FIELD_CHARS
+      and LONG_USER[:MAX_ENVELOPE_FIELD_CHARS] in users_of(after_burst)
+      and LONG_USER not in users_of(after_burst),
+      {"longest": longest_field, "clamped_present": LONG_USER[:256] in users_of(after_burst)})
 
 key_count = len(list(r.scan_iter(match=SHOWBACK_KEY_PATTERN)))
 n_identities = len(distinct_identities)

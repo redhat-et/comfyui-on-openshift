@@ -1906,8 +1906,8 @@ async def generate(request: Request):
     # the showback key-space bound above ("THE FIELD COUNT IS CAPPED") caps
     # the number of fields, not their size, so an uncapped field name is a
     # second, uncounted way to grow that Hash against `noeviction` Redis.
-    if user:
-        state["user"] = user
+    if envelope["user"]:
+        state["user"] = envelope["user"]
 
     await conn.hset(state_key(job_id), mapping=state)
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
