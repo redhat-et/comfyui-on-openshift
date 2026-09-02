@@ -114,6 +114,16 @@ spec:
             # which is also the default: see BEGIN QUOTA BREAKER in hub.py.
             - name: QUOTA_GPU_SECONDS
               value: "QUOTA_GPU_SECONDS_PLACEHOLDER"
+            # hub.py scopes /outputs and /api/showback to the caller only when
+            # it knows a proxy is in front of it; under "none" the identity
+            # header is client-supplied and scoping would be theatre.
+            - name: AUTH_MODE
+              value: "AUTH_MODE_PLACEHOLDER"
+            # Comma-separated identities that may read every submitter's row
+            # of /api/showback under AUTH_MODE=oauth. Empty: nobody but the
+            # caller's own row plus totals.
+            - name: SHOWBACK_OPERATORS
+              value: "SHOWBACK_OPERATORS_PLACEHOLDER"
 
           resources:
             requests:

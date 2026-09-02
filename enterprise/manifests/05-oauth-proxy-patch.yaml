@@ -82,7 +82,7 @@ spec:
             # Deliberate and bounded: that path exposes exactly two gauges
             # (queue depth, worker count) — no job data, no user data. Widen
             # this regex only after thinking about what else it uncovers.
-            - --skip-auth-regex=^/metrics
+            - --skip-auth-regex=^/metrics$
 
           resources:
             requests:

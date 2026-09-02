@@ -34,6 +34,10 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 : "${COMFYUI_REF:=c2bcbecd82ec5ae66594340b395c24ef0217b238}"
 : "${GPU_NODE_LABEL:=nvidia.com/gpu.present=true}"
 : "${QUOTA_GPU_SECONDS:=0}"
+# Who may read every submitter's showback row under AUTH_MODE=oauth (comma-
+# separated identities as oauth-proxy reports them). Empty by default: each
+# caller sees their own row and the totals, and nothing that names a colleague.
+: "${SHOWBACK_OPERATORS:=}"
 
 # The scheduled warm floor (docs/10-roadmap.md, I1). 0 is off, and off is the
 # default: this is the one setting in the file that spends money while nobody
@@ -434,6 +438,8 @@ apply_gateway()
 {
     sed -e "s#image: comfy-gateway:latest#image: ${GATEWAY_IMAGE}#" \
         -e "s#QUOTA_GPU_SECONDS_PLACEHOLDER#${QUOTA_GPU_SECONDS}#" \
+        -e "s#AUTH_MODE_PLACEHOLDER#${AUTH_MODE}#" \
+        -e "s#SHOWBACK_OPERATORS_PLACEHOLDER#${SHOWBACK_OPERATORS}#" \
         "${MANIFESTS}/01-gateway.yaml" \
         | oc apply -n "$APP_NAMESPACE" -f -
 }

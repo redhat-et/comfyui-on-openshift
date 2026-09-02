@@ -65,13 +65,13 @@ load_env()
     : "${MAX_GPU_WORKERS:=3}"
     : "${SCALE_TO_ZERO:=true}"
     : "${ENABLE_MANAGER:=false}"
-    : "${COMFYUI_REF:=v0.32.0}"
+    : "${COMFYUI_REF:=c2bcbecd82ec5ae66594340b395c24ef0217b238}"   # v0.32.0
 
     # Kept identical to the ARG defaults in app/Containerfile so a bare
     # `podman build` and this repo's BuildConfig (scripts/05-deploy.sh) build
     # the same image. See that file's comment above ARG COMFYUI_REF for why
     # the four torch values move together.
-    : "${MANAGER_REF:=4.2.2}"
+    : "${MANAGER_REF:=da5e88aae61c06e1396724e77dc5fa152732797f}"   # 4.2.2
     : "${TORCH_INDEX:=https://download.pytorch.org/whl/cu128}"
     : "${TORCH_VERSION:=2.8.0}"
     : "${TORCHVISION_VERSION:=0.23.0}"

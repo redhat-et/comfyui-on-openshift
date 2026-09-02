@@ -11,6 +11,11 @@ export REDIS_PASSWORD="$PASS"
 export COMFY_HOST=127.0.0.1 COMFY_PORT=8999
 export OUTPUT_ROOT="$WORK/output"
 export BOOT_TIMEOUT=30 RECV_TIMEOUT=5 JOB_TIMEOUT=60
+# The Makefile exports .env, so a developer's AUTH_MODE=oauth would put this
+# shared gateway in oauth mode and break every check that submits as several
+# users. check-66 starts its own oauth-mode gateway on another port.
+export AUTH_MODE=none
+unset SHOWBACK_OPERATORS
 # Shrunk so the SIGKILL test (check-30-sigkill.py) resolves in seconds, not the
 # production-default minutes. TTL must still exceed RECV_TIMEOUT above.
 export HEARTBEAT_TTL=10 REAPER_INTERVAL=2
