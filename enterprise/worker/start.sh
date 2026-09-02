@@ -30,6 +30,17 @@ COMFY_HOST="${COMFY_HOST:-127.0.0.1}"
 COMFY_PORT="${COMFY_PORT:-8188}"
 COMFY_ROOT="${COMFY_ROOT:-/opt/comfyui}"
 
+# CI and diagnostics only — NEVER in the pool. Set to 1, this boots ComfyUI
+# alone and never starts the agent, so the container is a plain ComfyUI with no
+# Redis connection and no claim on the queue. That is exactly what the nightly
+# image proof needs: a GitHub runner has no GPU and no Redis, so it boots this
+# image with AGENT_DISABLED=1, `--cpu` appended to the entrypoint, and
+# COMFY_HOST=0.0.0.0 so the runner can curl /system_stats from outside the
+# container. Set in a worker pod it would produce a pod that looks healthy,
+# holds a GPU, and takes no work at all — which is why it is off unless
+# something asks for it by name.
+AGENT_DISABLED="${AGENT_DISABLED:-0}"
+
 # One variable for both halves. ComfyUI is a long-lived process with a single
 # fixed --output-directory, and worker_agent.py computes each submitter's
 # output workspace underneath that same directory (docs/10-roadmap.md, Q3) from
@@ -88,17 +99,29 @@ python3 main.py \
     "$@" &
 comfy_pid=$!
 
-echo "[start] launching agent"
-python3 "${COMFY_ROOT}/worker_agent.py" &
-agent_pid=$!
+if [[ "$AGENT_DISABLED" == "1" ]]; then
+    echo "[start] AGENT_DISABLED=1 — ComfyUI only, no agent, no queue"
 
-# Exit as soon as either child exits, so the kubelet can restart us.
-wait -n "$comfy_pid" "$agent_pid"
-exit_code=$?
+    # One child, so wait on it by pid rather than `wait -n`: with the agent
+    # never started there is no second pid to race, and `wait -n` on a single
+    # job would just be the same wait spelled obscurely.
+    wait "$comfy_pid"
+    exit_code=$?
+else
+    echo "[start] launching agent"
+    python3 "${COMFY_ROOT}/worker_agent.py" &
+    agent_pid=$!
+
+    # Exit as soon as either child exits, so the kubelet can restart us.
+    wait -n "$comfy_pid" "$agent_pid"
+    exit_code=$?
+fi
 
 echo "[start] a child exited (status ${exit_code}) — shutting this container down"
 
-kill -TERM "$comfy_pid" "$agent_pid" 2>/dev/null
+# ${agent_pid:+...} because there may not be one: an unset positional in a kill
+# argument list is an error message on every AGENT_DISABLED=1 exit.
+kill -TERM "$comfy_pid" ${agent_pid:+"$agent_pid"} 2>/dev/null
 wait 2>/dev/null
 
 exit "$exit_code"

@@ -550,6 +550,14 @@ shape_require enterprise/worker/start.sh \
 # there, and the failure reads like a broken image rather than a runner with no
 # card. Nothing in the e2e suite can see this: it runs worker_agent.py directly
 # against a stub, never through the entrypoint.
+# The other half of the same CI proof. A GitHub runner has no GPU and no Redis,
+# so the agent cannot start; without this switch the container would exit the
+# moment worker_agent.py failed to connect, and the image proof would report a
+# missing Redis as a broken image.
+shape_require enterprise/worker/start.sh \
+    '^AGENT_DISABLED=' \
+    "start.sh must honour AGENT_DISABLED. Nightly CI boots this image on a runner with no GPU and no Redis; with the agent started anyway the container exits on the failed Redis connection and the arbitrary-UID proof reports a missing dependency as an image regression"
+
 shape_require enterprise/worker/start.sh \
     '^[[:space:]]*"\$@" &$' \
     "start.sh is the worker image's ENTRYPOINT and must forward its own arguments to ComfyUI. Nightly CI boots this image with --cpu because GitHub runners have no GPU; swallowed, the flag produces a CUDA failure that looks like an image regression"
