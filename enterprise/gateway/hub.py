@@ -1404,6 +1404,21 @@ REAP_UNDELIVERABLE_KEY = "comfy:reap:undeliverable"
 REAP_UNDELIVERABLE_MAX = 100
 REAP_UNDELIVERABLE_TTL = PAYLOAD_TTL
 
+# Which processing-list entry a job was last requeued FROM, on the job's state
+# hash — reap_entry_id() of that entry's bytes. This is what makes a second
+# look at the same entry safe. The entry leaves its list only after the reap
+# has finished (see above), and for a retryable death "finished" means the
+# job is already back on comfy:queue and quite possibly running on a second
+# worker. If the LREM that follows raises, the entry is still parked, and the
+# next tick would reap it AGAIN: stamp the ownership fence over the second
+# attempt's claim, read a phase that is now `executing`, and fail a job that
+# is running perfectly well — whose worker then discards its own result
+# because it no longer owns the job. An entry whose id is already recorded
+# here has been dealt with; the only thing left to do with it is remove it.
+# A job stranded a second time is a different entry with a different id, so
+# this never suppresses a genuine second stranding.
+REQUEUED_ENTRY_FIELD = "requeued_entry"
+
 # END REAP DURABILITY
 # ---------------------------------------------------------------------------
 
@@ -1521,7 +1536,8 @@ async def cancel_orphaned_job(conn: redis.Redis, job_id: str) -> None:
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
 
 
-async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> None:
+async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int,
+                               entry_id: str) -> None:
     """Put a pre-execution death back on the queue, once."""
     job_id = entry["job_id"]
 
@@ -1556,9 +1572,18 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> 
             f"full ({position} jobs) so it could not be requeued. Resubmit. {DESCRIBE_HINT}.")
         return
 
+    # REQUEUED_ENTRY_FIELD in the same write as the status, immediately after
+    # the enqueue: from this instant a second look at the entry this came
+    # from must remove it and nothing more. Written after the enqueue rather
+    # than before, deliberately — a gateway that dies between the two leaves
+    # an entry that will be reaped twice (a duplicate terminal on a stream a
+    # browser stopped reading at the first), where the other order would
+    # leave an entry the next tick silently removes with the job on no queue
+    # at all. At-least-once, the same trade BEGIN REAP DURABILITY makes.
     await conn.hset(
         state_key(job_id),
-        mapping={"status": "queued", PHASE_FIELD: PHASE_QUEUED},
+        mapping={"status": "queued", PHASE_FIELD: PHASE_QUEUED,
+                 REQUEUED_ENTRY_FIELD: entry_id},
     )
     await arm_state_ttl(conn, job_id)
 
@@ -1578,7 +1603,7 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> 
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL, nx=True)
 
 
-async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
+async def reap_stranded_job(conn: redis.Redis, raw: str, entry_id: str) -> None:
     """One entry off a dead worker's processing list: retry it, or fail it."""
     try:
         payload = json.loads(raw)
@@ -1588,6 +1613,14 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
         # job_id names no job, so there is nothing to report a failure on and
         # nowhere to report it. Anything else is failed below rather than
         # dropped.
+        return
+
+    # ALREADY DONE, before the fence and before anything is decided: this
+    # exact entry was requeued on an earlier tick and only its removal
+    # failed. Returning here is what lets the caller remove it — see
+    # REQUEUED_ENTRY_FIELD for what deciding it again would do to the attempt
+    # that is now running.
+    if await conn.hget(state_key(job_id), REQUEUED_ENTRY_FIELD) == entry_id:
         return
 
     # FENCE FIRST, before anything is read and before anything is decided.
@@ -1711,7 +1744,7 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
             f"repeatedly is a cluster problem, not a workflow problem. {DESCRIBE_HINT}.")
         return
 
-    await requeue_orphaned_job(conn, entry, attempt)
+    await requeue_orphaned_job(conn, entry, attempt, entry_id)
 
 
 async def defer_stranded_entry(conn: redis.Redis, key: str, raw: str,
@@ -1800,7 +1833,7 @@ async def reap_processing_list(conn: redis.Redis, key: str) -> None:
             return
 
         try:
-            await reap_stranded_job(conn, raw)
+            await reap_stranded_job(conn, raw, entry_id)
         except Exception:  # noqa: BLE001 - handled by leaving the entry where it is
             await defer_stranded_entry(conn, key, raw, entry_id)
 
@@ -1812,7 +1845,19 @@ async def reap_processing_list(conn: redis.Redis, key: str) -> None:
 
         # Only now, with every write the reap makes landed — the terminal
         # event included — is losing this entry the same as losing nothing.
-        await conn.lrem(key, 1, raw)
+        #
+        # And the removal itself can raise. Routed through the same deferral
+        # as a failed reap, so the claim is released and the next tick tries
+        # the removal again promptly — rather than propagating, leaving the
+        # claim to expire on its own and this entry to be reaped a second
+        # time a minute later. REQUEUED_ENTRY_FIELD is what makes that second
+        # look a removal and not a re-decision.
+        try:
+            await conn.lrem(key, 1, raw)
+        except Exception:  # noqa: BLE001 - the entry is still parked; see above
+            await defer_stranded_entry(conn, key, raw, entry_id)
+            return
+
         await conn.delete(claim_key, f"{REAP_FAILURES_PREFIX}{entry_id}")
 
 

@@ -33,6 +33,23 @@ reaper's own bookkeeping rather than any particular way of dying.
      `comfy:reap:undeliverable` rather than destroyed, so an operator holding
      a job id can still find out what became of it.
 
+  C. A FAILED REMOVAL AFTER A SUCCESSFUL REQUEUE. The entry comes off the
+     list only after the reap has finished, which for a retryable death means
+     after the job is back on comfy:queue and a live worker may already be
+     running it. If the LREM that follows raises, the entry stays parked, and
+     a later tick reaps it AGAIN: it stamps the ownership fence over the
+     second attempt's claim and reads a phase that is now `executing` -- so a
+     job that is running perfectly well is failed, and the worker running it
+     abandons its result because it no longer owns the job. The fault is
+     injected with an ACL rule that denies LREM to the shared user for the
+     instant the reaper needs it (LINDEX, the claim and the whole requeue
+     path stay allowed), then lifted; the reap claim is deleted afterwards so
+     the second look happens on the next tick rather than after the claim's
+     60-second visibility timeout. The requeued job must run to completion
+     with exactly one terminal event and its owner left untouched, and the
+     entry must leave the list within a few ticks -- the removal is retried,
+     not re-decided.
+
 What is asserted, and why it is asserted this way. Every count comes from an
 observer armed BEFORE the reaper could act -- the length of the processing
 list, the type of the poisoned key, the contents of the undeliverable list --
@@ -43,7 +60,7 @@ stream still a string: it got as far as the terminal write and no further),
 because an entry surviving a reap that failed somewhere earlier would prove
 nothing about the write this is actually about.
 """
-import json, os, sys, time, uuid
+import hashlib, json, os, sys, time, uuid
 import redis
 
 # See check-30-sigkill.py: run.sh's stdout is a pipe, and a check killed by
@@ -85,10 +102,9 @@ def stream_key(job_id):
     return f"comfy:job:{job_id}:events"
 
 
-def terminal_events(job_id):
-    """Every terminal event on the job's stream, over its whole history. One
-    is a reaped job; two is a job reaped twice, which is what an entry removed
-    only after success can get wrong in the other direction."""
+def events_of(job_id, wanted):
+    """The types of every event on the job's stream that is one of `wanted`,
+    over its whole history, in order."""
     kinds = []
 
     for _entry_id, fields in r.xrange(stream_key(job_id)):
@@ -97,10 +113,17 @@ def terminal_events(job_id):
         except (json.JSONDecodeError, KeyError, TypeError):
             continue
 
-        if kind in TERMINAL_TYPES:
+        if kind in wanted:
             kinds.append(kind)
 
     return kinds
+
+
+def terminal_events(job_id):
+    """Every terminal event on the job's stream. One is a reaped job; two is
+    a job reaped twice, which is what an entry removed only after success can
+    get wrong in the other direction."""
+    return events_of(job_id, TERMINAL_TYPES)
 
 
 def until(predicate, timeout):
@@ -266,10 +289,84 @@ check("the undeliverable list is bounded -- it cannot grow without limit in a "
       0 < r.llen(DEAD_KEY) <= 100 and r.ttl(DEAD_KEY) > 0,
       f"llen={r.llen(DEAD_KEY)} ttl={r.ttl(DEAD_KEY)}")
 
+print("\n== C: a requeue whose LREM failed is not re-decided against the live second attempt")
+
+# See check-30-sigkill.py's comfy_saw() for the stub's arrival log; here the
+# job has to be one a live worker will actually run for a while, so the second
+# reap lands on a job in flight. fake_comfy's __slow__ marker is ~6s.
+job_c = f"reapdur-c-{uuid.uuid4().hex[:12]}"
+inc_c = f"reapdur-c-{uuid.uuid4().hex[:8]}#{uuid.uuid4().hex[:8]}"
+proc_c = f"comfy:processing:{inc_c}"
+raw_c = json.dumps({
+    "schema_version": 1,
+    "job_id": job_c,
+    "workflow": {"1": {"class_type": "KSampler", "inputs": {}},
+                 "__slow__": {"class_type": "KSampler"}},
+    "queue_key": "",
+    "attempt": {"count": 0, "phase": "queued"},
+    "user": "",
+    "submitted_at": time.time(),
+})
+claim_c = "comfy:reap:claim:" + hashlib.sha256(raw_c.encode("utf-8")).hexdigest()[:32]
+
+r.delete(proc_c, state_key(job_c), stream_key(job_c))
+r.hset(state_key(job_c), mapping={"status": "queued", "phase": "queued"})
+r.expire(state_key(job_c), 600)
+
+
+def retry_events(job_id):
+    return events_of(job_id, {"retry"})
+
+
+# THE INJECTED FAULT: LREM is denied to the one user everything here connects
+# as. Lifted the moment the requeue is observed, which is a few milliseconds
+# after the reaper's own LREM has already raised -- and well before the live
+# worker's finish() needs the command for its own list, six seconds later.
+r.execute_command("ACL", "SETUSER", "default", "-lrem")
+try:
+    r.lpush(proc_c, raw_c)
+
+    requeued = until(lambda: len(retry_events(job_c)) > 0, REAPER_INTERVAL * 4 + 10)
+    time.sleep(0.3)
+finally:
+    r.execute_command("ACL", "SETUSER", "default", "+lrem")
+
+check("fixture: the reaper requeued the stranded entry (a retry event is on the stream)",
+      requeued, retry_events(job_c))
+check("fixture: the fault fired -- the requeue landed but the entry is STILL on "
+      "the processing list, exactly the state a raised LREM leaves behind",
+      r.llen(proc_c) == 1, f"llen={r.llen(proc_c)}")
+
+# The claim's TTL is a visibility timeout for a reaper that died mid-reap. On
+# HEAD the raised LREM leaves it in place, so the next look at this entry is
+# 60 seconds out; deleting it here is that timeout elapsing, on this tick.
+r.delete(claim_c)
+
+left = until(lambda: r.llen(proc_c) == 0, REAPER_INTERVAL * 4 + 5)
+check("the entry left the processing list within a few ticks -- the removal "
+      "was retried rather than left until the claim expired",
+      left, f"llen={r.llen(proc_c)}")
+
+ended = until(lambda: r.hget(state_key(job_c), "status") in TERMINAL_TYPES, 40)
+final_c = r.hgetall(state_key(job_c))
+
+check("the requeued job ran to completion on the live worker -- the second "
+      "look at the entry did not fail a job that was executing",
+      ended and final_c.get("status") == "completed", final_c)
+check("exactly one terminal event, and it is the worker's own completion -- "
+      "not a `failed` from a reap that re-decided an entry it had already "
+      "requeued",
+      terminal_events(job_c) == ["completed"], terminal_events(job_c))
+check("the ownership fence was not stamped over the second attempt's claim",
+      final_c.get("owner") != "#reaped", final_c.get("owner"))
+check("the retry was spent exactly once", final_c.get("attempt_count") == "1",
+      final_c.get("attempt_count"))
+
 # The fixtures' own leftovers. Not the undeliverable list, which is asserted
 # on above and expires on its own.
 r.delete(state_key(job_a), stream_key(job_a),
-         state_key(job_b), stream_key(job_b))
+         state_key(job_b), stream_key(job_b),
+         state_key(job_c), stream_key(job_c), proc_c)
 
 print()
 
