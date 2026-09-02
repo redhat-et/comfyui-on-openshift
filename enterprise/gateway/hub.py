@@ -41,6 +41,7 @@ import uuid
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,6 +53,12 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 EVENT_STREAM_TTL = int(os.environ.get("EVENT_STREAM_TTL", "3600"))
 MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "500"))
+
+# Refused at import rather than tolerated: EXPIRE with a non-positive TTL
+# deletes the key on the spot, so an EVENT_STREAM_TTL of 0 is a gateway that
+# erases every job the instant it creates it and reports nothing wrong.
+if EVENT_STREAM_TTL <= 0:
+    raise ValueError(f"EVENT_STREAM_TTL must be a positive number of seconds, got {EVENT_STREAM_TTL}")
 
 # The queue carries an ordering record and the workflow itself sits beside it
 # at payload_key(job_id) — see BEGIN SHARED ENVELOPE. This is the backstop on
@@ -84,6 +91,11 @@ WORKER_KEY_PREFIX = "comfy:worker:"
 PROCESSING_KEY_PREFIX = "comfy:processing:"
 REAPER_INTERVAL = int(os.environ.get("REAPER_INTERVAL", "30"))
 
+# Same posture: a zero interval is a tight loop of keyspace SCANs against a
+# single-threaded Redis, which is an outage with a config-file cause.
+if REAPER_INTERVAL <= 0:
+    raise ValueError(f"REAPER_INTERVAL must be a positive number of seconds, got {REAPER_INTERVAL}")
+
 # How many times the reaper may put a job back on the queue (docs/10-roadmap.md,
 # Q2) — and only ever a job that died before ComfyUI saw the workflow, see
 # RETRYABLE_PHASES. One, not three: the deaths this retries (a node reclaim or
@@ -101,6 +113,44 @@ MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "1"))
 # that.
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 STATIC_ROOT = pathlib.Path(__file__).parent / "static"
+
+# How the gateway is exposed — enterprise/setup.sh's AUTH_MODE, which the
+# manifests pass through to this container. "oauth" means oauth-proxy is in
+# front: X-Forwarded-User is set by the proxy from a real login, and whatever
+# the client sent under that name was stripped. "none" means the gateway is
+# reached directly and the same header is the client's own claim about
+# itself. Two endpoints take an authorization decision on that header —
+# output_file() and showback() — and they take it ONLY under oauth: under
+# none the identity is client-supplied, so a scope on it would be a control
+# that evaporates in one of the two supported modes, and both docstrings say
+# so. Unset reads as none, the mode in which nothing is scoped, because a
+# gateway that has not been told how it is exposed must not pretend to know.
+AUTH_MODE = os.environ.get("AUTH_MODE", "none").strip().lower()
+AUTH_MODE_OAUTH = "oauth"
+
+# Who may read every submitter's row of /api/showback under AUTH_MODE=oauth: a
+# comma-separated list of identities, spelled exactly as oauth-proxy puts them
+# in X-Forwarded-User. Everyone else sees their own row and the pool totals.
+# Unset means nobody is an operator — the report is still served, it just
+# names no one but the caller. Ignored under AUTH_MODE=none.
+SHOWBACK_OPERATORS = frozenset(
+    name.strip() for name in os.environ.get("SHOWBACK_OPERATORS", "").split(",") if name.strip())
+
+# How long one gather_stats() snapshot is served before the keyspace is
+# scanned again. index.html polls /api/stats every five seconds per open tab
+# and Prometheus scrapes /metrics, neither of them authenticated; without
+# this, each of those calls is a SCAN over the whole keyspace of a
+# single-threaded Redis, paid for by every worker parked in BLMOVE. 0 turns
+# the cache off.
+STATS_CACHE_SECONDS = float(os.environ.get("STATS_CACHE_SECONDS", "5"))
+
+# The ceiling on this process's Redis connection pool. Every open /ws/<job>
+# holds one connection for as long as it tails, so this is also the ceiling
+# on concurrent viewers per replica: past it a tail's read raises, retries
+# briefly and closes, instead of the pool growing until Redis's own
+# maxclients starts refusing the workers. Generous for a pool of a few GPUs,
+# and finite.
+REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "200"))
 
 
 def log(message: str) -> None:
@@ -716,6 +766,75 @@ def showback_accrue_call(state: str, destination: str,
 
 
 # ---------------------------------------------------------------------------
+# BEGIN SHARED WORKSPACE — the submitter's directory name (docs/10-roadmap.md, Q3)
+#
+# worker_agent.py's BEGIN OUTPUT WORKSPACES gives every submitter one
+# directory under OUTPUT_ROOT, named from the envelope's `user`. This is the
+# NAMING half of that, and nothing else — the pure functions and the
+# constants they read. It is MIRRORED VERBATIM between enterprise/gateway/
+# hub.py and enterprise/worker/worker_agent.py for the same reason the
+# envelope and the showback accumulator are: hub.py's output_file() has to
+# compute the same name from the same identity to decide, under
+# AUTH_MODE=oauth, whether a caller is reading their own workspace, and
+# rewrite_image_urls() has to refuse the same filename shapes the worker
+# refuses — a gateway that spelled either rule differently would refuse
+# everyone their own files, or serve what the worker would not name, with
+# nothing failing anywhere to say so. scripts/lint.sh diffs the two copies
+# line for line. The directory mode, the prefix rewrite and everything that
+# touches the volume stay the worker's alone — the gateway mounts it
+# read-only.
+# ---------------------------------------------------------------------------
+
+# Where a job with no authenticated submitter goes. Deliberately not "" (which
+# would put anonymous output loose in the shared root again) and deliberately
+# not derivable from any username: a real workspace is always
+# "<slug>-<12 hex>", and the leading underscore is a character the slug rule
+# cannot emit, so "no user" can never alias onto whoever submits next.
+ANON_WORKSPACE = "_anonymous"
+
+# Everything outside the allowlist collapses to a single "-".
+WORKSPACE_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
+
+# Bounds on the readable half. 40 + 1 + 12 is far below NAME_MAX (255) even
+# before hub.py's own 256-character clamp on the header.
+MAX_WORKSPACE_SLUG_CHARS = 40
+WORKSPACE_DIGEST_CHARS = 12
+
+
+def workspace_name(user: str) -> str:
+    """The submitter's directory name. Total, never raises, never rejects."""
+    if not user:
+        return ANON_WORKSPACE
+
+    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
+    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
+
+    # .strip("-") again: the truncation above can leave a trailing separator.
+    # "user" when nothing readable survived — the digest still separates two
+    # such names from each other.
+    return f"{slug.strip('-') or 'user'}-{digest}"
+
+
+def is_bare_filename(name: str) -> bool:
+    """
+    True iff `name` is a single path component: no separator, no NUL, and not
+    "." or "..". This is the confinement rule for the REPORTED FILENAME,
+    mirroring what workspace_path() already enforces for the reported
+    workspace — a run of unsafe characters cannot be un-collapsed into a
+    traversal the way a raw "/" or ".." can.
+
+    ComfyUI's own manifest entries never put a separator in `filename`;
+    `subfolder` is the only field a save node uses to nest. So a `filename`
+    that fails this is not ComfyUI's own shape and is refused outright rather
+    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    """
+    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+
+# END SHARED WORKSPACE
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # BEGIN QUOTA BREAKER (docs/10-roadmap.md, Q5)
 #
 # A ceiling on the GPU seconds one submitter may spend inside one showback
@@ -745,18 +864,18 @@ def showback_accrue_call(state: str, destination: str,
 #      what could not be read (see log() above). The budget alarm remains the
 #      backstop.
 #
-#      "Redis unreachable" reaches this fail-open only when it fails between
-#      generate()'s two reads — this one and the backpressure `LLEN` above it
-#      in the function, which is NOT wrapped the same way and raises
-#      unhandled. For an outage that takes the whole instance down, that LLEN
-#      is what the submitter actually sees (a 500, not a quiet pass-through);
-#      it is deliberately not softened to match, because backpressure exists
-#      to protect Redis from an unbounded queue and "proceed when you cannot
-#      even read the depth" is the one answer that control must not give. The
-#      logged fail-open here is real and reachable — a read that fails on its
-#      own (a single flaky call, a differently-sharded key in a clustered
-#      Redis) — just not the "Redis is entirely down" case the phrase most
-#      readily suggests.
+#      "Redis unreachable" reaches this fail-open on its own terms: the quota
+#      read is the first Redis call generate() makes, so an outage that takes
+#      the whole instance down logs a fail-open here and then raises,
+#      unhandled, on the enqueue script one call later — the submitter sees a
+#      500, not a quiet pass-through, and nothing was written. That script is
+#      NOT softened to match, because backpressure lives inside it
+#      (FAIR_ENQUEUE_LUA) precisely so that "proceed when you cannot even
+#      read the depth" is an answer this endpoint cannot give. The logged
+#      fail-open here is real and reachable — a read that fails on its own
+#      (a single flaky call, a differently-sharded key in a clustered Redis)
+#      — just not the "Redis is entirely down" case the phrase most readily
+#      suggests.
 #
 #   3. IT IS NOT WIRED INTO readyz(), NOT EVEN TRANSITIVELY. That endpoint is
 #      the gateway's readiness probe: a quota check inside it would take the
@@ -1011,6 +1130,20 @@ local new_entry = ARGV[1]
 local new_lane = ARGV[2] or ""
 local workflow = ARGV[3]
 local payload_ttl = tonumber(ARGV[4])
+local max_depth = tonumber(ARGV[5]) or 0
+
+-- Backpressure, INSIDE the script rather than an LLEN in the caller: a depth
+-- read in one round trip and an insert in the next is a window every submit
+-- that arrived in between fits through, so N clients retrying against a full
+-- queue all read "one short of full" and all get in. Here the read and the
+-- insert are one atomic unit, and the refusal happens before the payload is
+-- written so a refused submit leaves nothing behind. 0 disables the ceiling.
+if max_depth > 0 then
+  local depth = redis.call('LLEN', key)
+  if depth >= max_depth then
+    return {-1, depth}
+  end
+end
 
 -- The workflow lands beside the queue BEFORE the entry pointing at it lands on
 -- the queue, so there is no ordering in which a worker pops a pointer whose
@@ -1094,9 +1227,14 @@ else
 end
 
 -- {jobs queued before this one (any lane), jobs that will be served before
--- this one under fair-queueing order}
+-- this one under fair-queueing order} — or {-1, depth} when the queue was
+-- full and nothing was written (QUEUE_FULL below).
 return {n, insert_at - 1}
 """
+
+# What the script's first return value is when it refused the insert. The
+# second value is then the depth it saw, for the 503's text.
+QUEUE_FULL = -1
 
 
 def fair_enqueue_call(envelope: dict) -> tuple[list, list]:
@@ -1113,7 +1251,8 @@ def fair_enqueue_call(envelope: dict) -> tuple[list, list]:
         [json.dumps(queue_record(envelope)),
          envelope["queue_key"],
          json.dumps(envelope["workflow"]),
-         PAYLOAD_TTL],
+         PAYLOAD_TTL,
+         MAX_QUEUE_DEPTH],
     )
 
 
@@ -1148,13 +1287,34 @@ async def lifespan(_app: FastAPI):
     # the other replica's reaper. That bound comes from the atomic HINCRBY in
     # reap_stranded_job() below, not from this.
     reaper = asyncio.create_task(reap_orphaned_jobs())
+
+    # The landing page, once. Read here rather than per request because a
+    # blocking read on the event loop stalls every WebSocket this process is
+    # tailing for the duration, and the file never changes inside a running
+    # container. Nothing is being served yet, so blocking here costs nothing.
+    global _index_html
+    page = STATIC_ROOT / "index.html"
+    _index_html = page.read_text() if page.is_file() else None
+
     yield
+
+    # Cancel, then AWAIT the cancellation: a task cancelled and dropped is one
+    # uvicorn's shutdown logs as "Task was destroyed but it is pending", and
+    # its Redis connection stays checked out of a pool that is about to be
+    # closed underneath it.
     reaper.cancel()
+
+    with contextlib.suppress(asyncio.CancelledError):
+        await reaper
+
+    if _redis is not None:
+        await _redis.aclose()
 
 
 app = FastAPI(title="ComfyUI Gateway", lifespan=lifespan)
 
 _redis: redis.Redis | None = None
+_index_html: str | None = None
 
 
 def client() -> redis.Redis:
@@ -1166,6 +1326,13 @@ def client() -> redis.Redis:
             password=REDIS_PASSWORD,
             decode_responses=True,
             health_check_interval=30,
+            # Explicit, because redis-py 8 changed the default to 5 seconds,
+            # which turns every blocking XREAD in progress() below into a
+            # "Timeout reading from ..." raise instead of a wait. None is what
+            # redis-py < 8 always did; writing it down is what lets
+            # requirements.txt's ceiling be lifted after a re-test.
+            socket_timeout=None,
+            max_connections=REDIS_MAX_CONNECTIONS,
         )
 
     return _redis
@@ -1344,6 +1511,21 @@ REAP_UNDELIVERABLE_KEY = "comfy:reap:undeliverable"
 REAP_UNDELIVERABLE_MAX = 100
 REAP_UNDELIVERABLE_TTL = PAYLOAD_TTL
 
+# Which processing-list entry a job was last requeued FROM, on the job's state
+# hash — reap_entry_id() of that entry's bytes. This is what makes a second
+# look at the same entry safe. The entry leaves its list only after the reap
+# has finished (see above), and for a retryable death "finished" means the
+# job is already back on comfy:queue and quite possibly running on a second
+# worker. If the LREM that follows raises, the entry is still parked, and the
+# next tick would reap it AGAIN: stamp the ownership fence over the second
+# attempt's claim, read a phase that is now `executing`, and fail a job that
+# is running perfectly well — whose worker then discards its own result
+# because it no longer owns the job. An entry whose id is already recorded
+# here has been dealt with; the only thing left to do with it is remove it.
+# A job stranded a second time is a different entry with a different id, so
+# this never suppresses a genuine second stranding.
+REQUEUED_ENTRY_FIELD = "requeued_entry"
+
 # END REAP DURABILITY
 # ---------------------------------------------------------------------------
 
@@ -1461,7 +1643,8 @@ async def cancel_orphaned_job(conn: redis.Redis, job_id: str) -> None:
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
 
 
-async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> None:
+async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int,
+                               entry_id: str) -> None:
     """Put a pre-execution death back on the queue, once."""
     job_id = entry["job_id"]
 
@@ -1483,11 +1666,31 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> 
     # nothing wrong, which is the starvation Q1 exists to prevent, arriving by
     # a new door. It rejoins at the back of its own lane's round.
     keys, args = fair_enqueue_call(envelope)
-    _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+    queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
 
+    if queued_before == QUEUE_FULL:
+        # The queue filled between reap_stranded_job()'s early check and
+        # here. Hand the retry back — nothing was written — and fail the job
+        # the way that check would have.
+        await conn.hincrby(state_key(job_id), ATTEMPT_COUNT_FIELD, -1)
+        await fail_orphaned_job(
+            conn, job_id,
+            f"{DEAD_WORKER} before ComfyUI saw the workflow, and the queue was "
+            f"full ({position} jobs) so it could not be requeued. Resubmit. {DESCRIBE_HINT}.")
+        return
+
+    # REQUEUED_ENTRY_FIELD in the same write as the status, immediately after
+    # the enqueue: from this instant a second look at the entry this came
+    # from must remove it and nothing more. Written after the enqueue rather
+    # than before, deliberately — a gateway that dies between the two leaves
+    # an entry that will be reaped twice (a duplicate terminal on a stream a
+    # browser stopped reading at the first), where the other order would
+    # leave an entry the next tick silently removes with the job on no queue
+    # at all. At-least-once, the same trade BEGIN REAP DURABILITY makes.
     await conn.hset(
         state_key(job_id),
-        mapping={"status": "queued", PHASE_FIELD: PHASE_QUEUED},
+        mapping={"status": "queued", PHASE_FIELD: PHASE_QUEUED,
+                 REQUEUED_ENTRY_FIELD: entry_id},
     )
     await arm_state_ttl(conn, job_id)
 
@@ -1507,7 +1710,7 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> 
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL, nx=True)
 
 
-async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
+async def reap_stranded_job(conn: redis.Redis, raw: str, entry_id: str) -> None:
     """One entry off a dead worker's processing list: retry it, or fail it."""
     try:
         payload = json.loads(raw)
@@ -1517,6 +1720,14 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
         # job_id names no job, so there is nothing to report a failure on and
         # nowhere to report it. Anything else is failed below rather than
         # dropped.
+        return
+
+    # ALREADY DONE, before the fence and before anything is decided: this
+    # exact entry was requeued on an earlier tick and only its removal
+    # failed. Returning here is what lets the caller remove it — see
+    # REQUEUED_ENTRY_FIELD for what deciding it again would do to the attempt
+    # that is now running.
+    if await conn.hget(state_key(job_id), REQUEUED_ENTRY_FIELD) == entry_id:
         return
 
     # FENCE FIRST, before anything is read and before anything is decided.
@@ -1607,8 +1818,10 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
     # Backpressure applies to requeued work exactly as it does to new work:
     # this is the same one physical list, bounded by the same ceiling, and a
     # pool that is dying faster than it drains must not be the one path that
-    # gets to grow the queue past it. Checked before the counter moves, so a
-    # job refused here has not spent its retry.
+    # gets to grow the queue past it. The bound itself is inside
+    # FAIR_ENQUEUE_LUA; this early read is so that a job refused on a full
+    # queue has not spent its retry, and requeue_orphaned_job() hands the
+    # retry back in the rare case the queue fills in between.
     depth = await conn.llen(QUEUE_KEY)
 
     if depth >= MAX_QUEUE_DEPTH:
@@ -1638,7 +1851,7 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
             f"repeatedly is a cluster problem, not a workflow problem. {DESCRIBE_HINT}.")
         return
 
-    await requeue_orphaned_job(conn, entry, attempt)
+    await requeue_orphaned_job(conn, entry, attempt, entry_id)
 
 
 async def defer_stranded_entry(conn: redis.Redis, key: str, raw: str,
@@ -1727,7 +1940,7 @@ async def reap_processing_list(conn: redis.Redis, key: str) -> None:
             return
 
         try:
-            await reap_stranded_job(conn, raw)
+            await reap_stranded_job(conn, raw, entry_id)
         except Exception:  # noqa: BLE001 - handled by leaving the entry where it is
             await defer_stranded_entry(conn, key, raw, entry_id)
 
@@ -1739,7 +1952,19 @@ async def reap_processing_list(conn: redis.Redis, key: str) -> None:
 
         # Only now, with every write the reap makes landed — the terminal
         # event included — is losing this entry the same as losing nothing.
-        await conn.lrem(key, 1, raw)
+        #
+        # And the removal itself can raise. Routed through the same deferral
+        # as a failed reap, so the claim is released and the next tick tries
+        # the removal again promptly — rather than propagating, leaving the
+        # claim to expire on its own and this entry to be reaped a second
+        # time a minute later. REQUEUED_ENTRY_FIELD is what makes that second
+        # look a removal and not a re-decision.
+        try:
+            await conn.lrem(key, 1, raw)
+        except Exception:  # noqa: BLE001 - the entry is still parked; see above
+            await defer_stranded_entry(conn, key, raw, entry_id)
+            return
+
         await conn.delete(claim_key, f"{REAP_FAILURES_PREFIX}{entry_id}")
 
 
@@ -1794,6 +2019,15 @@ async def generate(request: Request):
     size can be capped while it streams in — by the time FastAPI hands over a
     parsed dict, an oversized body has already been buffered whole.
     """
+    # The body is parsed as JSON whatever the client says it is, so say what
+    # it must be: a form post, or a cross-site text/plain submission a browser
+    # will send without a preflight, must not be able to queue a job.
+    # index.html sends exactly this. Parameters (charset) are allowed.
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+    if media_type != "application/json":
+        raise HTTPException(415, "Content-Type must be application/json")
+
     declared = request.headers.get("content-length", "")
 
     if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
@@ -1821,13 +2055,6 @@ async def generate(request: Request):
         raise HTTPException(400, "body must be a ComfyUI workflow object, or {\"workflow\": {...}}")
 
     conn = client()
-
-    # Backpressure. Without this a stuck worker pool turns into an unbounded
-    # Redis list, and the first symptom is Redis OOM rather than a slow queue.
-    depth = await conn.llen(QUEUE_KEY)
-
-    if depth >= MAX_QUEUE_DEPTH:
-        raise HTTPException(503, f"queue is full ({depth} jobs). Try again shortly.")
 
     # Who spent the GPU, and — since Q1 — whose fair-queueing lane this job
     # belongs to. oauth-proxy sets X-Forwarded-User for the authenticated user
@@ -1888,7 +2115,16 @@ async def generate(request: Request):
     # unlike a doc comment the field name travels with the value to every
     # place it is read.
     keys, args = fair_enqueue_call(envelope)
-    _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+    queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+
+    # Backpressure. Without it a stuck worker pool turns into an unbounded
+    # Redis list, and the first symptom is Redis OOM rather than a slow queue.
+    # Decided INSIDE the script, atomically with the insert — an LLEN here
+    # followed by the enqueue was a window N simultaneous submits all fit
+    # through — and before anything was written, so a refused submit leaves
+    # no payload, no state and no stream behind.
+    if queued_before == QUEUE_FULL:
+        raise HTTPException(503, f"queue is full ({position} jobs). Try again shortly.")
 
     # phase is seeded here rather than left for the worker to create, so the
     # breadcrumb is never absent on a job that exists. The reaper reads a
@@ -1906,8 +2142,8 @@ async def generate(request: Request):
     # the showback key-space bound above ("THE FIELD COUNT IS CAPPED") caps
     # the number of fields, not their size, so an uncapped field name is a
     # second, uncounted way to grow that Hash against `noeviction` Redis.
-    if user:
-        state["user"] = user
+    if envelope["user"]:
+        state["user"] = envelope["user"]
 
     await conn.hset(state_key(job_id), mapping=state)
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
@@ -1966,6 +2202,27 @@ async def cancel(job_id: str):
 # scripts/lint.sh pins this line for that reason.
 TERMINAL_TYPES = {"completed", "failed", "cancelled"}
 
+# Application close codes (the 4000-4999 range the RFC leaves to us), so a
+# browser can tell these apart from a gateway that went away (1006).
+WS_CLOSE_UNKNOWN_JOB = 4404   # no such job, or it expired
+WS_CLOSE_LIFETIME = 4408      # held open for EVENT_STREAM_TTL; reconnect if you still care
+
+# How long one XREAD may block before the loop sends a ping. The ping is
+# what notices a client that has gone away; without it a browser tab closed
+# mid-generation leaves the coroutine parked forever.
+WS_PING_MS = 15_000
+
+
+def xread_block_ms(deadline: float) -> int | None:
+    """How long the next XREAD may block: the ping interval, or the lifetime
+    left if that is shorter — None once the lifetime has run out."""
+    remaining = deadline - time.monotonic()
+
+    if remaining <= 0:
+        return None
+
+    return min(WS_PING_MS, max(1, int(remaining * 1000)))
+
 
 @app.websocket("/ws/{job_id}")
 async def progress(websocket: WebSocket, job_id: str):
@@ -1976,13 +2233,33 @@ async def progress(websocket: WebSocket, job_id: str):
     last_id = "0-0"
     redis_errors = 0
 
+    # Two bounds this socket used to lack, both about the same thing: one
+    # Redis connection is held for as long as this coroutine runs, on a pool
+    # that is now finite (REDIS_MAX_CONNECTIONS).
+    #
+    # A job id that names nothing is closed, not tailed: /ws/<anything> was
+    # accepted and parked forever on an id that never had a job behind it.
+    # And a socket on a real job lives at most EVENT_STREAM_TTL — the stream
+    # it tails expires that long after its last write, so past that it is
+    # blocked on a key that no longer exists. A client that still cares
+    # reconnects and replays, exactly as it would after any other close.
     try:
+        if not await conn.exists(state_key(job_id)):
+            await websocket.close(code=WS_CLOSE_UNKNOWN_JOB, reason="unknown or expired job")
+            return
+
+        deadline = time.monotonic() + EVENT_STREAM_TTL
+
         while True:
-            # BLOCK is in milliseconds. The timeout exists so we can send a ping
-            # and notice a client that has gone away; without it a browser tab
-            # closed mid-generation leaves this coroutine parked forever.
+            block = xread_block_ms(deadline)
+
+            if block is None:
+                await websocket.close(code=WS_CLOSE_LIFETIME,
+                                      reason="stream lifetime reached; reconnect to resume")
+                return
+
             try:
-                entries = await conn.xread({key: last_id}, count=100, block=15_000)
+                entries = await conn.xread({key: last_id}, count=100, block=block)
 
             except redis.RedisError:
                 # A Redis blip is not a job failure — the worker may be running
@@ -2034,11 +2311,36 @@ async def progress(websocket: WebSocket, job_id: str):
             pass
 
 
+def output_url(subfolder, filename) -> str | None:
+    """The /outputs URL for one reported image, or None if it cannot be named
+    safely: the filename and every subfolder component must pass the
+    worker's is_bare_filename() (BEGIN SHARED WORKSPACE)."""
+    if not isinstance(filename, str) or not isinstance(subfolder, str):
+        return None
+
+    components = subfolder.split("/") if subfolder else []
+
+    if not all(is_bare_filename(part) for part in [filename, *components]):
+        return None
+
+    return "/".join(["/outputs", *components, filename])
+
+
 def rewrite_image_urls(event: dict) -> dict:
     """
     ComfyUI reports outputs as {filename, subfolder, type} relative to its own
     output directory. The browser cannot reach the worker, so turn each one into
     a URL this gateway serves off the shared volume.
+
+    With the worker's confinement rule, not without it. The worker applies
+    is_bare_filename() and output_subfolder() to the /history manifest it puts
+    on the terminal event — but a live `executed` event is forwarded from
+    ComfyUI verbatim, and this used to build /outputs/{subfolder}/{filename}
+    from it as it stood. A custom node reporting {subfolder: "../../etc"} was
+    handed to the browser as a URL under /outputs/../../etc; output_file()
+    refuses to serve that, but the refusal was the only thing standing there.
+    An entry that is not made of bare components keeps its event and loses
+    its URL, which is what the worker does with the same shape.
     """
     images = event.get("data", {}).get("output", {}).get("images")
 
@@ -2049,8 +2351,12 @@ def rewrite_image_urls(event: dict) -> dict:
         if not isinstance(image, dict) or "filename" not in image:
             continue
 
-        subfolder = image.get("subfolder") or ""
-        image["url"] = f"/outputs/{subfolder}/{image['filename']}".replace("//", "/")
+        url = output_url(image.get("subfolder") or "", image["filename"])
+
+        if url is None:
+            image.pop("url", None)
+        else:
+            image["url"] = url
 
     return event
 
@@ -2060,22 +2366,72 @@ def rewrite_image_urls(event: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/outputs/{path:path}")
-async def output_file(path: str):
+def caller_identity(request: Request) -> str:
     """
-    Serve a generated image from the shared volume.
+    The X-Forwarded-User on this request, clamped exactly as generate() clamps
+    it before it reaches the envelope — so what output_file() and showback()
+    scope by is the identity the worker named the workspace from and the
+    accrual billed, not a longer string that happens to share a prefix.
+    """
+    return envelope_text(request.headers.get("x-forwarded-user", ""))
 
-    The resolve()-and-compare below is the only thing standing between this
+
+def locate_output(path: str, workspace: str | None) -> pathlib.Path:
+    """
+    The file behind /outputs/<path>, or an HTTPException. Blocking, and meant
+    to be: resolve() and is_file() each stat the shared volume, which is EFS,
+    and output_file() runs this in a worker thread so a slow NFS round trip
+    stalls one request rather than every WebSocket this process is tailing.
+
+    The resolve()-and-compare is the only thing standing between this
     endpoint and an arbitrary file read: a path like ../../etc/passwd resolves
     outside OUTPUT_ROOT and is rejected. Do not "simplify" it into a join.
+
+    `workspace` is the caller's own directory name when reads are scoped, and
+    the containment is checked on the RESOLVED path rather than on the first
+    URL segment: /outputs/<mine>/../<theirs>/x names mine in its first segment
+    and theirs on disk.
     """
     candidate = (OUTPUT_ROOT / path).resolve()
 
     if not candidate.is_relative_to(OUTPUT_ROOT):
         raise HTTPException(403, "path escapes the output directory")
 
+    if workspace is not None and not candidate.is_relative_to(OUTPUT_ROOT / workspace):
+        raise HTTPException(403, "not one of your outputs")
+
     if not candidate.is_file():
         raise HTTPException(404, "no such output")
+
+    return candidate
+
+
+@app.get("/outputs/{path:path}")
+async def output_file(path: str, request: Request):
+    """
+    Serve a generated image from the shared volume.
+
+    Under AUTH_MODE=oauth a caller may read only files inside their own
+    workspace — the directory workspace_name() derives from the identity
+    oauth-proxy put in X-Forwarded-User, which is the same directory the
+    worker wrote their outputs into (BEGIN SHARED WORKSPACE). Before this,
+    the workspace name was a pure function of a username /api/showback
+    listed, so any logged-in user could read any other user's images.
+
+    Under AUTH_MODE=none reads are deliberately NOT scoped, and this is the
+    same argument Q3's workspaces make: there is no proxy, the identity is a
+    header the caller sets on themselves, and a scope keyed on it would be
+    authorization derived from an unauthenticated claim — a control that
+    only pretends to exist. A URL is exactly as guessable there as it was
+    before the workspaces existed, and the docs say so rather than the code
+    implying otherwise.
+    """
+    workspace = None
+
+    if AUTH_MODE == AUTH_MODE_OAUTH:
+        workspace = workspace_name(caller_identity(request))
+
+    candidate = await run_in_threadpool(locate_output, path, workspace)
 
     return FileResponse(candidate)
 
@@ -2180,7 +2536,9 @@ async def gather_stats() -> dict:
     # estimated wait that is briefly optimistic after a crash-restart.
     workers = 0
 
-    async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*"):
+    # COUNT well above the number of live workers, so this is one SCAN round
+    # trip rather than the server default's ten keys at a time.
+    async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*", count=1000):
         workers += 1
 
     return {
@@ -2190,9 +2548,34 @@ async def gather_stats() -> dict:
     }
 
 
+# One snapshot per STATS_CACHE_SECONDS, shared by every caller of /api/stats
+# and /metrics. The lock is what makes "shared" true under load: N tabs
+# polling in the same instant would otherwise all find the cache stale and
+# all scan, which is the burst the cache exists to collapse into one.
+_stats_cache: dict = {"expires": 0.0, "data": None}
+_stats_lock = asyncio.Lock()
+
+
+async def cached_stats() -> dict:
+    """gather_stats(), at most once per STATS_CACHE_SECONDS per process."""
+    if _stats_cache["data"] is not None and time.monotonic() < _stats_cache["expires"]:
+        return _stats_cache["data"]
+
+    async with _stats_lock:
+        # Whoever held the lock may have refreshed it while this caller waited.
+        if _stats_cache["data"] is not None and time.monotonic() < _stats_cache["expires"]:
+            return _stats_cache["data"]
+
+        data = await gather_stats()
+        _stats_cache["data"] = data
+        _stats_cache["expires"] = time.monotonic() + STATS_CACHE_SECONDS
+
+        return data
+
+
 @app.get("/api/stats")
 async def stats():
-    return await gather_stats()
+    return await cached_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -2263,6 +2646,9 @@ async def showback_report(period: str) -> dict:
     return {
         "period": period,
         "users": users,
+        # The submitters' sum with no names attached, so a report scoped to
+        # one caller (showback() below) still says what the pool spent.
+        "users_total_gpu_seconds": round(sum(users.values()), 3),
         "anonymous_gpu_seconds": buckets[SHOWBACK_ANONYMOUS_FIELD],
         "excluded_gpu_seconds": buckets[SHOWBACK_EXCLUDED_FIELD],
         "other_gpu_seconds": buckets[SHOWBACK_OTHER_FIELD],
@@ -2274,13 +2660,25 @@ async def showback_report(period: str) -> dict:
     }
 
 
+def scoped_showback(report: dict, caller: str) -> dict:
+    """The same report with `users` cut down to the caller's own row. The
+    totals — including users_total_gpu_seconds — are left as they are: what
+    the pool spent is not a secret, who spent it is."""
+    users = report["users"]
+
+    return dict(report,
+                users={caller: users[caller]} if caller and caller in users else {},
+                scoped_to=caller or None)
+
+
 @app.get("/api/showback")
-async def showback(period: str | None = None):
+async def showback(request: Request, period: str | None = None):
     """
     Who spent the card this period, in GPU seconds.
 
         {"period": "2026-08",
          "users": {"alice@example.com": 4102.5, ...},
+         "users_total_gpu_seconds": 4102.5,
          "anonymous_gpu_seconds": 0.0,
          "excluded_gpu_seconds": 0.0,
          "other_gpu_seconds": 0.0,
@@ -2307,20 +2705,33 @@ async def showback(period: str | None = None):
     `make park` is safe — the cluster stays and so does the volume. See
     docs/09-engineering-handoff.md section 5.
 
-    Reads are not caller-scoped, deliberately and on the same terms as Q3's
-    output workspaces: under AUTH_MODE=oauth the whole gateway is behind the
-    proxy, and under AUTH_MODE=none the identity this would scope by is a
-    header the caller sets on themselves, so a guarantee that evaporates in
-    one of the two modes is worse than a documented absence. What this exposes
-    beyond /api/jobs/<id> is the LIST of submitters, which is why it is a
-    report an operator reads rather than something linked from the UI.
+    Who may read whose row follows AUTH_MODE, on the same terms as
+    output_file(). Under oauth the identity is the proxy's: a caller named in
+    SHOWBACK_OPERATORS gets the whole report, everyone else gets their own
+    row plus the totals (`scoped_to` says so). What the full report exposes
+    beyond /api/jobs/<id> is the LIST of submitters — and since a workspace
+    name is a pure function of a submitter's identity, that list was the
+    other half of reading someone else's outputs. Under none the report is
+    not scoped at all: the identity this would scope by is a header the
+    caller sets on themselves, and a guarantee that evaporates in one of the
+    two modes is worse than a documented absence.
     """
     period = period or showback_period(time.time())
 
     if not SHOWBACK_PERIOD_PATTERN.match(period):
         raise HTTPException(400, "period must be a UTC calendar month, e.g. 2026-08")
 
-    return await showback_report(period)
+    report = await showback_report(period)
+
+    if AUTH_MODE != AUTH_MODE_OAUTH:
+        return report
+
+    caller = caller_identity(request)
+
+    if caller in SHOWBACK_OPERATORS:
+        return report
+
+    return scoped_showback(report, caller)
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
@@ -2331,7 +2742,7 @@ async def metrics():
     the ServiceMonitor enterprise/setup.sh applies, which is what makes
     "queue deeper than N for 30 minutes" an alert instead of a support ticket.
     """
-    data = await gather_stats()
+    data = await cached_stats()
 
     text = (
         "# HELP comfy_queue_depth Jobs waiting in the Redis queue.\n"
@@ -2362,9 +2773,8 @@ async def metrics():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    page = STATIC_ROOT / "index.html"
-
-    if not page.is_file():
+    # Read once at startup (lifespan): no file I/O on the event loop per hit.
+    if _index_html is None:
         return HTMLResponse("<h1>ComfyUI Gateway</h1><p>API is up. See /docs.</p>")
 
-    return HTMLResponse(page.read_text())
+    return HTMLResponse(_index_html)

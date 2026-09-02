@@ -83,7 +83,29 @@ def get(path):
     return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
 
 
+# /metrics and /api/stats serve one shared snapshot per STATS_CACHE_SECONDS
+# (hub.py's cached_stats(): the endpoints are polled unauthenticated, and each
+# call used to be a keyspace SCAN). So a read taken right after the queue
+# changed can legitimately be up to that old, and every read here first waits
+# the window out -- the assertions below are about the gauge's VALUE, and a
+# stale snapshot is not a wrong value.
+STATS_CACHE_SECONDS = float(os.environ.get("STATS_CACHE_SECONDS", "5"))
+HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "60"))
+
+
 def read_metrics():
+    # Waiting the window out lengthens the freeze below past HEARTBEAT_TTL,
+    # and a lapsed heartbeat IS a death to the reaper, which would then
+    # requeue the frozen agent's own job and move the queue under these
+    # assertions. So the frozen agent's heartbeat is re-armed while waiting
+    # -- check-55-retry-placement.py's technique; only the expiry is touched.
+    deadline = time.time() + STATS_CACHE_SECONDS + 0.5
+
+    while time.time() < deadline:
+        for key in r.scan_iter(match="comfy:worker:*"):
+            r.expire(key, HEARTBEAT_TTL)
+        time.sleep(0.2)
+
     return urllib.request.urlopen(GW + "/metrics", timeout=10).read().decode()
 
 
@@ -268,6 +290,12 @@ try:
         except json.JSONDecodeError:
             entries.append({})
 
+    # The gauge is read BEFORE the ages are computed: read_metrics() waits
+    # the cache window out, and the ages must be taken from the same moment
+    # as the snapshot they are compared with. The list cannot change in
+    # between -- the agent is frozen.
+    text_3 = read_metrics()
+
     now = time.time()
     head, tail = (entries[0], entries[-1]) if entries else ({}, {})
     head_age = now - (head.get("submitted_at") or now)
@@ -290,7 +318,7 @@ try:
           tail_age - head_age >= STALE_AGE * 0.5,
           {"head_age": round(head_age, 1), "tail_age": round(tail_age, 1)})
 
-    value_3 = gauge_or_zero(read_metrics(), GAUGE_NAME)
+    value_3 = gauge_or_zero(text_3, GAUGE_NAME)
 
     # Both ages are read off the list itself rather than restated from
     # STALE_AGE, so this compares the gauge against the queue's own contents.
