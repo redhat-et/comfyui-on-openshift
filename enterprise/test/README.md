@@ -382,6 +382,24 @@ outage. What it cannot see is the *shape* of that separation — a health
 endpoint that reads the quota is green whenever its reader is under the cap —
 so `scripts/lint.sh` walks `hub.py`'s call graph for it.
 
+## The pytest layer (`enterprise/test/unit/`)
+
+Everything above proves the system through a real submit against a real
+Redis and a stub ComfyUI. `enterprise/test/unit/` is the other half: pure
+functions in `hub.py` and `worker_agent.py`, called directly, in-process,
+with no Redis and no ComfyUI at all -- `python3 -m pytest enterprise/test/unit`,
+under a second. It exists for the functions where the interesting behaviour
+is a return value for a given input rather than an effect on the system: the
+queue envelope's round trip and its field clamp, `workspace_name()`'s
+hostile-input and unicode handling, the Dec→Jan and leap-February boundaries
+in `quota_period_reset()`/`showback_period()`, and the path-confinement
+functions (`is_bare_filename()`, `output_subfolder()`, `output_url()`,
+`locate_output()`) including a planted symlink, which this suite can arrange
+far more cheaply than a two-pod EFS scenario. `enterprise/test/unit/README.md`
+lists exactly what is covered and what is deliberately left to the checks
+above instead. It is wired into `make test` (first, since it is the fastest
+layer) and into CI as its own step.
+
 ## What it does not cover
 
 Anything requiring a real cluster: KEDA actually scaling, the machine pool

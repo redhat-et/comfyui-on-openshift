@@ -8,11 +8,16 @@ ComfyUI on your machine. You need `redis-server` on PATH (`brew install redis`
 or `apt-get install redis-server`) and:
 
 ```bash
-pip install -r enterprise/gateway/requirements.txt websocket-client
+pip install -r enterprise/gateway/requirements.txt -r enterprise/test/unit/requirements-test.txt websocket-client
 make test
 ```
 
-That runs the shell unit tests first (`scripts/unit-tests.sh` — instant, no
+That runs a pytest layer first (`python3 -m pytest enterprise/test/unit` —
+in-process, no Redis, no ComfyUI: it imports `hub.py` and `worker_agent.py`
+directly and calls their pure functions, things like the queue envelope's
+round trip, `workspace_name()`'s hostile-input and unicode handling, and the
+Dec→Jan/leap-Feb calendar-month math behind quotas and showback, under a
+second), then the shell unit tests (`scripts/unit-tests.sh` — instant, no
 dependencies, pins the parsing edge cases like AWS CLI's tab-separated
 output), then the e2e suite.
 
