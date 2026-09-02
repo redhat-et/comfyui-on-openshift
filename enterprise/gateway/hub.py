@@ -2101,11 +2101,52 @@ async def progress(websocket: WebSocket, job_id: str):
             pass
 
 
+def is_bare_filename(name: str) -> bool:
+    """
+    True iff `name` is a single path component: no separator, no NUL, and not
+    "." or "..". This is the confinement rule for the REPORTED FILENAME,
+    mirroring what workspace_path() already enforces for the reported
+    workspace — a run of unsafe characters cannot be un-collapsed into a
+    traversal the way a raw "/" or ".." can.
+
+    ComfyUI's own manifest entries never put a separator in `filename`;
+    `subfolder` is the only field a save node uses to nest. So a `filename`
+    that fails this is not ComfyUI's own shape and is refused outright rather
+    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    """
+    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+
+
+def output_url(subfolder, filename) -> str | None:
+    """The /outputs URL for one reported image, or None if it cannot be named
+    safely: the filename and every subfolder component must pass the
+    worker's is_bare_filename() (BEGIN SHARED WORKSPACE)."""
+    if not isinstance(filename, str) or not isinstance(subfolder, str):
+        return None
+
+    components = subfolder.split("/") if subfolder else []
+
+    if not all(is_bare_filename(part) for part in [filename, *components]):
+        return None
+
+    return "/".join(["/outputs", *components, filename])
+
+
 def rewrite_image_urls(event: dict) -> dict:
     """
     ComfyUI reports outputs as {filename, subfolder, type} relative to its own
     output directory. The browser cannot reach the worker, so turn each one into
     a URL this gateway serves off the shared volume.
+
+    With the worker's confinement rule, not without it. The worker applies
+    is_bare_filename() and output_subfolder() to the /history manifest it puts
+    on the terminal event — but a live `executed` event is forwarded from
+    ComfyUI verbatim, and this used to build /outputs/{subfolder}/{filename}
+    from it as it stood. A custom node reporting {subfolder: "../../etc"} was
+    handed to the browser as a URL under /outputs/../../etc; output_file()
+    refuses to serve that, but the refusal was the only thing standing there.
+    An entry that is not made of bare components keeps its event and loses
+    its URL, which is what the worker does with the same shape.
     """
     images = event.get("data", {}).get("output", {}).get("images")
 
@@ -2116,8 +2157,12 @@ def rewrite_image_urls(event: dict) -> dict:
         if not isinstance(image, dict) or "filename" not in image:
             continue
 
-        subfolder = image.get("subfolder") or ""
-        image["url"] = f"/outputs/{subfolder}/{image['filename']}".replace("//", "/")
+        url = output_url(image.get("subfolder") or "", image["filename"])
+
+        if url is None:
+            image.pop("url", None)
+        else:
+            image["url"] = url
 
     return event
 

@@ -234,6 +234,66 @@ sock.close()
 check("a body declared larger than MAX_BODY_BYTES is refused with 413 before it is read",
       b" 413 " in status_line, status_line)
 
+print("\n== url rewriting confines what a raw ComfyUI event reports")
+# Live `executed` events reach the browser through rewrite_image_urls() with
+# whatever {filename, subfolder} ComfyUI (or a custom node) put in them -- the
+# worker's confinement applies to the /history manifest it builds the terminal
+# event from, not to the events it forwards verbatim. The stream is written
+# directly: this is about what the gateway does with an event, not about how
+# a worker produces one. A filename or subfolder component that is not a bare
+# single path component must lose its URL (the event itself is still
+# delivered); ordinary shapes must still get one.
+r = redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
+                   password=os.environ.get("REDIS_PASSWORD") or None, decode_responses=True)
+fake_job = f"rewrite-{uuid.uuid4().hex[:12]}"
+state_k, stream_k = f"comfy:job:{fake_job}:state", f"comfy:job:{fake_job}:events"
+r.hset(state_k, mapping={"status": "running"})
+r.expire(state_k, 120)
+REPORTED = [
+    {"filename": "ok.png", "subfolder": "ws-abc", "type": "output"},
+    {"filename": "flat.png", "subfolder": "", "type": "output"},
+    {"filename": "deep.png", "subfolder": "ws-abc/run1", "type": "output"},
+    {"filename": "../../etc/passwd", "subfolder": "", "type": "output"},
+    {"filename": "x.png", "subfolder": "../../etc", "type": "output"},
+    {"filename": "x.png", "subfolder": "/abs", "type": "output"},
+    {"filename": "a/b.png", "subfolder": "", "type": "output"},
+    {"filename": "..", "subfolder": "ws-abc", "type": "output"},
+    {"filename": "x.png", "subfolder": "ws-abc//run1", "type": "output"},
+]
+r.xadd(stream_k, {"data": json.dumps({"type": "executed", "data": {
+    "node": "9", "prompt_id": "p-rewrite", "output": {"images": REPORTED}}})})
+r.xadd(stream_k, {"data": json.dumps({"type": "completed", "data": {"images": []}})})
+r.expire(stream_k, 120)
+
+ws4 = websocket.WebSocket()
+ws4.connect(f"ws://127.0.0.1:8100/ws/{fake_job}", timeout=10)
+ws4.settimeout(10)
+executed = None
+while True:
+    try:
+        m = json.loads(ws4.recv())
+    except Exception:  # noqa: BLE001
+        break
+    if m.get("type") == "executed":
+        executed = m
+    if m.get("type") in ("completed", "failed", "cancelled"):
+        break
+ws4.close()
+
+got = (executed or {}).get("data", {}).get("output", {}).get("images", [])
+urls = [image.get("url") for image in got]
+check("the executed event itself was delivered with every image entry intact",
+      len(got) == len(REPORTED), urls)
+check("ordinary entries are rewritten to gateway URLs",
+      urls[:3] == ["/outputs/ws-abc/ok.png", "/outputs/flat.png", "/outputs/ws-abc/run1/deep.png"],
+      urls[:3])
+check("a filename or subfolder that is not made of bare path components gets NO "
+      "url -- traversal, an absolute subfolder, a separator inside filename, "
+      "'..' as a filename and an empty component are all dropped rather than "
+      "handed to the browser as /outputs/../...",
+      all(url is None for url in urls[3:]), urls[3:])
+r.delete(state_k, stream_k)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")
