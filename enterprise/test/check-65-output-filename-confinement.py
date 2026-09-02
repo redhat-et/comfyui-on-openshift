@@ -278,6 +278,45 @@ check("the manifest's own `filename` is still the real, unencoded name -- the "
       "escaping belongs to the URL and nowhere else",
       images and images[0]["filename"] == awkward_filename, images)
 
+# ---------------------------------------------------------------------------
+# (g) a manifest naming a file inside ANOTHER submitter's workspace is
+#     refused rather than moved into this one
+# ---------------------------------------------------------------------------
+print("\n== (g) an output reported inside another user's workspace is refused, not moved")
+
+# output_subfolder() moves a file a node wrote outside the submitter's
+# workspace INTO it, so that outputs from custom nodes with hardcoded paths
+# are still served from the right place. The move is an os.replace, and
+# before this scenario the only thing it checked was "inside OUTPUT_ROOT and
+# not already inside mine" -- which is satisfied by a file inside somebody
+# ELSE's workspace. A manifest entry naming one (a custom node that lets the
+# workflow choose its subfolder is enough) therefore took another user's
+# finished file, moved it under this submitter's directory and handed this
+# submitter a URL for it. That is a cross-user read AND a deletion from the
+# victim's point of view, and it needs no traversal to reach: workspace
+# names are derived from usernames the /api/showback report lists.
+seed_output()
+victim_dir = OUTPUT_ROOT / control_workspace
+victim_dir.mkdir(parents=True, exist_ok=True)
+victim_file = victim_dir / "private_0001.png"
+victim_file.write_bytes(b"alice's private render")
+set_next_output("private_0001.png", subfolder=control_workspace)
+job_id, terminal = submit_and_wait("mallory-two")
+check("the job still completes -- a refused output does not fail the job",
+      terminal and terminal["type"] == "completed", terminal)
+images = (terminal or {}).get("data", {}).get("images", [])
+check("no image is reported for a file that lives in another submitter's "
+      "workspace -- not moved-and-served, not served in place, just refused",
+      images == [], images)
+check("and the other submitter's file is exactly where it was, untouched",
+      victim_file.exists() and victim_file.read_bytes() == b"alice's private render",
+      victim_file)
+mallory_dirs = [d for d in OUTPUT_ROOT.iterdir()
+                if d.is_dir() and d.name.startswith("mallory-two-")]
+stolen = [p for d in mallory_dirs for p in d.rglob("private_0001.png")]
+check("nothing under this submitter's own workspace now holds the victim's file",
+      stolen == [], stolen)
+
 print()
 if failures:
     print(f"{len(failures)} FAILED: {failures}")

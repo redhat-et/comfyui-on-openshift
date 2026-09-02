@@ -1223,6 +1223,25 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str
     if reported.is_relative_to(ws_root):
         return subfolder, filename  # already scoped, by the prefix rewrite
 
+    # Inside OUTPUT_ROOT, outside this workspace — the move below exists for
+    # exactly that, so a custom node that hardcodes its own subfolder still
+    # has its output served from the right place. But "not inside mine" is
+    # satisfied by "inside somebody else's", and the move is an os.replace:
+    # a manifest naming a file in another submitter's workspace (any node
+    # that lets the workflow choose its subfolder will do, and workspace
+    # names derive from usernames /api/showback lists) took that user's
+    # finished file, put it under this submitter's directory and handed
+    # this submitter a URL for it — a cross-user read that is also a
+    # deletion. No legitimate job writes there: scoped_prefix() puts a
+    # prefix naming another workspace INSIDE the submitter's own. Refused,
+    # and the file is not touched.
+    inside = reported.relative_to(OUTPUT_ROOT).parts
+
+    if len(inside) > 1 and looks_like_workspace(inside[0]):
+        log(f"warning: output {subfolder}/{filename} is inside workspace {inside[0]!r}, "
+            f"not {workspace!r} — not moved, not served")
+        return workspace, ""
+
     if not reported.exists():
         # A node reported a file it did not write, or something else removed
         # it. There is nothing to move and nothing to serve either way, so
