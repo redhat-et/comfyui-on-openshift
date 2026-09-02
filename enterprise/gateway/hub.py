@@ -1235,6 +1235,12 @@ def client() -> redis.Redis:
             password=REDIS_PASSWORD,
             decode_responses=True,
             health_check_interval=30,
+            # Explicit, because redis-py 8 changed the default to 5 seconds,
+            # which turns every blocking XREAD in progress() below into a
+            # "Timeout reading from ..." raise instead of a wait. None is what
+            # redis-py < 8 always did; writing it down is what lets
+            # requirements.txt's ceiling be lifted after a re-test.
+            socket_timeout=None,
             max_connections=REDIS_MAX_CONNECTIONS,
         )
 
