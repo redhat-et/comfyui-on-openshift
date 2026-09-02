@@ -234,6 +234,10 @@ sock.close()
 check("a body declared larger than MAX_BODY_BYTES is refused with 413 before it is read",
       b" 413 " in status_line, status_line)
 
+print("\n== the landing page is served")
+page = urllib.request.urlopen(GW + "/", timeout=10).read().decode()
+check("GET / serves index.html", "ComfyUI" in page and "/api/generate" in page, page[:80])
+
 print("\n== a WebSocket for a job that does not exist is closed, not held open")
 # Before this, /ws/<anything> was accepted and parked on a 15-second XREAD loop
 # forever, one Redis connection each, for an id that names no job and never

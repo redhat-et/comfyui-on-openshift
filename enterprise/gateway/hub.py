@@ -41,6 +41,7 @@ import uuid
 import redis.asyncio as redis
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -1196,6 +1197,14 @@ async def lifespan(_app: FastAPI):
     # reap_stranded_job() below, not from this.
     reaper = asyncio.create_task(reap_orphaned_jobs())
 
+    # The landing page, once. Read here rather than per request because a
+    # blocking read on the event loop stalls every WebSocket this process is
+    # tailing for the duration, and the file never changes inside a running
+    # container. Nothing is being served yet, so blocking here costs nothing.
+    global _index_html
+    page = STATIC_ROOT / "index.html"
+    _index_html = page.read_text() if page.is_file() else None
+
     yield
 
     # Cancel, then AWAIT the cancellation: a task cancelled and dropped is one
@@ -1214,6 +1223,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="ComfyUI Gateway", lifespan=lifespan)
 
 _redis: redis.Redis | None = None
+_index_html: str | None = None
 
 
 def client() -> redis.Redis:
@@ -2275,12 +2285,14 @@ def rewrite_image_urls(event: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/outputs/{path:path}")
-async def output_file(path: str):
+def locate_output(path: str) -> pathlib.Path:
     """
-    Serve a generated image from the shared volume.
+    The file behind /outputs/<path>, or an HTTPException. Blocking, and meant
+    to be: resolve() and is_file() each stat the shared volume, which is EFS,
+    and output_file() runs this in a worker thread so a slow NFS round trip
+    stalls one request rather than every WebSocket this process is tailing.
 
-    The resolve()-and-compare below is the only thing standing between this
+    The resolve()-and-compare is the only thing standing between this
     endpoint and an arbitrary file read: a path like ../../etc/passwd resolves
     outside OUTPUT_ROOT and is rejected. Do not "simplify" it into a join.
     """
@@ -2291,6 +2303,14 @@ async def output_file(path: str):
 
     if not candidate.is_file():
         raise HTTPException(404, "no such output")
+
+    return candidate
+
+
+@app.get("/outputs/{path:path}")
+async def output_file(path: str):
+    """Serve a generated image from the shared volume."""
+    candidate = await run_in_threadpool(locate_output, path)
 
     return FileResponse(candidate)
 
@@ -2604,9 +2624,8 @@ async def metrics():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    page = STATIC_ROOT / "index.html"
-
-    if not page.is_file():
+    # Read once at startup (lifespan): no file I/O on the event loop per hit.
+    if _index_html is None:
         return HTMLResponse("<h1>ComfyUI Gateway</h1><p>API is up. See /docs.</p>")
 
-    return HTMLResponse(page.read_text())
+    return HTMLResponse(_index_html)
