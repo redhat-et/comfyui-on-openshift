@@ -448,6 +448,20 @@ expect_true "lint fails a worker manifest that mounts a ServiceAccount token not
     lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-mounts-sa-token.yaml" \
     "does not set automountServiceAccountToken: false"
 
+# W4's two halves, one fixture each. The Secret key is the loud half — a
+# reviewer can see `key: password` in a diff — and the URL is the silent one:
+# a redis:// URL with no username authenticates as `default` however correct
+# the password beside it, so the least-privilege user is bypassed with every
+# pod healthy and every job running. A single fixture breaking both would pass
+# with either rule deleted.
+expect_true "lint fails a worker manifest that takes the ADMIN Redis password" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-holds-admin-redis-password.yaml" \
+    "the ADMIN Redis credential"
+
+expect_true "lint fails a worker manifest whose REDIS_URL names no user, silently authenticating as default" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-redis-url-has-no-user.yaml" \
+    "with no username"
+
 cleanup_manifest_fixture_drops
 trap - EXIT
 

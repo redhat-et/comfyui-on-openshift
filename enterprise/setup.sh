@@ -114,11 +114,36 @@ ok "volumes present"
 
 log "Secrets"
 
+# Alphanumeric only: this value is substituted into a redis-server `--user`
+# ACL rule and into a redis:// URL's credentials, and neither place wants to
+# meet a '+', a '/' or an '='.
+redis_password()
+{
+    head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32
+}
+
+# TWO passwords, because there are two Redis users (00-redis.yaml). `password`
+# is the admin credential — the gateway's, KEDA's, and the readiness probe's.
+# `worker_password` belongs to the least-privilege `comfy-worker` ACL user and
+# is the only Redis credential a GPU pod, and therefore any custom node
+# running in one, ever sees.
 if oc get secret comfy-redis -n "$APP_NAMESPACE" >/dev/null 2>&1; then
-    ok "comfy-redis exists (delete it to rotate the password)"
+    if oc get secret comfy-redis -n "$APP_NAMESPACE" \
+        -o jsonpath='{.data.worker_password}' 2>/dev/null | grep -q .; then
+        ok "comfy-redis exists (delete it to rotate both passwords)"
+    else
+        # A namespace deployed before the worker had its own user. Add the
+        # second password rather than recreating the Secret: rotating the admin
+        # password here would leave the running gateway pods authenticating
+        # with the old one until they happen to restart.
+        oc patch secret comfy-redis -n "$APP_NAMESPACE" --type merge \
+            -p "{\"stringData\":{\"worker_password\":\"$(redis_password)\"}}" >/dev/null
+        ok "comfy-redis gained worker_password (the worker's own ACL user)"
+    fi
 else
     oc create secret generic comfy-redis -n "$APP_NAMESPACE" \
-        --from-literal=password="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32)"
+        --from-literal=password="$(redis_password)" \
+        --from-literal=worker_password="$(redis_password)"
     ok "comfy-redis created"
 fi
 

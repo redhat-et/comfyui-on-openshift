@@ -406,13 +406,78 @@ for f, doc in docs:
 
     # Redis must not evict. The default policy silently drops queued jobs
     # under memory pressure, which presents as work vanishing at random.
+    #
+    # And the worker's ACL user must stay least-privilege. Widening it is the
+    # silent half of the pair below: the worker Deployment carrying the admin
+    # password is a visible, greppable mistake, whereas `+@all` appended to
+    # this rule list leaves every manifest looking correct, every test passing,
+    # and arbitrary custom-node Python holding a credential that can FLUSHALL
+    # the queue or CONFIG SET the memory ceiling out from under it.
     for c in containers:
         if c.get('name') != 'redis':
             continue
+
         args = [str(a) for a in (c.get('args') or [])]
+
         if 'noeviction' not in args:
             bad(f, "the redis container does not set maxmemory-policy "
                    "noeviction — the default evicts queued jobs")
+
+        if 'comfy-worker' not in args:
+            bad(f, "the redis container defines no comfy-worker ACL user. The "
+                   "worker authenticates as that user (02-worker.yaml's "
+                   "REDIS_URL names it); without the user here, either every "
+                   "worker fails to authenticate or somebody has quietly put "
+                   "the admin password back into the GPU pods")
+        else:
+            rules = args[args.index('comfy-worker'):]
+
+            if '-@all' not in rules:
+                bad(f, "the comfy-worker ACL user does not start from -@all. "
+                       "An allowlist that is not preceded by a deny-all is an "
+                       "addition to the default permissions, not a restriction "
+                       "of them")
+
+            widened = [r for r in rules
+                       if r in ('+@all', 'allcommands', '~*', 'allkeys',
+                                'nopass', '&*', 'allchannels')]
+
+            if widened:
+                bad(f, f"the comfy-worker ACL user carries {widened}, which "
+                       "undoes the point of it having its own user. This is "
+                       "the credential arbitrary custom-node Python on a GPU "
+                       "node can read out of its own environment")
+
+    # The worker must never hold the admin Redis password (W4). It runs
+    # arbitrary custom-node Python, and anything running in that container can
+    # read its own environment; the `password` key of comfy-redis is the
+    # gateway's and KEDA's credential for the whole keyspace.
+    if kind == 'Deployment' and dig(doc, 'spec', 'selector', 'matchLabels',
+                                    'app') == 'comfy-worker':
+        for c in containers:
+            for entry in (c.get('env') or []):
+                if not isinstance(entry, dict):
+                    continue
+
+                ref = dig(entry, 'valueFrom', 'secretKeyRef')
+
+                if isinstance(ref, dict) and ref.get('name') == 'comfy-redis' \
+                        and ref.get('key') == 'password':
+                    bad(f, f"{kind}/{name} container {c.get('name')} takes "
+                           f"env {entry.get('name')} from comfy-redis/password "
+                           "— the ADMIN Redis credential. The worker has its "
+                           "own least-privilege ACL user; it wants "
+                           "comfy-redis/worker_password")
+
+            url = env_of(c, 'REDIS_URL')
+
+            if url is not None and not re.match(r'^redis://[^/@]+@', url):
+                bad(f, f"{kind}/{name} container {c.get('name')} has "
+                       f"REDIS_URL={url!r} with no username. redis.from_url() "
+                       "then authenticates as `default`, the admin user, "
+                       "whatever password it is handed — so the least-"
+                       "privilege ACL user is bypassed silently and nothing "
+                       "fails")
 
     # Under AUTH_MODE=oauth the gateway itself must be rebound to loopback,
     # or the proxy is a formality: anything in the cluster reaches :8000

@@ -41,6 +41,21 @@ Changing `AUTH_MODE` is also just an edit-and-re-run: switching oauth → none,
 `setup.sh` detects the leftover oauth-proxy sidecar and recreates the gateway
 without it.
 
+### Two Redis users, not one
+
+The `comfy-redis` Secret holds two passwords. `password` is the admin
+credential — the gateway's, KEDA's, and the readiness probe's. `worker_password`
+belongs to a Redis ACL user called `comfy-worker` that is allowed exactly the
+commands `worker_agent.py` issues, against exactly the five key patterns it
+names, and nothing else: no `FLUSHALL`, no `CONFIG`, no `SCAN`, no reading a key
+outside its own.
+
+That is the only Redis credential a GPU pod ever holds, which matters because a
+GPU pod runs whatever custom-node Python is baked into the image and anything
+running there can read its own environment. `setup.sh` generates both, and adds
+the second one to a namespace deployed before this existed without rotating the
+first. Delete the Secret to rotate both.
+
 ### Why `rwx` is not optional here
 
 The gateway serves finished images off the same volume the workers write them

@@ -81,6 +81,15 @@ spec:
                 secretKeyRef:
                   name: comfy-redis
                   key: password
+            # The second password: the worker's ACL user, below. A separate
+            # key in the same Secret so rotating one does not rotate the other,
+            # and so the worker Deployment can reference the one it is allowed
+            # to have without ever naming the admin key.
+            - name: REDIS_WORKER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: comfy-redis
+                  key: worker_password
 
           # appendonly gives durability across a pod restart. maxmemory-policy
           # noeviction is the important one: the default would silently evict
@@ -106,6 +115,84 @@ spec:
             - 512mb
             - --maxmemory-policy
             - noeviction
+
+            # ---------------------------------------------------------------
+            # The worker's Redis identity, and the reason it is not `default`.
+            #
+            # A worker pod runs whatever custom-node Python is baked into the
+            # image, on a GPU node, and until this block existed that code
+            # shared ONE password with the gateway and with KEDA. Anything
+            # running in the pod could read it out of the environment and then
+            # do anything Redis can do: FLUSHALL the queue, rewrite another
+            # user's job state, read every submitter identity out of the
+            # showback hashes, or simply CONFIG SET a smaller maxmemory and
+            # watch the queue evaporate.
+            #
+            # So the worker gets its own user, allowed exactly the commands
+            # worker_agent.py issues and exactly the keys it names — read out
+            # of the source, not guessed:
+            #
+            #   PING                       health_check_interval and connect
+            #   SET/DEL   comfy:worker:*   the heartbeat and its removal
+            #   BLMOVE    comfy:queue -> comfy:processing:*   the only pop
+            #   LREM      comfy:processing:*                  the ack
+            #   GET/DEL   comfy:job:*      the payload beside the queue entry
+            #   XADD      comfy:job:*      the progress stream
+            #   EXPIRE    comfy:job:*      arming the stream and state TTLs
+            #   HGET/HSET comfy:job:*      owner, phase, cancel, status
+            #   EVALSHA + SCRIPT LOAD      SHOWBACK_ACCRUE_LUA, which redis-py
+            #                              loads on first NOSCRIPT
+            #
+            # and the Lua's own calls, because Redis 7 runs a script with the
+            # CALLING user's permissions and checks every redis.call inside it:
+            # HGET, HDEL, HEXISTS, HLEN, HINCRBYFLOAT, HSET and EXPIRE against
+            # the job's state hash and comfy:showback:<period>. Deleting a
+            # command from this list does not fail the build; it fails one
+            # Redis call at runtime, so the list is pinned by scripts/lint.sh.
+            #
+            # What it does NOT get: -@all first, so nothing outside the list
+            # above is reachable — no FLUSHALL, no CONFIG, no SCAN, no KEYS, no
+            # DEBUG, no reading a key outside the five patterns. resetchannels
+            # because nothing here uses pub/sub at all.
+            #
+            # `default` deliberately stays broad. It is the gateway's user (the
+            # gateway is trusted with the whole keyspace by construction — it
+            # is the thing that writes it), KEDA's, and the readiness probe's;
+            # narrowing it is a separate change with three consumers to prove,
+            # and it is not the credential arbitrary node code can read.
+            #
+            # Each token is its own argument on purpose: redis-server quotes
+            # every non-`--` argv element before parsing it, so "on >x ~y" as
+            # one element arrives as one nonsense token, not three rules.
+            # ---------------------------------------------------------------
+            - --user
+            - comfy-worker
+            - "on"
+            - ">$(REDIS_WORKER_PASSWORD)"
+            - resetchannels
+            - "~comfy:queue"
+            - "~comfy:processing:*"
+            - "~comfy:worker:*"
+            - "~comfy:job:*"
+            - "~comfy:showback:*"
+            - -@all
+            - +ping
+            - +client|setinfo
+            - +get
+            - +set
+            - +del
+            - +blmove
+            - +lrem
+            - +xadd
+            - +expire
+            - +hget
+            - +hset
+            - +hdel
+            - +hexists
+            - +hlen
+            - +hincrbyfloat
+            - +evalsha
+            - +script|load
 
           resources:
             requests:

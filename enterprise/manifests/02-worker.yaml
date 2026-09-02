@@ -85,13 +85,24 @@ spec:
           image: comfy-worker:latest
 
           env:
+            # The username is in the URL and the password is beside it, which
+            # is the whole of the wiring for the least-privilege Redis user
+            # defined in 00-redis.yaml: redis.from_url() reads the user out of
+            # the URL and takes the password from the keyword argument, so
+            # worker_agent.py needed no change at all. Do not put the password
+            # in the URL — it would land in the pod spec in clear text.
+            #
+            # This pod must never hold the `password` key of comfy-redis. That
+            # is the admin credential the gateway and KEDA use, and anything
+            # running in this container can read the environment; scripts/lint.sh
+            # fails a worker Deployment that names it.
             - name: REDIS_URL
-              value: redis://redis:6379/0
+              value: redis://comfy-worker@redis:6379/0
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: comfy-redis
-                  key: password
+                  key: worker_password
             - name: QUEUE_KEY
               value: comfy:queue
             - name: JOB_TIMEOUT
