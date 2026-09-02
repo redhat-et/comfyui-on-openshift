@@ -1,8 +1,10 @@
 # The checks CONTRIBUTING.md asks for, enforced instead of trusted.
 #
-# Both jobs delegate to the same make targets a contributor runs locally
-# (`make lint`, `make test`), so the local and CI invocations cannot drift —
-# the logic lives in scripts/lint.sh and enterprise/test/run.sh.
+# The lint and e2e jobs delegate to the same make targets a contributor runs
+# locally (`make lint`, `make test`), so the local and CI invocations cannot
+# drift — the logic lives in scripts/lint.sh and enterprise/test/run.sh. Two
+# more jobs (comfyui-smoke, image-uid) cover things a laptop `make` run does
+# not: the real pinned ComfyUI booting, and arbitrary-UID compatibility.
 name: ci
 
 on:
@@ -10,11 +12,25 @@ on:
     branches: [master]
   pull_request:
 
+# A new push to the same PR (or branch) supersedes the in-flight run instead
+# of queueing behind it — these jobs build Docker images and are not free,
+# and only the latest commit's result matters for a PR check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Default GITHUB_TOKEN scope on pull_request is otherwise whatever the org
+# default is (can be write); none of these jobs need more than reading the
+# repo.
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: install lint tools
         run: |
@@ -22,21 +38,70 @@ jobs:
           sudo apt-get install -y -qq shellcheck
           python3 -m pip install --quiet pyyaml
 
+      - name: install kubeconform
+        run: |
+          # Pinned release binary rather than `go install`, so this job does
+          # not need a Go toolchain just to check manifest shapes. Checksum
+          # is the one published in the release's own CHECKSUMS file.
+          curl -sSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz
+          echo "9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883  kubeconform.tar.gz" | sha256sum -c -
+          tar xzf kubeconform.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          rm -f kubeconform.tar.gz kubeconform
+
+      - name: validate manifests against Kubernetes/OpenShift/KEDA schemas
+        run: |
+          # -ignore-missing-schemas: route.openshift.io/v1 Route and the core
+          # NetworkPolicy kind have no entry in kubeconform's default schema
+          # catalog, and this repo has no vendored OpenShift CRD schema to
+          # point at instead. KEDA's ScaledObject/TriggerAuthentication DO
+          # have a maintained schema catalog (datreeio/CRDs-catalog), so that
+          # is added as a second -schema-location rather than also ignored.
+          #
+          # enterprise/manifests/05-oauth-proxy-patch.yaml is a
+          # strategic-merge patch fragment (no kind/apiVersion of its own,
+          # applied by scripts/05-deploy.sh) rather than a standalone
+          # manifest; kubeconform has no notion of "not a full resource", so
+          # it is excluded by name instead of reported as a false failure.
+          kubeconform -strict -ignore-missing-schemas -summary \
+            -ignore-filename-pattern '.*05-oauth-proxy-patch\.yaml' \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            manifests/base enterprise/manifests
+
+      - name: kustomize build manifests/base
+        run: |
+          # kustomize ships preinstalled on the ubuntu-latest runner image
+          # (actions/runner-images), so no install step here. enterprise/
+          # manifests has no kustomization.yaml — those are applied directly,
+          # not through an overlay — so only manifests/base has a build to
+          # validate; the rendered output is fed back through kubeconform so
+          # a kustomize-only mistake (e.g. a patch producing something the
+          # raw files don't show) is still schema-checked.
+          kustomize build manifests/base | kubeconform -strict -ignore-missing-schemas -summary
+
       - name: make lint
         run: make lint
 
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: install redis and python deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq redis-server
-          # Gateway deps cover the worker's redis; websocket-client is the
-          # worker's other dep and what the checks use to talk to the gateway.
-          python3 -m pip install --quiet -r enterprise/gateway/requirements.txt websocket-client
+          # Both requirements files, not gateway's plus a hand-typed
+          # websocket-client: the worker's requirements.txt already declares
+          # websocket-client (what the checks use to talk to the gateway),
+          # and its own redis<7 pin, kept here as one file to edit instead of
+          # two places that can drift.
+          python3 -m pip install --quiet \
+            -r enterprise/gateway/requirements.txt \
+            -r enterprise/worker/requirements.txt
 
       - name: make test
         run: make test
@@ -49,8 +114,9 @@ jobs:
   # <base>/custom_nodes) and the assertions fail besides.
   comfyui-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: boot ComfyUI on CPU and assert the path contract
         run: |
@@ -64,26 +130,17 @@ jobs:
   # will: as an arbitrary high UID with GID 0 supplementary, ignoring the
   # image's USER. This is the single most common way an image that works
   # under `docker run` breaks on OpenShift — tested here without a cluster.
-  # (The GPU images are too large for per-PR builds; their UID hygiene is the
-  # chgrp/chmod section reviewers guard in the Containerfiles.)
+  # (The two GPU images are too large to build on every PR; nightly.yaml
+  # builds and UID-tests both of them once a day instead — gpu-single-user-
+  # image and gpu-worker-image.)
   image-uid:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: build the gateway image
         run: docker build -t gateway-uid-test -f enterprise/gateway/Containerfile enterprise/gateway
-
-      # Cheap here because the image is already built above. The GPU images
-      # are scanned nightly instead (nightly.yaml) — they are too large to
-      # pull and scan on every PR.
-      - name: scan the gateway image for known CVEs
-        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
-        with:
-          image-ref: gateway-uid-test
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
 
       - name: serve as an arbitrary UID
         run: |
@@ -104,3 +161,28 @@ jobs:
             echo "gateway did not serve /healthz as an arbitrary UID with GID 0"
             exit 1
           fi
+
+      # Moved to run after the arbitrary-UID proof above (used to sit between
+      # build and serve, with exit-code: 1): a newly-disclosed HIGH/CRITICAL
+      # in the ubi9 base image used to fail this job before the correctness
+      # test this job exists for — the arbitrary-UID boot — ever ran, on
+      # every unrelated PR. continue-on-error keeps a CVE from blocking the
+      # PR check entirely; the scan still runs and still shows red in the job
+      # summary, it just doesn't gate. This is intentionally soft only for
+      # this small, frequently-rebuilt image — the two GPU images
+      # (nightly.yaml) scan with exit-code 1 and no continue-on-error,
+      # because they build once a day, not on every push.
+      - name: scan the gateway image for known CVEs
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        continue-on-error: true
+        env:
+          # Anonymous ghcr.io pulls of the trivy vulnerability DB are
+          # IP-rate-limited on shared GitHub runners; fall back to the
+          # AWS-hosted mirror first.
+          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,ghcr.io/aquasecurity/trivy-db
+        with:
+          image-ref: gateway-uid-test
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          cache: true
