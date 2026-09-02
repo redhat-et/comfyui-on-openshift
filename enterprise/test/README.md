@@ -636,6 +636,17 @@ fails the suite. That was not true before `docs/10-roadmap.md` item F3: the
 files were copied by a glob but invoked by hardcoded name, so a new check was
 copied, never run, and the suite stayed green.
 
+**Shared helpers live in `harness.py`.** A check imports `check`, `GW`,
+`COMFY`, `drain`, `state_key` and the rest from it rather than pasting its own
+copy; `harness.py`'s docstring lists what is there and what a check may assume
+from it. `GW` and `COMFY` are `Client`s already bound to the shared gateway and
+the stub ComfyUI, `check()` is the single definition of the PASS/FAIL line
+`run.sh` folds on, and `drain()`, `start_agent()` and `showback()` take
+parameters for the few places two checks genuinely need different behaviour. A
+check that needs a helper the module lacks adds it there, not inline — the
+suite went from 31% to 6% duplicated code when the copies were folded, and the
+FAIL marker stopped living in twenty-one files.
+
 The convention:
 
 | | |
@@ -644,7 +655,7 @@ The convention:
 | **Order** | Filename order, so leave gaps: `10`, `20`, `30`. Do **not** write `check4.py`; unpadded numbers sort wrong (`check10` lands between `check` and `check2`) and the ordering here is load-bearing. |
 | **argv[1]** | The pid of a worker agent that is up and polling. Ignore it if you do not need it. |
 | **Environment** | Inherited from `run.sh`: Redis on 6399, the gateway on 8100, the stub ComfyUI on 8999, and the shrunk `HEARTBEAT_TTL` / `REAPER_INTERVAL` / `JOB_TIMEOUT` that let worker-death assertions resolve in seconds. |
-| **Exit status** | 0 for pass, non-zero for fail. Print one `PASS`/`FAIL` line per assertion — the existing checks share a four-line `check()` helper worth copying. |
+| **Exit status** | 0 for pass, non-zero for fail. Print one `PASS`/`FAIL` line per assertion through `harness.check()` — the one place the marker format is defined. |
 | **Reported failure** | A printed failure fails the suite on its own, whatever the check exits. `run.sh` reads each check's output for the `check()` helper's own line format — two spaces, `FAIL`, two spaces, at the start of a line — so a check that keeps printing its FAIL lines but stops turning them into a non-zero exit (the `sys.exit(1)` lost in an edit, a failures list nothing reads any more) is still caught, instead of leaving the suite and CI green over its own output. The marker is anchored and padded rather than a search for the word, so ordinary prose — an assertion name that mentions failing, a Redis value echoed into a detail field, the `N FAILED: [...]` summary line — does not trip it. Keep using the shared helper and this is automatic. |
 | **Runtime** | Under `CHECK_TIMEOUT` (default 240s), which is a hang kill-switch rather than a budget. Keep a check to seconds; the whole suite is meant to run in about a minute. |
 
