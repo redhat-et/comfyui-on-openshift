@@ -1143,6 +1143,119 @@ fi
 
 # ---------------------------------------------------------------------------
 
+log "the output workspace naming is mirrored, not diverged (audit G2)"
+
+# A third contract in the same shape as the two above. The worker names each
+# submitter's output directory (workspace_name: slug plus digest) and the
+# gateway now refuses to serve a file outside the caller's directory, which
+# means the gateway has to compute the same name from the same identity. The
+# two files ship in two images; the function is duplicated between BEGIN/END
+# SHARED WORKSPACE markers, and this rule is what makes "change both or
+# neither" more than a comment. Drift here is not a crash: it is every
+# /outputs request answering 403 to its rightful owner — or, if the slug rule
+# alone diverges, two users mapped to one directory.
+
+if python3 - <<'EOF'
+import difflib, sys
+
+MARKERS = ("# BEGIN SHARED WORKSPACE", "# END SHARED WORKSPACE")
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+
+def block(path, begin, end):
+    lines = open(path).read().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(begin)]
+    ends = [i for i, line in enumerate(lines) if line.startswith(end)]
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        print(f"  {path}: expected exactly one {begin} ... {end} block, found "
+              f"{len(starts)} begin and {len(ends)} end marker(s) — the workspace "
+              "naming must be present in both files, delimited, and identical")
+        return None
+    return lines[starts[0]:ends[0] + 1]
+
+blocks = [block(path, *MARKERS) for path in FILES]
+if any(b is None for b in blocks):
+    sys.exit(1)
+if blocks[0] != blocks[1]:
+    print(f"  the shared workspace block differs between {FILES[0]} and "
+          f"{FILES[1]} — change both or neither:")
+    for line in difflib.unified_diff(blocks[0], blocks[1], FILES[0], FILES[1],
+                                     lineterm="", n=1):
+        print(f"    {line}")
+    sys.exit(1)
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the job key shapes and the cancel flag agree between gateway and worker (audit G9)"
+
+# The small contracts that live OUTSIDE the mirrored blocks: the Redis key a
+# job's state, stream and payload live under, the TTL both sides arm on them,
+# and the one Hash field the gateway writes and the worker polls to cancel a
+# running job. Each is a one-line definition that looks too small to mirror,
+# which is exactly how it drifts: rename the key on one side and the other
+# side still runs, reading an empty hash, never seeing a cancel, and expiring
+# nothing. This compares the function bodies by AST rather than by marker so
+# the definitions can stay where they read best in each file.
+
+if python3 - <<'EOF'
+import ast, re, sys
+
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+FUNCS = ("state_key", "stream_key", "payload_key")
+
+def load(path):
+    src = open(path).read()
+    tree = ast.parse(src)
+    funcs = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in FUNCS:
+            funcs[node.name] = ast.get_source_segment(src, node)
+    ttl = re.search(r'^EVENT_STREAM_TTL = (.+)$', src, re.M)
+    return src, funcs, ttl.group(1) if ttl else None
+
+hub_src, hub_funcs, hub_ttl = load(FILES[0])
+wrk_src, wrk_funcs, wrk_ttl = load(FILES[1])
+rc = 0
+
+for name in FUNCS:
+    if name not in hub_funcs or name not in wrk_funcs:
+        print(f"  {name}() must be a top-level def in both files")
+        rc = 1
+    elif hub_funcs[name] != wrk_funcs[name]:
+        print(f"  {name}() differs between the two files — change both or neither:")
+        print("    " + hub_funcs[name].replace("\n", "\n    "))
+        print("    " + wrk_funcs[name].replace("\n", "\n    "))
+        rc = 1
+
+if hub_ttl != wrk_ttl:
+    print(f"  EVENT_STREAM_TTL default differs: hub {hub_ttl!r} vs worker {wrk_ttl!r}")
+    rc = 1
+
+field = re.search(r'^CANCEL_REQUESTED_FIELD = "([^"]+)"$', hub_src, re.M)
+if not field:
+    print("  hub.py no longer defines CANCEL_REQUESTED_FIELD as a string literal")
+    rc = 1
+elif f'"{field.group(1)}"' not in wrk_src:
+    print(f"  the worker never mentions {field.group(1)!r}, the field the gateway "
+          "writes to cancel a running job")
+    rc = 1
+
+sys.exit(rc)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
 printf '\n'
 
 if (( FAILURES == 0 )); then

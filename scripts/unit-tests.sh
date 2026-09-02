@@ -561,6 +561,64 @@ cleanup_manifest_fixture_drops
 trap - EXIT
 
 # ---------------------------------------------------------------------------
+# Landing additions: the two mirror rules the hub/worker fixes needed (G2, G9).
+# ---------------------------------------------------------------------------
+
+log "scripts/lint.sh — the workspace naming and the job key shapes are mirrored (G2, G9)"
+
+# Same technique as the envelope test above: drift the real file the way a
+# later change plausibly would, run lint, restore whatever happens.
+
+WORKER_PY="$REPO_ROOT/enterprise/worker/worker_agent.py"
+WORKER_PY_BACKUP="$(mktemp -t comfy-worker-backup.XXXXXX)"
+MIRROR_LOG="$(mktemp -t comfy-mirror-lint.XXXXXX)"
+cp "$WORKER_PY" "$WORKER_PY_BACKUP"
+
+restore_worker_py()
+{
+    [[ -f "$WORKER_PY_BACKUP" ]] && cp "$WORKER_PY_BACKUP" "$WORKER_PY"
+}
+trap restore_worker_py EXIT
+
+lint_fails_with()
+{
+    local needle="$1" rc=0
+    "$LINT_SH" > "$MIRROR_LOG" 2>&1 || rc=$?
+    (( rc != 0 )) && grep -q "$needle" "$MIRROR_LOG"
+}
+
+# (1) the digest length changes on the worker only: every directory the
+# worker creates from now on has a name the gateway will never compute.
+python3 - "$WORKER_PY" <<'PYEOF2'
+import sys
+path = sys.argv[1]
+content = open(path).read()
+line = "WORKSPACE_DIGEST_CHARS = 12\n"
+assert content.count(line) == 1, "WORKSPACE_DIGEST_CHARS moved — update this test"
+open(path, "w").write(content.replace(line, "WORKSPACE_DIGEST_CHARS = 16\n", 1))
+PYEOF2
+expect_true "lint fails when the worker's workspace digest length drifts from the gateway's" \
+    lint_fails_with "shared workspace block differs"
+restore_worker_py
+
+# (2) the state key is renamed on the worker only: the gateway keeps reading
+# an empty hash, the reaper keeps arming a TTL on a key nothing writes.
+python3 - "$WORKER_PY" <<'PYEOF2'
+import sys
+path = sys.argv[1]
+content = open(path).read()
+line = '    return f"comfy:job:{job_id}:state"\n'
+assert content.count(line) == 1, "state_key() moved — update this test"
+open(path, "w").write(content.replace(line, '    return f"comfy:jobs:{job_id}:state"\n', 1))
+PYEOF2
+expect_true "lint fails when the worker's state_key() shape drifts from the gateway's" \
+    lint_fails_with "state_key() differs"
+restore_worker_py
+
+trap - EXIT
+rm -f "$WORKER_PY_BACKUP" "$MIRROR_LOG"
+
+# ---------------------------------------------------------------------------
 
 printf '\n'
 
