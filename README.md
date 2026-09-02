@@ -3,6 +3,9 @@
 **One GPU pool, a whole team — not a card per person.**
 
 [![ci](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml/badge.svg)](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml)
+[![nightly](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/nightly.yaml/badge.svg)](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/nightly.yaml)
+[![release](https://img.shields.io/github/v/release/redhat-et/comfyui-on-openshift?display_name=tag)](https://github.com/redhat-et/comfyui-on-openshift/releases)
+[![license](https://img.shields.io/github/license/redhat-et/comfyui-on-openshift)](LICENSE)
 
 ComfyUI is a single-user desktop application wearing a web UI. It has no
 authentication, its custom-node system executes arbitrary Python by design, and
@@ -75,6 +78,7 @@ setting; "Where this loses" below is the long form.
 | Already have an OpenShift cluster | `PLATFORM=openshift` in `.env`, `oc login`, then `make gpu storage deploy` (or `make gpu storage enterprise`) — nothing in those steps is ROSA-specific |
 | Just evaluating the code | `make test`, then `enterprise/test/README.md` for what each assertion is defending |
 | Taking this over from someone | `docs/09-engineering-handoff.md` |
+| Bringing it up on real hardware for the first time | `docs/12-first-cluster-day.md` — the run CI cannot do, as a checklist: what to measure, where each number goes, what to verify, what to record |
 
 ## What changes for the people using it
 

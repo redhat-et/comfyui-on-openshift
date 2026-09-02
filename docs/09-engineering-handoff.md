@@ -128,7 +128,7 @@ enterprise/         the multi-user configuration
   manifests/        Redis, gateway, worker, KEDA, oauth-proxy, Routes, NetworkPolicy
   test/             e2e suite: real Redis, stub ComfyUI, no cluster needed
 app/Containerfile   the single-user ComfyUI image
-docs/               eleven documents — 01-08, this file, the roadmap, scaling
+docs/               twelve documents — 01-08, this file, the roadmap, scaling, first cluster day
 .env                33 variables; the only configuration surface
 ```
 
