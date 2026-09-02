@@ -234,6 +234,29 @@ sock.close()
 check("a body declared larger than MAX_BODY_BYTES is refused with 413 before it is read",
       b" 413 " in status_line, status_line)
 
+print("\n== a WebSocket for a job that does not exist is closed, not held open")
+# Before this, /ws/<anything> was accepted and parked on a 15-second XREAD loop
+# forever, one Redis connection each, for an id that names no job and never
+# will. Closed with an application code (4404) so a browser can tell "no such
+# job" from "the gateway went away"; recv_frame() reads the close frame itself
+# rather than websocket-client's "" rendering of it.
+ws3 = websocket.WebSocket()
+ws3.connect(f"ws://127.0.0.1:8100/ws/no-such-job-{uuid.uuid4().hex[:8]}", timeout=10)
+ws3.settimeout(10)
+close_code = None
+try:
+    frame = ws3.recv_frame()
+    if frame.opcode == websocket.ABNF.OPCODE_CLOSE and len(frame.data) >= 2:
+        close_code = struct.unpack("!H", frame.data[:2])[0]
+    else:
+        close_code = f"opcode {frame.opcode}: {frame.data[:60]!r}"
+except Exception as exc:  # noqa: BLE001
+    close_code = repr(exc)
+ws3.close()
+check("the server closes a WebSocket for an unknown job with code 4404 within "
+      "seconds, instead of holding it open on a ping loop",
+      close_code == 4404, close_code)
+
 print("\n== url rewriting confines what a raw ComfyUI event reports")
 # Live `executed` events reach the browser through rewrite_image_urls() with
 # whatever {filename, subfolder} ComfyUI (or a custom node) put in them -- the

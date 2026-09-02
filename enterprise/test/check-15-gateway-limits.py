@@ -147,6 +147,41 @@ if not up:
     sys.exit(1)
 
 try:
+    print(f"\n== A: a WebSocket is closed once EVENT_STREAM_TTL ({DGW_STREAM_TTL}s) has elapsed")
+
+    job_a = f"limits-a-{uuid.uuid4().hex[:12]}"
+    state_a, stream_a = f"comfy:job:{job_a}:state", f"comfy:job:{job_a}:events"
+    r.hset(state_a, mapping={"status": "queued", "phase": "queued"})
+    r.xadd(stream_a, {"data": json.dumps({"type": "queued", "data": {"position": 0}})})
+    r.expire(state_a, 120)
+    r.expire(stream_a, 120)
+
+    ws = websocket.WebSocket()
+    ws.connect(f"ws://127.0.0.1:{DGW_PORT}/ws/{job_a}", timeout=10)
+    opened_at = time.time()
+    budget = DGW_STREAM_TTL + 6
+    ws.settimeout(budget)
+    close_code, seen = None, []
+    try:
+        while time.time() - opened_at < budget:
+            frame = ws.recv_frame()
+            if frame.opcode == websocket.ABNF.OPCODE_CLOSE:
+                close_code = struct.unpack("!H", frame.data[:2])[0] if len(frame.data) >= 2 else "no code"
+                break
+            seen.append(frame.data[:40])
+    except Exception as exc:  # noqa: BLE001
+        close_code = repr(exc)
+    held_for = time.time() - opened_at
+    ws.close()
+
+    check("the replay itself still happened before the cap (the queued event arrived)",
+          any(b"queued" in s for s in seen), seen)
+    check(f"the server closed the socket with an application code (4408) once "
+          f"EVENT_STREAM_TTL had elapsed, rather than holding it on a ping loop -- "
+          f"held for {held_for:.1f}s against a {DGW_STREAM_TTL}s cap",
+          close_code == 4408 and held_for < budget, {"close": close_code, "held_for": held_for})
+    r.delete(state_a, stream_a)
+
     print(f"\n== B: MAX_QUEUE_DEPTH={DGW_MAX_DEPTH} holds under {SUBMITS} concurrent submits")
 
     results = []

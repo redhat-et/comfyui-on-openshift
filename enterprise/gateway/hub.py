@@ -113,6 +113,14 @@ MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "1"))
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 STATIC_ROOT = pathlib.Path(__file__).parent / "static"
 
+# The ceiling on this process's Redis connection pool. Every open /ws/<job>
+# holds one connection for as long as it tails, so this is also the ceiling
+# on concurrent viewers per replica: past it a tail's read raises, retries
+# briefly and closes, instead of the pool growing until Redis's own
+# maxclients starts refusing the workers. Generous for a pool of a few GPUs,
+# and finite.
+REDIS_MAX_CONNECTIONS = int(os.environ.get("REDIS_MAX_CONNECTIONS", "200"))
+
 
 def log(message: str) -> None:
     """
@@ -1209,6 +1217,7 @@ def client() -> redis.Redis:
             password=REDIS_PASSWORD,
             decode_responses=True,
             health_check_interval=30,
+            max_connections=REDIS_MAX_CONNECTIONS,
         )
 
     return _redis
@@ -2033,6 +2042,27 @@ async def cancel(job_id: str):
 # scripts/lint.sh pins this line for that reason.
 TERMINAL_TYPES = {"completed", "failed", "cancelled"}
 
+# Application close codes (the 4000-4999 range the RFC leaves to us), so a
+# browser can tell these apart from a gateway that went away (1006).
+WS_CLOSE_UNKNOWN_JOB = 4404   # no such job, or it expired
+WS_CLOSE_LIFETIME = 4408      # held open for EVENT_STREAM_TTL; reconnect if you still care
+
+# How long one XREAD may block before the loop sends a ping. The ping is
+# what notices a client that has gone away; without it a browser tab closed
+# mid-generation leaves the coroutine parked forever.
+WS_PING_MS = 15_000
+
+
+def xread_block_ms(deadline: float) -> int | None:
+    """How long the next XREAD may block: the ping interval, or the lifetime
+    left if that is shorter — None once the lifetime has run out."""
+    remaining = deadline - time.monotonic()
+
+    if remaining <= 0:
+        return None
+
+    return min(WS_PING_MS, max(1, int(remaining * 1000)))
+
 
 @app.websocket("/ws/{job_id}")
 async def progress(websocket: WebSocket, job_id: str):
@@ -2043,13 +2073,33 @@ async def progress(websocket: WebSocket, job_id: str):
     last_id = "0-0"
     redis_errors = 0
 
+    # Two bounds this socket used to lack, both about the same thing: one
+    # Redis connection is held for as long as this coroutine runs, on a pool
+    # that is now finite (REDIS_MAX_CONNECTIONS).
+    #
+    # A job id that names nothing is closed, not tailed: /ws/<anything> was
+    # accepted and parked forever on an id that never had a job behind it.
+    # And a socket on a real job lives at most EVENT_STREAM_TTL — the stream
+    # it tails expires that long after its last write, so past that it is
+    # blocked on a key that no longer exists. A client that still cares
+    # reconnects and replays, exactly as it would after any other close.
     try:
+        if not await conn.exists(state_key(job_id)):
+            await websocket.close(code=WS_CLOSE_UNKNOWN_JOB, reason="unknown or expired job")
+            return
+
+        deadline = time.monotonic() + EVENT_STREAM_TTL
+
         while True:
-            # BLOCK is in milliseconds. The timeout exists so we can send a ping
-            # and notice a client that has gone away; without it a browser tab
-            # closed mid-generation leaves this coroutine parked forever.
+            block = xread_block_ms(deadline)
+
+            if block is None:
+                await websocket.close(code=WS_CLOSE_LIFETIME,
+                                      reason="stream lifetime reached; reconnect to resume")
+                return
+
             try:
-                entries = await conn.xread({key: last_id}, count=100, block=15_000)
+                entries = await conn.xread({key: last_id}, count=100, block=block)
 
             except redis.RedisError:
                 # A Redis blip is not a job failure — the worker may be running
