@@ -462,6 +462,14 @@ expect_true "lint fails a worker manifest whose REDIS_URL names no user, silentl
     lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-redis-url-has-no-user.yaml" \
     "with no username"
 
+# The regression the namespace default-deny creates, and the only one it
+# creates. A Deployment nothing selects is not left unrestricted, it is cut
+# off — and it fails silently: Ready pod, passing probes, every connection
+# timing out, nothing in the events naming a network policy.
+expect_true "lint fails a Deployment in the multi-user namespace that no NetworkPolicy selects" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/deployment-no-network-policy.yaml" \
+    "is not selected by any NetworkPolicy"
+
 cleanup_manifest_fixture_drops
 trap - EXIT
 

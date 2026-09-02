@@ -238,6 +238,24 @@ for f in sorted(glob.glob('manifests/base/*.yaml')
     except yaml.YAMLError as exc:
         bad(f, f"parse error: {exc}")
 
+# Every NetworkPolicy in the multi-user namespace that selects SOMETHING, by
+# name and by the labels it selects. The catch-all deny (podSelector: {}) is
+# deliberately excluded: it covers every pod trivially, so counting it as
+# coverage would make the rule below vacuous — which is the opposite of what it
+# is for. A workload with no policy naming it is denied in both directions by
+# that catch-all, and presents as a pod that starts, passes its probes, and
+# cannot talk to anything.
+network_policy_selectors = []
+
+for f, doc in docs:
+    if doc.get('kind') != 'NetworkPolicy' or not f.startswith('enterprise/manifests/'):
+        continue
+
+    labels = dig(doc, 'spec', 'podSelector', 'matchLabels') or {}
+
+    if labels:
+        network_policy_selectors.append((dig(doc, 'metadata', 'name'), labels))
+
 for f, doc in docs:
     kind = doc.get('kind')
     name = dig(doc, 'metadata', 'name')
@@ -352,6 +370,24 @@ for f, doc in docs:
                    "namespace's own pods calls the Kubernetes API, so the "
                    "projected token is a credential with no reader except "
                    "whatever else ends up executing in the pod")
+
+    # And every Deployment here must be named by a NetworkPolicy that selects
+    # it. enterprise/manifests/06-network-policy.yaml default-denies the
+    # namespace in both directions, so a workload added without a rule of its
+    # own is not "unrestricted", it is cut off — and it fails in the way that
+    # takes longest to diagnose: the pod starts, the container is healthy, the
+    # probes pass, and every connection it opens times out.
+    if kind == 'Deployment' and f.startswith('enterprise/manifests/'):
+        pod_labels = dig(doc, 'spec', 'template', 'metadata', 'labels') or {}
+        covered = [policy for policy, selector in network_policy_selectors
+                   if all(pod_labels.get(k) == v for k, v in selector.items())]
+
+        if not covered:
+            bad(f, f"{kind}/{name} is not selected by any NetworkPolicy in "
+                   "enterprise/manifests. The namespace default-denies ingress "
+                   "and egress, so this pod will start, pass its probes, and "
+                   "be unable to reach Redis, DNS or anything else — with "
+                   "nothing in its logs or events naming the cause")
 
     # The SIGTERM drain needs a window longer than the job it is draining.
     # The pool scales to zero, so termination is routine; a grace period

@@ -9,7 +9,11 @@
 # and buys you nothing until you have far more traffic than one GPU can serve.
 #
 # It is also namespace-internal only: no Route, no Service type LoadBalancer,
-# and a NetworkPolicy below that admits only the gateway and the workers.
+# and a NetworkPolicy that admits only the gateway, the workers and KEDA. That
+# policy used to live at the bottom of this file; it now sits with the rest of
+# the namespace's rules in 06-network-policy.yaml, which is the only place the
+# whole picture — a default deny, and the four flows allowed to exist — can be
+# read at once.
 apiVersion: v1
 kind: Service
 metadata:
@@ -229,35 +233,3 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: redis-data
----
-# Only the gateway, the workers, and KEDA may reach Redis. Without this, any pod
-# in any namespace that can resolve the Service can pop jobs off the queue.
-#
-# ROSA runs OVN-Kubernetes and enforces NetworkPolicy, so the openshift-keda
-# exception below is load-bearing, not decorative: a bare podSelector means
-# "pods in this namespace", and the KEDA scaler dials from its own operator pod
-# in openshift-keda. Leave it out and the ScaledObject sits in ScalerFailed
-# while the queue grows and nothing scales up.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: redis-allow-app-only
-spec:
-  podSelector:
-    matchLabels:
-      app: redis
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app: comfy-gateway
-        - podSelector:
-            matchLabels:
-              app: comfy-worker
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: openshift-keda
-      ports:
-        - protocol: TCP
-          port: 6379

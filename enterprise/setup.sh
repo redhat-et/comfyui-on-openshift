@@ -392,6 +392,18 @@ apply_gateway()
 }
 
 oc apply -n "$APP_NAMESPACE" -f "${MANIFESTS}/00-redis.yaml"
+
+# Before the workloads, not after. The namespace default-denies once this
+# lands, so applying it first means a pod that comes up is a pod the policy
+# already covers, rather than one that works for a minute and then stops.
+#
+# It also carries the egress hole the BuildConfig pods above need. On a FIRST
+# run those builds have already finished by the time this file exists, and on
+# every run after it they are covered — which is the order that matters,
+# because the failure is a build hanging on `git fetch` with nothing in its log
+# about network policy.
+oc apply -n "$APP_NAMESPACE" -f "${MANIFESTS}/06-network-policy.yaml"
+
 apply_gateway
 
 # The worker's nodeSelector has to name a label the machine pool declares, or

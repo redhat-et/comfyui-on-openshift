@@ -56,6 +56,25 @@ running there can read its own environment. `setup.sh` generates both, and adds
 the second one to a namespace deployed before this existed without rotating the
 first. Delete the Secret to rotate both.
 
+### The workers have no route to the internet
+
+`06-network-policy.yaml` default-denies the namespace in both directions and
+then allows four flows: worker → Redis and DNS, gateway ← the router and the
+metrics scrapers, gateway → Redis and TLS control-plane ports for the SSO
+sidecar, Redis ← the gateway, the workers and KEDA. Build pods keep their
+egress; nothing else has any.
+
+The worker rule is the one with a consequence: a GPU pod cannot reach anything
+except Redis, so `ENABLE_MANAGER=true` cannot fetch its node list, install
+anything, or download a model at runtime — it will hang. That was already this
+configuration's documented position (`docs/06-enterprise-architecture.md`); the
+policy makes it true rather than advisory.
+
+If the app stops answering on its Route right after `setup.sh`, read the
+`gateway-ingress` comment in that file first: it assumes the router is a pod in
+`openshift-ingress`, which is right on ROSA and wrong on clusters that run the
+router on the host network.
+
 ### Why `rwx` is not optional here
 
 The gateway serves finished images off the same volume the workers write them

@@ -33,6 +33,13 @@ oc delete pdb comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
 oc delete sa comfy-gateway -n "$APP_NAMESPACE" --ignore-not-found
 oc delete bc,is comfy-gateway comfy-worker -n "$APP_NAMESPACE" --ignore-not-found
 
+# The namespace's network policy goes with the application, not with the data:
+# leaving a default-deny behind in a namespace whose workloads have been
+# removed is a trap for whatever is deployed there next.
+oc delete -n "$APP_NAMESPACE" --ignore-not-found \
+    networkpolicy default-deny allow-dns-egress worker-egress-redis-only \
+    gateway-ingress gateway-egress redis-allow-app-only allow-build-egress
+
 ok "application removed"
 
 if [[ "$PURGE" == "true" ]]; then
@@ -40,7 +47,6 @@ if [[ "$PURGE" == "true" ]]; then
 
     oc delete deployment redis -n "$APP_NAMESPACE" --ignore-not-found
     oc delete service redis -n "$APP_NAMESPACE" --ignore-not-found
-    oc delete networkpolicy redis-allow-app-only -n "$APP_NAMESPACE" --ignore-not-found
     oc delete pvc redis-data -n "$APP_NAMESPACE" --ignore-not-found
     oc delete secret comfy-redis comfy-gateway-session comfy-gateway-tls \
         -n "$APP_NAMESPACE" --ignore-not-found
