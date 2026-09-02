@@ -49,165 +49,33 @@ This check kills the agent it is handed (argv[1]) up front rather than
 working beside it: it needs to know WHICH worker picks its job up, and
 `run.sh` re-establishes a live agent before the next check either way.
 """
-import json, os, signal, subprocess, sys, time, urllib.request, uuid
-import redis
-import websocket
+import os, signal, sys, time, uuid
 
+from harness import (
+    check, comfy_saw, connect_redis, drain, excluded_total, failures, showback,
+    start_agent, state_key, stop_agent, user_total, wait_for,
+)
+from harness import GW
 from worker_ids import heartbeat_keys, processing_keys
 
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-WORKER_AGENT = os.environ["WORKER_AGENT"]
+get, post = GW.get, GW.post
+
 HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "180"))
 
 # One pod name, used by both incarnations below -- this is the reuse.
 HOSTNAME = f"restart-pod-{uuid.uuid4().hex[:6]}"
 USER = f"restart-{uuid.uuid4().hex[:8]}@example.com"
 
-failures = []
+r = connect_redis()
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body=None, base=GW, headers=None):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    hdrs = {"Content-Type": "application/json"}
-    hdrs.update(headers or {})
-    req = urllib.request.Request(base + path, data=data, headers=hdrs)
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path, base=GW):
-    return json.loads(urllib.request.urlopen(base + path, timeout=10).read())
-
-
-def comfy_saw(probe):
-    """Has the stub ComfyUI been handed a workflow carrying this node? Same
-    question, and the same answer source, as check-30-sigkill.py's."""
-    return probe in get("/__received__", base=COMFY)["nodes"]
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-def showback():
-    try:
-        return get("/api/showback")
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def user_total(data, who):
-    try:
-        return float((data.get("users") or {}).get(who, 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def excluded_total(data):
-    try:
-        return float(data.get("excluded_gpu_seconds", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def wait_for(predicate, timeout=30, interval=0.2):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if predicate():
-                return True
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(interval)
-    return False
-
-
-def drain(job_id, timeout=60):
-    """Tail the WebSocket to its terminal event, with a real wall-clock
-    ceiling -- see check-30-sigkill.py's copy for why the deadline is
-    recomputed before every recv() rather than handed to settimeout() once
-    (hub.py pings every 15s, and a ping resets a per-call timeout)."""
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    deadline = time.time() + timeout
-    seen, terminal = [], None
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            print(f"  drain({job_id}): no terminal event within {timeout}s "
-                  f"-- gave up; events seen so far: {seen}")
-            break
-        ws.settimeout(remaining)
-        try:
-            m = json.loads(ws.recv())
-        except Exception:  # noqa: BLE001
-            break
-        if m.get("type") == "ping":
-            continue
-        seen.append(m["type"])
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
-    return seen, terminal
-
-
-def start_agent(tag, timeout=40):
-    """An agent under this check's fixed HOSTNAME. Readiness is taken from
-    the agent's own log line rather than from the existence of a heartbeat
-    key: the whole point of this check is a second incarnation under an
-    identity whose heartbeat key is ALREADY there, so `EXISTS` cannot tell
-    'the replacement is up' from 'its predecessor's key has not expired yet'.
-
-    Named to match run.sh's own agent*.log glob, so a failing run dumps it."""
-    env = dict(os.environ)
-    env["HOSTNAME"] = HOSTNAME
-    log_path = f"agent-{HOSTNAME}-{tag}.log"
-    log = open(log_path, "w")
-    proc = subprocess.Popen(
-        [sys.executable, WORKER_AGENT], env=env,
-        stdout=log, stderr=subprocess.STDOUT,
-    )
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with open(log_path) as fh:
-                if "ready, polling" in fh.read():
-                    return proc
-        except OSError:
-            pass
-        if proc.poll() is not None:
-            return proc  # died on startup; later assertions will show it
-        time.sleep(0.1)
-    return proc
-
-
-def stop_agent(proc):
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=10)
-    except Exception:  # noqa: BLE001
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
+# Both incarnations below start under this fixed HOSTNAME with ready="log":
+# the whole point of this check is a second incarnation under an identity
+# whose heartbeat key is ALREADY there, so heartbeat existence cannot tell
+# "the replacement is up" from "its predecessor's key has not expired yet" --
+# see harness.start_agent's own docstring on this exact fixture.
+AGENT_TIMEOUT = 40
 
 
 handed_pid = int(sys.argv[1])
@@ -230,7 +98,7 @@ try:
 
     print(f"\n== incarnation 1 of pod {HOSTNAME} picks up a job and gets it into ComfyUI")
 
-    first = start_agent("first")
+    first = start_agent(HOSTNAME, timeout=AGENT_TIMEOUT, tag="first", ready="log")
 
     hb = heartbeat_keys(r, HOSTNAME)
     check("incarnation 1 registered exactly one heartbeat under this pod name",
@@ -264,7 +132,7 @@ try:
 
     stranded_key = stranded[0] if stranded else f"comfy:processing:{HOSTNAME}"
 
-    baseline = showback()
+    baseline = showback(GW)
     baseline_user = user_total(baseline, USER)
     baseline_excluded = excluded_total(baseline)
 
@@ -276,7 +144,7 @@ try:
     os.kill(first.pid, signal.SIGKILL)
     t_killed = time.time()
 
-    second = start_agent("second")
+    second = start_agent(HOSTNAME, timeout=AGENT_TIMEOUT, tag="second", ready="log")
     restart_gap = time.time() - t_killed
 
     check(f"incarnation 2 was polling {restart_gap:.1f}s after the kill, "
@@ -315,7 +183,7 @@ try:
           "TTL in a `noeviction` Redis for the lifetime of the pod",
           emptied, (stranded_key, r.lrange(stranded_key, 0, -1)))
 
-    after = showback()
+    after = showback(GW)
     recorded = ((user_total(after, USER) - baseline_user)
                 + (excluded_total(after) - baseline_excluded))
     check(f"the ~{ran_for:.1f}s of card this job held before the kill landed "

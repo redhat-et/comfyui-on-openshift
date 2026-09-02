@@ -1,0 +1,12 @@
+# Pinned to a minor, same convention as enterprise/gateway/requirements.txt
+# and enterprise/worker/requirements.txt: a rebuild months from now still
+# starts, and a pytest major bump (collection/fixture changes) is something
+# to see in a diff, not something CI silently picks up.
+#
+# This suite needs nothing beyond pytest itself and the standard library --
+# it imports hub.py and worker_agent.py directly and calls their pure
+# functions in-process, so it also needs whatever those two files import
+# (fastapi, redis, websocket-client), which enterprise/gateway/requirements.txt
+# and enterprise/worker/requirements.txt already provide and CONTRIBUTING.md
+# already asks for.
+pytest>=8.0,<9

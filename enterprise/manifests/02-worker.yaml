@@ -18,8 +18,28 @@ spec:
   # manifests before the autoscaler exists does not start an $0.80/hour node.
   replicas: 0
 
+  # RollingUpdate with NO surge, which is the opposite of the usual default and
+  # is the only setting a GPU pool can hold.
+  #
+  # It was Recreate. On an autoscaled pool that means an image update deletes
+  # every worker, then waits for new ones — and a new one waits on a GPU node,
+  # a ~10 GB image pull, CUDA init and a model load, which is the 8-17 minutes
+  # this whole design is arranged around. Times the pool. Deploying a one-line
+  # change to worker_agent.py emptied the pool for most of half an hour, and
+  # the symptom is jobs queueing with no worker to take them.
+  #
+  # maxSurge MUST be 0. Surge means "start the replacement before stopping the
+  # old one", and a replacement worker needs a whole GPU: with N workers on N
+  # cards, a surge pod is Pending until the cluster autoscaler provisions
+  # another node — so a rollout that was meant to replace pods instead buys an
+  # extra $0.80/hour node per surge, waits ~10 minutes for it, and only then
+  # starts. maxUnavailable 1 with maxSurge 0 replaces them one at a time, in
+  # place, and the pool keeps serving from the rest.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
 
   selector:
     matchLabels:
@@ -63,6 +83,18 @@ spec:
       # 1500-second render threw the work away anyway. Change them together.
       terminationGracePeriodSeconds: 1980
 
+      # No Kubernetes API client lives in this pod, so the projected
+      # ServiceAccount token is nothing but a credential sitting in the
+      # filesystem waiting to be read. Verified against the source rather than
+      # assumed: neither enterprise/gateway/hub.py nor
+      # enterprise/worker/worker_agent.py imports a Kubernetes client or opens
+      # the API server at all — Redis is the only thing either one dials.
+      #
+      # It matters more here than anywhere else in the namespace: this pod runs
+      # arbitrary custom-node Python on a GPU node, and a mounted token is a
+      # credential that node's code can read and use against the cluster.
+      automountServiceAccountToken: false
+
       securityContext:
         runAsNonRoot: true
         seccompProfile:
@@ -73,13 +105,24 @@ spec:
           image: comfy-worker:latest
 
           env:
+            # The username is in the URL and the password is beside it, which
+            # is the whole of the wiring for the least-privilege Redis user
+            # defined in 00-redis.yaml: redis.from_url() reads the user out of
+            # the URL and takes the password from the keyword argument, so
+            # worker_agent.py needed no change at all. Do not put the password
+            # in the URL — it would land in the pod spec in clear text.
+            #
+            # This pod must never hold the `password` key of comfy-redis. That
+            # is the admin credential the gateway and KEDA use, and anything
+            # running in this container can read the environment; scripts/lint.sh
+            # fails a worker Deployment that names it.
             - name: REDIS_URL
-              value: redis://redis:6379/0
+              value: redis://comfy-worker@redis:6379/0
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: comfy-redis
-                  key: password
+                  key: worker_password
             - name: QUEUE_KEY
               value: comfy:queue
             - name: JOB_TIMEOUT
@@ -90,6 +133,18 @@ spec:
               value: /models/.cache/huggingface
             - name: TORCH_HOME
               value: /models/.cache/torch
+
+            # The file worker_agent.py touches on every pass of its main loop,
+            # and the file the liveness probe below stats. Named here rather
+            # than left to the agent's default so that the two halves of one
+            # health check are wired from one place — a probe pointed at a path
+            # nothing writes fails every worker in the pool, sixty seconds
+            # apart, forever.
+            #
+            # It lives on the scratch emptyDir, which is the only writable path
+            # in the container that is not shared with another pod.
+            - name: AGENT_LIVENESS_FILE
+              value: /tmp/comfy-agent-alive
 
           # Requests equal limits on every resource, which is not a style
           # choice — it is the QoS class. Read the numbers first, then why
@@ -201,17 +256,44 @@ spec:
             periodSeconds: 10
             failureThreshold: 90
 
+          # TWO processes, ONE container, and therefore one liveness probe that
+          # has to answer for both. start.sh runs ComfyUI and the agent side by
+          # side; a container may only declare one livenessProbe, so the two
+          # assertions are `sh -ec` and two lines rather than two probes.
+          #
+          # The first line is the original: can ComfyUI answer? It binds
+          # loopback, so nothing outside the container can ask — an exec probe
+          # runs in the container's network namespace and can.
+          #
+          # The second line is the half that was missing, and it is the one
+          # that catches the expensive failure. The agent can be alive,
+          # connected and completely wedged — parked in a BLMOVE against a
+          # blackholed TCP connection, say — while ComfyUI answers /system_stats
+          # perfectly. The pod stays Ready, holds a card at ~$0.80/hour, and
+          # takes no work, indefinitely. worker_agent.py touches
+          # AGENT_LIVENESS_FILE on every pass of its main loop; if that file is
+          # more than two minutes old the agent has stopped going round.
+          #
+          # THE CONTRACT THIS DEPENDS ON: the touch must happen on every pass
+          # INCLUDING while a job is running. Jobs legitimately run for
+          # JOB_TIMEOUT — 1800 seconds — so an agent that touched the file only
+          # between jobs would fail this probe in the middle of every long
+          # generation and be killed for working. That is a property of
+          # worker_agent.py, not of this file, and it is why the threshold is
+          # written in seconds here rather than derived from JOB_TIMEOUT.
+          #
+          # `stat -c %Y` is GNU stat, which is what UBI9 has. `sh -ec` so the
+          # first line failing is the probe failing, without an explicit exit.
+          # No initialDelaySeconds: the startupProbe above already gates this
+          # one, and it does not pass until ComfyUI has finished loading.
           livenessProbe:
             exec:
               command:
-                - python3
-                - -c
+                - sh
+                - -ec
                 - |
-                  import urllib.request, sys
-                  try:
-                      urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=10)
-                  except Exception:
-                      sys.exit(1)
+                  python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8188/system_stats', timeout=10)"
+                  test $(( $(date +%s) - $(stat -c %Y "$AGENT_LIVENESS_FILE") )) -lt 120
             periodSeconds: 60
             failureThreshold: 3
 
@@ -224,3 +306,27 @@ spec:
             claimName: comfyui-output
         - name: scratch
           emptyDir: {}
+---
+# Keep the pool from being drained all at once.
+#
+# maxUnavailable: 1 rather than minAvailable: N, because N is not a number this
+# file knows — KEDA owns the replica count and it is legitimately 0 most of the
+# time. A minAvailable of anything above 0 against a pool that is deliberately
+# empty would block every node drain in the namespace forever; minAvailable: 0
+# would be a no-op with a comment.
+#
+# What this actually buys, and it is worth being precise because a PDB on an
+# autoscaled Deployment is easy to write and easy to overrate: a cluster
+# upgrade draining several GPU nodes at once takes them one at a time instead
+# of together, and a drain cannot land on a pool that is already down a worker.
+# Each eviction still costs whatever job that worker was running — the pod's
+# 1980-second grace period is what protects the job, not this.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: comfy-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: comfy-worker

@@ -16,9 +16,33 @@
 # size is pull time is cold-start time — the number this whole design fights.
 FROM nvcr.io/nvidia/cuda:12.6.2-base-ubi9
 
-ARG COMFYUI_REF=v0.32.0
+# TORCH_VERSION/TORCHVISION_VERSION/TORCHAUDIO_VERSION are one set —
+# torchvision and torchaudio each build against a single torch release, so
+# bumping one alone breaks at import, not at build. 2.8.0 is the line below
+# which COMFYUI_REF quietly degrades: v0.32.0 enables DynamicVRAM by default on
+# NVIDIA, start.sh passes nothing that opts out, and main.py gates it at
+# torch >= 2.8 — under that ComfyUI logs "Unsupported Pytorch detected" and
+# falls back to the legacy ModelPatcher. cu128 is the lowest index carrying
+# 2.8; cu124 stops at 2.6.0 and never got a 2.7+ wheel. Full argument in
+# app/Containerfile — bump all four together, in both files.
+# PINNED BY COMMIT, not by tag, and the two clones below fetch by SHA rather
+# than by --branch so that either spelling still works. A git tag is a mutable
+# pointer: upstream can move v0.32.0 at any time, and the whole failure mode
+# this file already documents for torch — a silent change with no crash and no
+# diff — applies to the application source just as well. The tag each SHA
+# corresponds to is on the line above it, and the .env value (COMFYUI_REF,
+# passed through as a build arg) still overrides both, so an operator who wants
+# a different revision names one and gets it.
+#
+# v0.32.0
+ARG COMFYUI_REF=c2bcbecd82ec5ae66594340b395c24ef0217b238
 ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git
-ARG TORCH_INDEX=https://download.pytorch.org/whl/cu124
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG TORCH_VERSION=2.8.0
+ARG TORCHVISION_VERSION=0.23.0
+ARG TORCHAUDIO_VERSION=2.8.0
+# 4.2.2 (the annotated tag object; it peels to commit bd4ede22)
+ARG MANAGER_REF=da5e88aae61c06e1396724e77dc5fa152732797f
 
 # ComfyUI-Manager lets any user with UI access install arbitrary Python from
 # the internet, which then runs in this pod — on a node with an instance role,
@@ -43,18 +67,41 @@ RUN alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 
 WORKDIR ${COMFY_ROOT}
 
-# torch first and alone: it is ~2.5 GB, and keeping it in its own layer means a
-# change to any other requirement does not re-pull it.
+# torch first and alone. On the cu128 index this layer is ~7 GB installed, not
+# the ~2.5 GB this comment used to claim — the wheel is about a gigabyte and
+# the nvidia-*-cu12 libraries it vendors (cuDNN, cuBLAS, cuSPARSE, cuFFT, NCCL,
+# nvrtc, triton) are the rest. That is most of the ~10 GB image and therefore
+# most of the cold-start pull, which is the number the whole autoscaled design
+# is fighting; its own layer means a change to any other requirement does not
+# re-pull it.
 RUN python3 -m pip install --upgrade pip setuptools wheel \
-    && python3 -m pip install --index-url ${TORCH_INDEX} torch torchvision torchaudio
+    && python3 -m pip install --index-url ${TORCH_INDEX} \
+        torch==${TORCH_VERSION} \
+        torchvision==${TORCHVISION_VERSION} \
+        torchaudio==${TORCHAUDIO_VERSION}
 
-RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} . \
+# init + fetch + checkout rather than `git clone --branch`: --branch takes a
+# ref name and refuses a bare commit SHA, which is what COMFYUI_REF now is by
+# default. A fetch of an explicit object works for a SHA, a tag and a branch
+# alike, so the .env value can still be any of the three. Still --depth 1, so
+# this is the same single-commit download it always was.
+RUN git init -q . \
+    && git remote add origin ${COMFYUI_REPO} \
+    && git fetch --depth 1 origin ${COMFYUI_REF} \
+    && git checkout -q FETCH_HEAD \
     && python3 -m pip install -r requirements.txt
 
+# Pinned to MANAGER_REF, and pointed at Comfy-Org/ (ltdrdata/ moved there
+# upstream; the old URL still redirects today, but don't depend on that
+# lasting). Same rationale as app/Containerfile.
 RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
-        git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git \
-            custom_nodes/ComfyUI-Manager && \
-        python3 -m pip install -r custom_nodes/ComfyUI-Manager/requirements.txt; \
+        mkdir -p custom_nodes/ComfyUI-Manager && \
+        cd custom_nodes/ComfyUI-Manager && \
+        git init -q . && \
+        git remote add origin https://github.com/Comfy-Org/ComfyUI-Manager.git && \
+        git fetch --depth 1 origin ${MANAGER_REF} && \
+        git checkout -q FETCH_HEAD && \
+        python3 -m pip install -r requirements.txt; \
     fi
 
 # ---------------------------------------------------------------------------
@@ -74,6 +121,24 @@ RUN chmod +x ${COMFY_ROOT}/start.sh
 # they are picked up here.
 COPY custom_nodes/ ${COMFY_ROOT}/custom_nodes/
 
+# And their pip dependencies, which app/Containerfile has always installed and
+# this image did not. Same staging directory, same setup.sh copy step: the
+# canonical file is app/requirements-extra.txt, and enterprise/setup.sh drops a
+# copy in beside the nodes it belongs to (it is gitignored there, like the nodes
+# themselves, so the two cannot drift).
+#
+# Without this, a node pack that imports one pip package works perfectly in the
+# single-user configuration and fails at IMPORT in the pool — which ComfyUI
+# reports by logging the traceback and carrying on without the node, so the
+# first sign is a workflow rejected for an unknown node type, on a GPU node that
+# has already been provisioned and paid for.
+#
+# -s, not -f: an empty file is the normal case, and `pip install -r` on one is a
+# wasted layer.
+RUN if [ -s ${COMFY_ROOT}/custom_nodes/requirements-extra.txt ]; then \
+        python3 -m pip install -r ${COMFY_ROOT}/custom_nodes/requirements-extra.txt; \
+    fi
+
 # ---------------------------------------------------------------------------
 # OpenShift arbitrary-UID compatibility
 #
@@ -83,10 +148,36 @@ COPY custom_nodes/ ${COMFY_ROOT}/custom_nodes/
 # crash-loops on a permission error that reads like a storage problem.
 # ---------------------------------------------------------------------------
 
-RUN mkdir -p /models /output ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
-    && chgrp -R 0 ${COMFY_ROOT} /models /output \
-    && chmod -R g=u ${COMFY_ROOT} /models /output \
-    && find ${COMFY_ROOT} /models /output -type d -exec chmod g+s {} \;
+RUN mkdir -p /models /output \
+        ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user
+
+# Group root EVERYWHERE, group-writable only where the process actually writes.
+#
+# The chmod used to be recursive over ${COMFY_ROOT} entire, and in THIS image
+# that is the sharper edge of the two: the thing running here is arbitrary
+# custom-node Python on a GPU node inside your VPC. GID 0 is a supplementary
+# group of whatever UID OpenShift picks, so g+w over the whole tree let a node
+# rewrite main.py, comfy/, worker_agent.py — the agent holding the Redis
+# credentials — or another node beside it, and the rewrite survived every
+# restart of that container. Nothing needs it: ComfyUI reads its own source and
+# writes only the paths named below.
+#
+# ${COMFY_ROOT} ITSELF stays group-writable, one level, and that is not an
+# oversight — ComfyUI creates directories directly under its base directory at
+# boot, and a read-only parent turns that into a permission error at start.
+# custom_nodes is in the writable set for the same reason it is in
+# app/Containerfile's, so ENABLE_MANAGER=true still boots; that flag is a
+# documented hazard here for reasons this permission narrowing does not change.
+#
+# The setgid bit on directories is the other half: files created later inherit
+# GID 0 rather than the creating process's group.
+RUN chgrp -R 0 ${COMFY_ROOT} /models /output \
+    && chmod g=u,g+s ${COMFY_ROOT} \
+    && chmod -R g=u ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
+                    ${COMFY_ROOT}/custom_nodes /models /output \
+    && find ${COMFY_ROOT}/temp ${COMFY_ROOT}/input ${COMFY_ROOT}/user \
+            ${COMFY_ROOT}/custom_nodes /models /output \
+            -type d -exec chmod g+s {} \;
 
 USER 1001
 

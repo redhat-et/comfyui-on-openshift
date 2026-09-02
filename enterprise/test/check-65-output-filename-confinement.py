@@ -49,19 +49,25 @@ naive join would resolve to.
     subfolder is the only field ComfyUI's own save nodes use to nest, so a
     slash inside filename itself is never legitimate.
 """
-import json, os, pathlib, sys, urllib.request
-import websocket
+import json, os, pathlib, stat, sys, urllib.request
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
+from harness import COMFY, GW, check, connect_redis, drain as _drain, failures, stream_key
+
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
-failures = []
+
+r = connect_redis()
 
 
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
+def stream_events(job_id):
+    """Every event on the job's own stream, in order -- what the worker
+    actually forwarded, before the gateway's per-socket rewrite touches it."""
+    events = []
+    for _entry_id, fields in r.xrange(stream_key(job_id)):
+        try:
+            events.append(json.loads(fields["data"]))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+    return events
 
 
 def seed_output():
@@ -70,43 +76,23 @@ def seed_output():
 
 
 def drain(job_id, timeout=15):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
-    terminal = None
-    while True:
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
+    _, terminal = _drain(job_id, timeout)
     return terminal
 
 
 def submit_and_wait(user, timeout=15):
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     workflow = {"3": {"class_type": "KSampler", "inputs": {}}}
-    req = urllib.request.Request(
-        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     return resp["job_id"], drain(resp["job_id"], timeout=timeout)
 
 
-def set_next_output(filename, subfolder=""):
-    req = urllib.request.Request(
-        COMFY + "/__set_next_output__",
-        data=json.dumps({"filename": filename, "subfolder": subfolder}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    urllib.request.urlopen(req, timeout=10).read()
+def set_next_output(filename, subfolder="", type="output", images=None):
+    """What the stub's /history manifest reports for the NEXT job. One entry
+    by default; `images` (a list of {filename, subfolder, type}) when the
+    scenario needs a manifest with more than one entry in it."""
+    body = {"images": images} if images is not None else {
+        "filename": filename, "subfolder": subfolder, "type": type}
+    COMFY.post("/__set_next_output__", body)
 
 
 def confined(url):
@@ -120,7 +106,7 @@ def confined(url):
 
 def fetch_ok(url):
     try:
-        return len(urllib.request.urlopen(GW + url, timeout=10).read()) > 0
+        return len(urllib.request.urlopen(GW.base_url + url, timeout=10).read()) > 0
     except Exception:
         return False
 
@@ -215,6 +201,164 @@ check("a filename containing '/' is refused just like one containing '..' "
       "-- subfolder is the only field a save node uses to nest, so a slash "
       "inside filename itself is never legitimate",
       images == [], images)
+
+# ---------------------------------------------------------------------------
+# (e) a preview (type "temp") beside a real output is not reported as one
+# ---------------------------------------------------------------------------
+print("\n== (e) a 'temp' preview in the manifest is dropped; the 'output' beside it is served")
+
+# ComfyUI's PreviewImage node reports its files in the same manifest shape as
+# SaveImage, with type "temp" instead of "output" -- and writes them under
+# --temp-directory, which is /tmp in the pod and not the shared volume at all.
+# A URL built for one of those is a 404 by construction, and worse than a 404:
+# it is one that resolves into the shared volume at a path a later SaveImage
+# on another worker could legitimately fill.
+seed_output()
+set_next_output(None, images=[
+    {"filename": "ComfyUI_temp_abcde_00001_.png", "subfolder": "", "type": "temp"},
+    {"filename": "out_0001.png", "subfolder": "", "type": "output"},
+])
+job_id, terminal = submit_and_wait("petra")
+check("the job completes", terminal and terminal["type"] == "completed", terminal)
+images = (terminal or {}).get("data", {}).get("images", [])
+check("exactly one image is reported -- the durable output, not the preview "
+      "that ComfyUI wrote to its temp directory and will never serve",
+      len(images) == 1 and images[0]["filename"] == "out_0001.png"
+      and images[0].get("type") == "output", images)
+check("and that one is a real, confined, servable URL",
+      workspace_ok(images[0]["url"]) if images else False, images)
+
+# ---------------------------------------------------------------------------
+# (f) a filename with URL-significant characters is percent-encoded, and
+#     still fetchable through the gateway
+# ---------------------------------------------------------------------------
+print("\n== (f) a filename with a space, '#' and '%' in it is served through a percent-encoded URL")
+
+# All three are legal in a filename and each breaks a URL differently: a
+# space is not allowed on the request line at all (http.client refuses to
+# send it), '#' starts a fragment so everything after it is dropped before
+# the request is made, and a bare '%' is a malformed escape. A save node's
+# filename_prefix is caller-chosen text, so these reach the manifest whenever
+# a user types them.
+seed_output()
+awkward_filename = "cat #1 100%.png"
+(OUTPUT_ROOT / awkward_filename).write_bytes(b"fake png bytes")
+set_next_output(awkward_filename, subfolder="")
+job_id, terminal = submit_and_wait("quentin")
+images = (terminal or {}).get("data", {}).get("images", [])
+url_awkward = images[0]["url"] if images else None
+check("the URL carries no raw space or '#' -- the characters are escaped, "
+      "not passed through for the browser to mis-split",
+      url_awkward and " " not in url_awkward and "#" not in url_awkward, url_awkward)
+check("and it is a real, confined URL the gateway actually serves the file "
+      "from -- the encoding round-trips, so the manifest names a file that "
+      "exists rather than a 404 with the right letters in it",
+      workspace_ok(url_awkward), url_awkward)
+check("the manifest's own `filename` is still the real, unencoded name -- the "
+      "escaping belongs to the URL and nowhere else",
+      images and images[0]["filename"] == awkward_filename, images)
+
+# ---------------------------------------------------------------------------
+# (g) a manifest naming a file inside ANOTHER submitter's workspace is
+#     refused rather than moved into this one
+# ---------------------------------------------------------------------------
+print("\n== (g) an output reported inside another user's workspace is refused, not moved")
+
+# output_subfolder() moves a file a node wrote outside the submitter's
+# workspace INTO it, so that outputs from custom nodes with hardcoded paths
+# are still served from the right place. The move is an os.replace, and
+# before this scenario the only thing it checked was "inside OUTPUT_ROOT and
+# not already inside mine" -- which is satisfied by a file inside somebody
+# ELSE's workspace. A manifest entry naming one (a custom node that lets the
+# workflow choose its subfolder is enough) therefore took another user's
+# finished file, moved it under this submitter's directory and handed this
+# submitter a URL for it. That is a cross-user read AND a deletion from the
+# victim's point of view, and it needs no traversal to reach: workspace
+# names are derived from usernames the /api/showback report lists.
+seed_output()
+victim_dir = OUTPUT_ROOT / control_workspace
+victim_dir.mkdir(parents=True, exist_ok=True)
+victim_file = victim_dir / "private_0001.png"
+victim_file.write_bytes(b"alice's private render")
+set_next_output("private_0001.png", subfolder=control_workspace)
+job_id, terminal = submit_and_wait("mallory-two")
+check("the job still completes -- a refused output does not fail the job",
+      terminal and terminal["type"] == "completed", terminal)
+images = (terminal or {}).get("data", {}).get("images", [])
+check("no image is reported for a file that lives in another submitter's "
+      "workspace -- not moved-and-served, not served in place, just refused",
+      images == [], images)
+check("and the other submitter's file is exactly where it was, untouched",
+      victim_file.exists() and victim_file.read_bytes() == b"alice's private render",
+      victim_file)
+mallory_dirs = [d for d in OUTPUT_ROOT.iterdir()
+                if d.is_dir() and d.name.startswith("mallory-two-")]
+stolen = [p for d in mallory_dirs for p in d.rglob("private_0001.png")]
+check("nothing under this submitter's own workspace now holds the victim's file",
+      stolen == [], stolen)
+
+# ---------------------------------------------------------------------------
+# (h) a subfolder carrying a '..' component is refused per component -- even
+#     one that resolves back INSIDE OUTPUT_ROOT
+# ---------------------------------------------------------------------------
+print("\n== (h) a subfolder with a '..' component is refused, even one that resolves inside OUTPUT_ROOT")
+
+# The old check resolved the whole reported path and asked "still inside
+# OUTPUT_ROOT?" -- which a subfolder of "../<OUTPUT_ROOT's own name>" passes,
+# since it resolves to OUTPUT_ROOT itself. But the DESTINATION the file was
+# then moved to was built by joining the raw subfolder under the workspace,
+# and ensure_workspace() walked that unnormalised path part by part: it
+# chmod'ed OUTPUT_ROOT itself on the way through the "..", created a sibling
+# of every workspace at the root, and moved the file there -- outside the
+# submitter's workspace, under a URL whose ".." the gateway happily resolves.
+seed_output()
+root_mode_before = stat.S_IMODE(OUTPUT_ROOT.stat().st_mode)
+dotdot_subfolder = f"../{OUTPUT_ROOT.name}"
+set_next_output("out_0001.png", subfolder=dotdot_subfolder)
+job_id, terminal = submit_and_wait("rita")
+check("the job still completes", terminal and terminal["type"] == "completed", terminal)
+images = (terminal or {}).get("data", {}).get("images", [])
+check("no image is reported for a subfolder containing '..' -- refused per "
+      "component, before anything is resolved, moved or created",
+      images == [], images)
+check("no '..' appears in any URL this job reported",
+      all(".." not in (img.get("url") or "") for img in images), images)
+check("OUTPUT_ROOT's own mode was not touched -- ensure_workspace() never "
+      "walked through the '..'",
+      stat.S_IMODE(OUTPUT_ROOT.stat().st_mode) == root_mode_before,
+      (oct(root_mode_before), oct(stat.S_IMODE(OUTPUT_ROOT.stat().st_mode))))
+check("no directory named after OUTPUT_ROOT was created inside it -- the "
+      "'sibling of every workspace' the unnormalised join used to produce",
+      not (OUTPUT_ROOT / OUTPUT_ROOT.name).exists(), OUTPUT_ROOT / OUTPUT_ROOT.name)
+check("and the file is still where it was, not moved out of the workspace tree",
+      (OUTPUT_ROOT / "out_0001.png").exists(), OUTPUT_ROOT / "out_0001.png")
+
+# ---------------------------------------------------------------------------
+# (i) the per-node `executed` event the worker forwards carries no raw paths
+# ---------------------------------------------------------------------------
+print("\n== (i) the forwarded 'executed' event carries no raw, unconfined output paths")
+
+# ComfyUI reports each node's outputs on the socket as it finishes, in an
+# `executed` event whose data.output.images is the same {filename, subfolder}
+# shape as the /history manifest -- unconfined, and BEFORE collect_outputs()
+# has moved or refused anything. The worker forwards every prompt event
+# verbatim onto the job's stream; the gateway turns those into /outputs/ URLs
+# for the browser. So the stub now emits one, carrying the same hostile
+# manifest as scenario (g), and the copy on the stream must not carry it.
+seed_output()
+set_next_output("private_0001.png", subfolder=control_workspace)
+job_id, terminal = submit_and_wait("sven")
+executed = [e for e in stream_events(job_id) if e.get("type") == "executed"]
+check("the stub emitted an 'executed' event and the worker forwarded it "
+      "(the per-node progress signal is kept)",
+      len(executed) >= 1, [e.get("type") for e in stream_events(job_id)])
+raw_paths = [img for e in executed
+             for img in ((e.get("data") or {}).get("output") or {}).get("images", [])]
+check("the forwarded copy carries no output paths at all -- the terminal "
+      "event is the only place a path leaves this worker, and it is confined",
+      raw_paths == [], raw_paths)
+check("but still names the node that finished",
+      all((e.get("data") or {}).get("node") for e in executed), executed)
 
 print()
 if failures:

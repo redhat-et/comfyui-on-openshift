@@ -108,7 +108,10 @@ which produces an intermittent bug that is miserable to diagnose in a cluster:
      to a stranded entry, and this agent re-reads it at the two moments its
      next action would become other people's business — before handing the
      workflow to ComfyUI, and before writing a terminal outcome. Reaped means
-     abandon: no submit, no terminal event, no accrual. See still_ours().
+     abandon: no submit, no terminal event, no accrual. See still_ours(), and
+     claim_executing(): the first of those two reads is folded into the
+     write it authorises, because a reap can land between a read and a
+     separate write, and did.
 """
 
 from __future__ import annotations
@@ -118,6 +121,7 @@ import json
 import os
 import pathlib
 import re
+import unicodedata
 import signal
 import socket
 import stat
@@ -125,6 +129,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -141,6 +146,12 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 EVENT_STREAM_TTL = int(os.environ.get("EVENT_STREAM_TTL", "3600"))
 
+# Refused at import, as hub.py refuses it: the executing claim's EXPIRE with a
+# non-positive TTL deletes the state hash at the instant of the claim, and the
+# reaper then reads an empty hash for a job that is running.
+if EVENT_STREAM_TTL <= 0:
+    raise ValueError(f"EVENT_STREAM_TTL must be a positive number of seconds, got {EVENT_STREAM_TTL}")
+
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_ADDR = f"{COMFY_HOST}:{COMFY_PORT}"
@@ -151,6 +162,25 @@ COMFY_ADDR = f"{COMFY_HOST}:{COMFY_PORT}"
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "60"))
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
+
+# How long, after asking ComfyUI to /interrupt a prompt this agent has given
+# up on, to wait for ComfyUI's queue to actually empty before concluding it
+# never will. An interrupt takes effect between sampler steps, so a big node
+# (a model load, an upscale) can take a while to notice; a custom node stuck
+# in a C call never notices. See await_comfy_idle().
+INTERRUPT_DRAIN_TIMEOUT = int(os.environ.get("INTERRUPT_DRAIN_TIMEOUT", "60"))
+
+# TEST-ONLY. Never set this in a manifest. A pause, in seconds, immediately
+# before the point-10 claim that turns "dispatched" into "executing" — the
+# last instant at which a reap can still be free. The window between reading
+# the owner and writing the phase is microseconds in production, and
+# enterprise/test/check-36-live-worker-fencing.py scenario C needs the
+# gateway's reaper to act INSIDE it, deterministically, to prove that a
+# requeue landing there is noticed rather than raced. There is no stub-side
+# hook that can widen this window: ComfyUI is not involved until the
+# submit, which is after it. Zero, the default, is no pause and no code
+# path — the sleep is not called.
+TEST_DELAY_BEFORE_CLAIM_S = float(os.environ.get("TEST_DELAY_BEFORE_CLAIM_S", "0"))
 
 # The shared output volume, as this container sees it. It must be the same
 # directory start.sh hands ComfyUI as --output-directory — start.sh reads this
@@ -240,6 +270,46 @@ WORKER_KEY = f"comfy:worker:{WORKER_INCARNATION}"
 # thing must be this process. See BEGIN WORKER IDENTITY.
 PROCESSING_KEY = f"comfy:processing:{WORKER_INCARNATION}"
 # END WORKER IDENTITY
+
+# How long one BLMOVE parks before returning None so the loop can notice
+# the SIGTERM flag. Named because REDIS_SOCKET_TIMEOUT below is defined
+# relative to it and the two must never be edited apart.
+QUEUE_POLL_TIMEOUT = 5
+
+# Socket timeouts on the Redis connection, set EXPLICITLY rather than left
+# to the library's default — because that default changed underneath this
+# file once. redis-py < 7 defaults socket_timeout to None (block forever);
+# redis-py 8 defaults it to 5 seconds, which is exactly QUEUE_POLL_TIMEOUT
+# and turns every idle BLMOVE into a raised TimeoutError. The requirements
+# file pins < 7 for that reason; this makes the pin a belt and not the
+# only thing holding the trousers up.
+#
+# But "block forever" is the other wrong answer. A Redis whose TCP path is
+# blackholed rather than refused (a NetworkPolicy change, a node's conntrack
+# table, a Redis pod replaced with its Service still pointing at the old
+# IP) leaves a BLMOVE with no timeout parked until the kernel gives up on
+# the connection, which is measured in minutes to hours — and the heartbeat
+# thread's SET parks the same way. The worker is Running, ComfyUI answers
+# the liveness probe, and nothing consumes the queue. So: a bound, larger
+# than the longest reply this agent legitimately waits for (the BLMOVE's
+# own QUEUE_POLL_TIMEOUT) by a margin wide enough that a loaded Redis is
+# never mistaken for a dead one. A TimeoutError out of the poll loop is not
+# caught: it ends the process, start.sh ends the container, and the kubelet
+# restarts it against whatever Redis is reachable then.
+REDIS_SOCKET_TIMEOUT = int(os.environ.get("REDIS_SOCKET_TIMEOUT", str(QUEUE_POLL_TIMEOUT + 25)))
+REDIS_CONNECT_TIMEOUT = int(os.environ.get("REDIS_CONNECT_TIMEOUT", "10"))
+
+# A file this process touches once per poll-loop pass and once per heartbeat
+# refresh, so an exec liveness probe can tell a polling agent from a wedged
+# one without reaching Redis: `stat -c %Y` age under 120 s — twice the
+# production HEARTBEAT_REFRESH (HEARTBEAT_TTL / 3 = 60 s), so one late
+# refresh is not a restart and two consecutive ones are. The pod's existing
+# probe asks ComfyUI's HTTP server, which answers happily while the agent
+# beside it is parked in a socket call. Touched BEFORE the Redis call in
+# heartbeat(), not after: a Redis outage is not the agent's fault and
+# restarting the pod would not fix it; a socket call that never returns is
+# what this exists to catch, and the next touch simply does not happen.
+AGENT_LIVENESS_FILE = os.environ.get("AGENT_LIVENESS_FILE", "/tmp/comfy-agent-alive")
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +910,18 @@ def showback_accrue_call(state: str, destination: str,
 
 shutting_down = False
 
+# Set by await_comfy_idle() when ComfyUI would not stop executing a prompt
+# this agent had abandoned. Read by main()'s loop the same way shutting_down
+# is: the current job is still reported and cleaned up, and then the process
+# exits non-zero instead of taking another job. See await_comfy_idle() for
+# why exiting is the only honest option.
+comfy_wedged = False
+
+# Set by interrupt(), cleared by await_comfy_idle(): whether the prompt the
+# idle wait is confirming was one this agent abandoned. It decides what an
+# UNREADABLE /queue means at the deadline — see await_comfy_idle().
+interrupt_sent = False
+
 
 def log(message: str) -> None:
     print(f"[agent] {message}", flush=True)
@@ -944,6 +1026,26 @@ signal.signal(signal.SIGINT, handle_sigterm)
 # defaults. See docs/09-engineering-handoff.md §3.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# BEGIN SHARED WORKSPACE — the submitter's directory name (docs/10-roadmap.md, Q3)
+#
+# worker_agent.py's BEGIN OUTPUT WORKSPACES gives every submitter one
+# directory under OUTPUT_ROOT, named from the envelope's `user`. This is the
+# NAMING half of that, and nothing else — the pure functions and the
+# constants they read. It is MIRRORED VERBATIM between enterprise/gateway/
+# hub.py and enterprise/worker/worker_agent.py for the same reason the
+# envelope and the showback accumulator are: hub.py's output_file() has to
+# compute the same name from the same identity to decide, under
+# AUTH_MODE=oauth, whether a caller is reading their own workspace, and
+# rewrite_image_urls() has to refuse the same filename shapes the worker
+# refuses — a gateway that spelled either rule differently would refuse
+# everyone their own files, or serve what the worker would not name, with
+# nothing failing anywhere to say so. scripts/lint.sh diffs the two copies
+# line for line. The directory mode, the prefix rewrite and everything that
+# touches the volume stay the worker's alone — the gateway mounts it
+# read-only.
+# ---------------------------------------------------------------------------
+
 # Where a job with no authenticated submitter goes. Deliberately not "" (which
 # would put anonymous output loose in the shared root again) and deliberately
 # not derivable from any username: a real workspace is always
@@ -959,6 +1061,47 @@ WORKSPACE_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
 MAX_WORKSPACE_SLUG_CHARS = 40
 WORKSPACE_DIGEST_CHARS = 12
 
+
+def workspace_name(user: str) -> str:
+    """The submitter's directory name. Total, never raises, never rejects."""
+    if not user:
+        return ANON_WORKSPACE
+
+    # NFC first: an identity provider can hand back "café" as four code points
+    # or as five (e plus a combining accent), and a human reads both as one
+    # person. Without this the digest below would give that person two
+    # unrelated workspaces, one per spelling, and the gateway's scoping would
+    # refuse them their own files whenever the proxy's spelling differed from
+    # the worker's. Canonical composition is the form both sides agree on.
+    user = unicodedata.normalize("NFC", user)
+
+    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
+    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
+
+    # .strip("-") again: the truncation above can leave a trailing separator.
+    # "user" when nothing readable survived — the digest still separates two
+    # such names from each other.
+    return f"{slug.strip('-') or 'user'}-{digest}"
+
+
+def is_bare_filename(name: str) -> bool:
+    """
+    True iff `name` is a single path component: no separator, no NUL, and not
+    "." or "..". This is the confinement rule for the REPORTED FILENAME,
+    mirroring what workspace_path() already enforces for the reported
+    workspace — a run of unsafe characters cannot be un-collapsed into a
+    traversal the way a raw "/" or ".." can.
+
+    ComfyUI's own manifest entries never put a separator in `filename`;
+    `subfolder` is the only field a save node uses to nest. So a `filename`
+    that fails this is not ComfyUI's own shape and is refused outright rather
+    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    """
+    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+
+# END SHARED WORKSPACE
+# ---------------------------------------------------------------------------
+
 # setgid + group-writable. Both halves are load-bearing under an arbitrary UID:
 # g+w is what lets the NEXT pod write here at all, and setgid is what makes the
 # files and subdirectories ComfyUI creates inside inherit GID 0 instead of the
@@ -968,26 +1111,21 @@ WORKSPACE_DIR_MODE = 0o2775
 # What ComfyUI's own SaveImage defaults to when a workflow leaves it empty.
 DEFAULT_FILENAME_PREFIX = "ComfyUI"
 
+# The manifest `type` of a file written under --output-directory. The other
+# value ComfyUI emits is "temp" (PreviewImage and friends, written under
+# --temp-directory), which never reaches the shared volume at all.
+DURABLE_OUTPUT_TYPE = "output"
+
+# Where hub.py serves the shared volume from. The URL half of every manifest
+# entry is built under this; the path half is confined by output_subfolder().
+OUTPUTS_URL_PREFIX = "/outputs/"
+
 # The one input ComfyUI treats as a path relative to --output-directory. Save
 # nodes spell it this way (SaveImage, SaveAnimatedPNG/WEBP and the video nodes
 # that copy them), which is what makes rewriting it the whole per-job scoping
 # mechanism: ComfyUI is a long-lived process started with ONE fixed
 # --output-directory, so there is no per-job flag to set instead.
 FILENAME_PREFIX_INPUT = "filename_prefix"
-
-
-def workspace_name(user: str) -> str:
-    """The submitter's directory name. Total, never raises, never rejects."""
-    if not user:
-        return ANON_WORKSPACE
-
-    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
-    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
-
-    # .strip("-") again: the truncation above can leave a trailing separator.
-    # "user" when nothing readable survived — the digest still separates two
-    # such names from each other.
-    return f"{slug.strip('-') or 'user'}-{digest}"
 
 
 def workspace_path(workspace: str) -> pathlib.Path:
@@ -1036,10 +1174,26 @@ def set_shared_mode(path: pathlib.Path) -> None:
 
 
 def ensure_workspace(path: pathlib.Path) -> None:
-    """Create every level below OUTPUT_ROOT, each with the explicit mode."""
+    """
+    Create every level below OUTPUT_ROOT, each with the explicit mode.
+
+    Only ever for a path that is already resolved and inside OUTPUT_ROOT, and
+    that is asserted rather than assumed: this walks `path` one component at
+    a time and chmods each one, so a ".." anywhere in it walks UP — the
+    caller that once let one through (output_subfolder(), before the
+    per-component rule below) had this function chmod OUTPUT_ROOT itself and
+    then create a sibling of every workspace at the root. relative_to()
+    raises for a path outside OUTPUT_ROOT; the component check is for a path
+    that stays inside it only because the ".." is cancelled by what follows.
+    """
+    relative = path.relative_to(OUTPUT_ROOT)
+
+    if not all(is_bare_filename(part) for part in relative.parts):
+        raise ValueError(f"refusing to create {path}: not a resolved path under {OUTPUT_ROOT}")
+
     current = OUTPUT_ROOT
 
-    for part in path.relative_to(OUTPUT_ROOT).parts:
+    for part in relative.parts:
         current = current / part
 
         try:
@@ -1105,7 +1259,7 @@ def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
     """
     scoped = 0
 
-    for node in workflow.values():
+    for node_id, node in workflow.items():
         if not isinstance(node, dict):
             continue
 
@@ -1114,26 +1268,54 @@ def scope_workflow_outputs(workflow: dict, workspace: str) -> int:
         if not isinstance(inputs, dict) or FILENAME_PREFIX_INPUT not in inputs:
             continue
 
-        inputs[FILENAME_PREFIX_INPUT] = scoped_prefix(workspace, inputs[FILENAME_PREFIX_INPUT])
+        prefix = inputs[FILENAME_PREFIX_INPUT]
+
+        # A list here is a LINK — [node_id, output_index], the prefix coming
+        # from another node's output (a string primitive, a text node) —
+        # and scoped_prefix() cannot follow it at submit time, so it puts
+        # the default in its place. That is the confined answer, and it is
+        # also a silent change to what the user's workflow said; say so,
+        # naming the node, so a support ticket about "my prefix was ignored"
+        # has a line to find.
+        if isinstance(prefix, list):
+            log(f"warning: node {node_id}: {FILENAME_PREFIX_INPUT} is linked from "
+                f"another node ({prefix!r}); replaced by {DEFAULT_FILENAME_PREFIX!r} "
+                f"inside workspace {workspace}")
+
+        inputs[FILENAME_PREFIX_INPUT] = scoped_prefix(workspace, prefix)
         scoped += 1
 
     return scoped
 
 
-def is_bare_filename(name: str) -> bool:
+def is_confined_subfolder(subfolder: str) -> bool:
     """
-    True iff `name` is a single path component: no separator, no NUL, and not
-    "." or "..". This is the confinement rule for the REPORTED FILENAME,
-    mirroring what workspace_path() already enforces for the reported
-    workspace — a run of unsafe characters cannot be un-collapsed into a
-    traversal the way a raw "/" or ".." can.
+    True iff every component of a reported `subfolder` is a bare path
+    component by the rule above — so no "..", no ".", no empty run, no
+    backslash, no NUL. Empty (no subfolder at all) is the common case and is
+    fine.
 
-    ComfyUI's own manifest entries never put a separator in `filename`;
-    `subfolder` is the only field a save node uses to nest. So a `filename`
-    that fails this is not ComfyUI's own shape and is refused outright rather
-    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    Per component, and BEFORE anything is resolved, because resolving the
+    whole path and asking "still inside OUTPUT_ROOT?" is the wrong question:
+    "../<OUTPUT_ROOT's own name>" resolves to OUTPUT_ROOT and passes it, and
+    the destination the file is then moved to is built by joining the raw
+    string under the workspace — where the ".." walks back out of it.
+    ComfyUI's own save nodes normalise the subfolder they report, so one that
+    fails this is not ComfyUI's shape and is refused, not repaired.
     """
-    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+    return all(is_bare_filename(part) for part in subfolder.split("/")) if subfolder else True
+
+
+# The shape of a workspace directory name, for telling "a file some node left
+# in the shared root" apart from "a file inside somebody else's workspace".
+# Mirrors what workspace_name() emits: a lowercase slug, "-", twelve hex
+# digits — or the anonymous workspace. A shared-root subfolder a custom node
+# hardcodes ("video/", "upscaled/") does not look like this.
+WORKSPACE_SHAPE = re.compile(r"[a-z0-9][a-z0-9-]*-[0-9a-f]{%d}" % WORKSPACE_DIGEST_CHARS)
+
+
+def looks_like_workspace(name: str) -> bool:
+    return name == ANON_WORKSPACE or WORKSPACE_SHAPE.fullmatch(name) is not None
 
 
 def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str, str]:
@@ -1166,6 +1348,10 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str
         log(f"warning: output filename {filename!r} is not a bare filename — not served")
         return workspace, ""
 
+    if not is_confined_subfolder(subfolder):
+        log(f"warning: output subfolder {subfolder!r} is not a plain relative path — not served")
+        return workspace, ""
+
     try:
         ws_root = workspace_path(workspace)
         reported = (OUTPUT_ROOT / subfolder / filename).resolve()
@@ -1183,6 +1369,25 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str
 
     if reported.is_relative_to(ws_root):
         return subfolder, filename  # already scoped, by the prefix rewrite
+
+    # Inside OUTPUT_ROOT, outside this workspace — the move below exists for
+    # exactly that, so a custom node that hardcodes its own subfolder still
+    # has its output served from the right place. But "not inside mine" is
+    # satisfied by "inside somebody else's", and the move is an os.replace:
+    # a manifest naming a file in another submitter's workspace (any node
+    # that lets the workflow choose its subfolder will do, and workspace
+    # names derive from usernames /api/showback lists) took that user's
+    # finished file, put it under this submitter's directory and handed
+    # this submitter a URL for it — a cross-user read that is also a
+    # deletion. No legitimate job writes there: scoped_prefix() puts a
+    # prefix naming another workspace INSIDE the submitter's own. Refused,
+    # and the file is not touched.
+    inside = reported.relative_to(OUTPUT_ROOT).parts
+
+    if len(inside) > 1 and looks_like_workspace(inside[0]):
+        log(f"warning: output {subfolder}/{filename} is inside workspace {inside[0]!r}, "
+            f"not {workspace!r} — not moved, not served")
+        return workspace, ""
 
     if not reported.exists():
         # A node reported a file it did not write, or something else removed
@@ -1222,14 +1427,32 @@ def connect_redis() -> redis.Redis:
         password=REDIS_PASSWORD,
         decode_responses=True,
         health_check_interval=30,
+        socket_timeout=REDIS_SOCKET_TIMEOUT,          # see REDIS_SOCKET_TIMEOUT
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
     )
     conn.ping()
 
     return conn
 
 
+def touch_liveness() -> None:
+    """Freshen AGENT_LIVENESS_FILE's mtime. Never raises: a probe file that
+    cannot be written is a probe that fails, which is the right direction,
+    and not a reason to fail a job."""
+    try:
+        with open(AGENT_LIVENESS_FILE, "a"):
+            pass
+
+        os.utime(AGENT_LIVENESS_FILE, None)
+
+    except OSError:
+        pass
+
+
 def heartbeat(conn: redis.Redis) -> None:
     """Tell the gateway this worker is alive. Expiry does the deregistering."""
+    touch_liveness()
+
     try:
         conn.set(WORKER_KEY, str(int(time.time())), ex=HEARTBEAT_TTL)
     except redis.RedisError:
@@ -1283,17 +1506,75 @@ def still_ours(conn: redis.Redis, job_id: str) -> bool:
     """
     Is this job still mine to act on? See point 10, and OWNER_FIELD.
 
-    Read immediately before the two acts a reaped worker must not perform:
-    handing the workflow to ComfyUI, and writing a terminal outcome. Everything
-    between them is this process talking to its own ComfyUI about work that has
-    already started, which a second opinion from Redis cannot undo.
+    Read immediately before writing a terminal outcome — the second of the
+    two acts a reaped worker must not perform. The first, handing the
+    workflow to ComfyUI, is guarded by claim_executing() below, which asks
+    the same question inside the write it protects rather than before it.
+    Everything between the two is this process talking to its own ComfyUI
+    about work that has already started, which a second opinion from Redis
+    cannot undo.
 
     Unowned is OURS. A hash written before this field existed, or recreated by
     an HSET after expiring, carries no owner — and a missing field that
     suppressed a terminal event would strand exactly the jobs this whole
-    mechanism exists to stop stranding.
+    mechanism exists to stop stranding. claim_executing() applies the same
+    rule, in Lua, for the same reason.
     """
     return conn.hget(state_key(job_id), OWNER_FIELD) in (None, "", WORKER_INCARNATION)
+
+
+# The claim: "executing" is written only if this incarnation still owns the
+# job, in one script, so nothing can land between the check and the write.
+#
+# This used to be still_ours() followed by an HSET — a read, then separately
+# a write that the read had supposedly authorised. Between them the reaper
+# could requeue the job (it stamps REAPED_OWNER first, then writes
+# phase=queued and pushes the entry back); the HSET then wrote "executing"
+# over the retry's "queued" and the submit that followed handed ComfyUI the
+# workflow beside the retry's own — the exact replay the fence exists to
+# prevent, arriving one line below it. The window was microseconds, which is
+# why it survived every check that parks a worker in front of the fence
+# (check-36 A/B) and why check-36 C needs TEST_DELAY_BEFORE_CLAIM_S to
+# reach it.
+#
+# Absence is not a fence, here as in still_ours(): a hash with no owner
+# field is claimed. The EXPIRE is inside the script for the reason
+# arm_state_ttl() gives in hub.py — an HSET recreates an expired hash with
+# no TTL — and because the caller used to issue it as a second round trip.
+CLAIM_EXECUTING_LUA = """
+local owner = redis.call('HGET', KEYS[1], ARGV[1])
+
+if owner and owner ~= '' and owner ~= ARGV[2] then
+  return 0
+end
+
+redis.call('HSET', KEYS[1], ARGV[3], ARGV[4])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+
+return 1
+"""
+
+_claim_script = None
+
+
+def claim_executing(conn: redis.Redis, job_id: str) -> bool:
+    """
+    Write PHASE_EXECUTING iff OWNER_FIELD is still this incarnation (or
+    absent). True means the claim held and ComfyUI may be handed the
+    workflow; False means somebody reaped this job in the meantime, and the
+    caller abandons exactly as it would have on a failed still_ours().
+    """
+    global _claim_script
+
+    if _claim_script is None:
+        _claim_script = conn.register_script(CLAIM_EXECUTING_LUA)
+
+    held = _claim_script(
+        keys=[state_key(job_id)],
+        args=[OWNER_FIELD, WORKER_INCARNATION, PHASE_FIELD, PHASE_EXECUTING, EVENT_STREAM_TTL],
+    )
+
+    return int(held) == 1
 
 
 def stream_key(job_id: str) -> str:
@@ -1434,6 +1715,12 @@ def run_job(conn: redis.Redis, job: dict) -> None:
     ws.connect(f"ws://{COMFY_ADDR}/ws?clientId={CLIENT_ID}", timeout=30)
     ws.settimeout(RECV_TIMEOUT)
 
+    # None until ComfyUI has been handed the workflow. Everything in the
+    # `except` and `finally` below that talks to ComfyUI about this prompt is
+    # conditional on it, because before the submit there is nothing at
+    # ComfyUI to interrupt or to wait for.
+    prompt_id = None
+
     try:
         # The last moment a cancel can still be free. /api/jobs/<id>/cancel is
         # cooperative and promises that "a job that has not been picked up yet
@@ -1456,31 +1743,34 @@ def run_job(conn: redis.Redis, job: dict) -> None:
         # terminal events on a stream the browser closed at the first, and two
         # accruals against one job_id.
         #
-        # Abandon rather than fail: the retry is running and will report for
-        # both of us, so a `failed` here would close a browser that is watching
-        # work which is going to succeed. Nothing is emitted, nothing is
-        # billed, and main()'s LREM already declines to delete a payload the
-        # reaper may have re-queued behind it.
-        if not still_ours(conn, job_id):
+        # Point 6, the other half, in the same write: ComfyUI is about to be
+        # handed the workflow, and "executing" is written BEFORE the POST
+        # rather than after it returns, because ComfyUI has the prompt from
+        # the moment the request is written — the round trip is a window in
+        # which a death would otherwise be read as "nothing ran" and replayed
+        # onto a second GPU, which is the one thing the narrow retry exists to
+        # prevent. The cost of being early is a job that dies inside the POST
+        # and is not retried; the cost of being late is a poison workflow
+        # walking the pool, so this errs early on purpose. Written BEFORE the
+        # `accepted` event for the same reason: this is the flag that decides
+        # a death's fate, and the event is only a thing to look at. From here
+        # on, every death this job suffers is terminal.
+        #
+        # One compare-and-set rather than a read and then a write, because a
+        # reap can land between the two (see CLAIM_EXECUTING_LUA). Abandon
+        # rather than fail when it does: the retry is running and will report
+        # for both of us, so a `failed` here would close a browser that is
+        # watching work which is going to succeed. Nothing is emitted, nothing
+        # is billed, and main()'s LREM already declines to delete a payload
+        # the reaper may have re-queued behind it.
+        if TEST_DELAY_BEFORE_CLAIM_S:
+            time.sleep(TEST_DELAY_BEFORE_CLAIM_S)  # see TEST_DELAY_BEFORE_CLAIM_S
+
+        if not claim_executing(conn, job_id):
             log(f"job {job_id}: reaped while this worker was still alive — "
                 f"another attempt owns it now, abandoning before submit "
                 f"(incarnation {WORKER_INCARNATION})")
             return
-
-        # Point 6, the other half: ComfyUI is about to be handed the workflow.
-        # BEFORE the POST rather than after it returns, because ComfyUI has the
-        # prompt from the moment the request is written — the round trip is a
-        # window in which a death would otherwise be read as "nothing ran" and
-        # replayed onto a second GPU, which is the one thing the narrow retry
-        # exists to prevent. The cost of being early is a job that dies inside
-        # the POST and is not retried; the cost of being late is a poison
-        # workflow walking the pool, so this errs early on purpose.
-        #
-        # Written BEFORE the `accepted` event for the same reason: this is the
-        # flag that decides a death's fate, and the event is only a thing to
-        # look at. From here on, every death this job suffers is terminal.
-        conn.hset(state_key(job_id), PHASE_FIELD, PHASE_EXECUTING)
-        conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
         prompt_id = submit_prompt(workflow)
 
@@ -1569,7 +1859,7 @@ def run_job(conn: redis.Redis, job: dict) -> None:
             if data.get("prompt_id") not in (None, prompt_id):
                 continue
 
-            emit(conn, job_id, message)
+            emit(conn, job_id, forwardable(message))
 
             kind = message.get("type")
 
@@ -1587,11 +1877,70 @@ def run_job(conn: redis.Redis, job: dict) -> None:
                 finish(conn, job_id, "completed", collect_outputs(prompt_id, workspace))
                 return
 
+    except Exception:
+        # Leaving this function by an exception after the submit — the
+        # TimeoutError above, the closed-socket RuntimeError, a Redis error
+        # out of emit() — means this agent has stopped listening to a prompt
+        # ComfyUI may well still be executing. It has to be told to stop:
+        # ComfyUI runs one prompt at a time, so the next job this worker
+        # takes would otherwise sit in ComfyUI's queue behind the abandoned
+        # one, receive no event, and time out too — and so would the one
+        # after it. A custom node wedged in a C call turned a whole pod into
+        # a black hole this way, with the liveness probe (which asks
+        # ComfyUI's HTTP server, not its executor) green throughout.
+        if prompt_id is not None:
+            interrupt()
+
+        raise
+
     finally:
         try:
             ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+        # Whatever way this job ended, the next BLMOVE must not happen while
+        # ComfyUI is still busy with this one. On the ordinary completion
+        # path this is one GET that finds an empty queue.
+        if prompt_id is not None:
+            await_comfy_idle(job_id, prompt_id)
+
+
+def forwardable(message: dict) -> dict:
+    """
+    The copy of a ComfyUI event that leaves this pod.
+
+    Everything is forwarded as-is except one field: an `executed` event's
+    data.output, which is the finished node's manifest in the same raw
+    {filename, subfolder, type} shape as /history — unconfined, and reported
+    BEFORE collect_outputs() has moved or refused anything. Stripped rather
+    than confined, for three reasons that add up to "nothing wants it":
+
+      - Nobody reads it. The browser renders the terminal event's `images`
+        (index.html); the per-node copy was only ever turned into
+        /outputs/ URLs by hub.py's rewrite_image_urls(), naming wherever
+        the node wrote — the shared root, or another submitter's workspace
+        — a URL that is wrong until the terminal collect runs and that
+        leaks the other directory's name either way.
+      - Confining here would mean running output_subfolder() — an
+        os.replace — per node, mid-execution, with the node's siblings
+        still writing beside the file, and the terminal collect then
+        finding it already moved. One place confines; this place reports
+        nothing.
+      - It is the one event whose size is the workflow's to choose (a
+        batch of 64 is 64 entries per save node), forwarded through Redis
+        for no reader.
+
+    The node id stays, so the event is still the per-node progress signal
+    it was. The terminal event carries the confined manifest.
+    """
+    if message.get("type") != "executed":
+        return message
+
+    data = dict(message.get("data") or {})
+    data.pop("output", None)
+
+    return dict(message, data=data)
 
 
 def prompt_finished(prompt_id: str) -> bool:
@@ -1632,21 +1981,44 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
 
     for node_output in (entry.get("outputs") or {}).values():
         for image in node_output.get("images", []):
+            # Only what was written to the shared volume. ComfyUI's manifest
+            # carries every file a node reported, and a PreviewImage node
+            # reports its files exactly like SaveImage does except for
+            # `type`: "temp" instead of "output", written under
+            # --temp-directory (/tmp in the pod, start.sh) rather than under
+            # --output-directory. A URL built for one of those is a 404 by
+            # construction, and not a harmless one: it resolves into the
+            # shared volume at a path a later save on another worker could
+            # legitimately fill with somebody else's image.
+            if image.get("type") != DURABLE_OUTPUT_TYPE:
+                continue
+
             raw_filename = image.get("filename")
             subfolder, filename = output_subfolder(workspace, image.get("subfolder") or "", raw_filename)
 
             if not filename:
                 continue  # refused as unsafe by output_subfolder() — never named in a URL
 
-            url = f"/outputs/{subfolder}/{filename}".replace("//", "/")
+            # Joined, then percent-encoded. A filename is caller-chosen text
+            # (it starts as a filename_prefix), so a space, a "#" or a "%" in
+            # it is ordinary — and each breaks a URL differently: a space is
+            # refused on the request line, "#" starts a fragment and drops
+            # everything after it, "%" is a malformed escape. quote() with
+            # "/" kept as the separator, which is safe because both halves
+            # are already bare components (no "/" inside a component to
+            # confuse with a separator). The gateway decodes the path before
+            # it resolves it, so the file is found under its real name.
+            relative = "/".join(part for part in (subfolder, filename) if part)
+            url = OUTPUTS_URL_PREFIX + urllib.parse.quote(relative, safe="/")
 
             # Defense in depth: output_subfolder() should already guarantee
             # this, but the URL is what actually reaches the browser, so it
             # is what gets checked, independently of the function that built
-            # it. A violation here means the confinement contract itself
-            # broke, so it is loud rather than swallowed into a "warning" log
-            # line the way a hostile INPUT is above.
-            resolved = (OUTPUT_ROOT / url[len("/outputs/"):]).resolve()
+            # it — decoded first, because the decoded path is the one the
+            # gateway will resolve. A violation here means the confinement
+            # contract itself broke, so it is loud rather than swallowed into
+            # a "warning" log line the way a hostile INPUT is above.
+            resolved = (OUTPUT_ROOT / urllib.parse.unquote(url[len(OUTPUTS_URL_PREFIX):])).resolve()
             if not resolved.is_relative_to(OUTPUT_ROOT):
                 raise RuntimeError(
                     f"confinement invariant broken: {url!r} (from subfolder={subfolder!r}, "
@@ -1666,12 +2038,88 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
 
 
 def interrupt() -> None:
+    global interrupt_sent
+
+    interrupt_sent = True
+
     try:
         urllib.request.urlopen(
             urllib.request.Request(f"http://{COMFY_ADDR}/interrupt", data=b"{}"), timeout=10
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+def comfy_idle() -> bool:
+    """Is ComfyUI's own queue empty — nothing running, nothing pending?"""
+    queue = comfy_get("/queue", timeout=5)
+
+    return not queue.get("queue_running") and not queue.get("queue_pending")
+
+
+def await_comfy_idle(job_id: str, prompt_id: str) -> None:
+    """
+    Block until ComfyUI's queue is empty, for at most INTERRUPT_DRAIN_TIMEOUT
+    — and if it still is not, mark this worker wedged so main() exits.
+
+    Called on every way out of run_job() once a prompt has been submitted.
+    After a completion it returns at once. After an interrupt — a cancel,
+    a timeout, a closed socket — it is the confirmation that the interrupt
+    took: /interrupt is a request, acted on between sampler steps, and a
+    node that never yields never acts on it.
+
+    Why exit rather than carry on polling. This agent binds the only path
+    into ComfyUI, and ComfyUI executes serially: while it is still running
+    the abandoned prompt, every job this worker takes is a job that will
+    time out unseen. The pod cannot fix its own ComfyUI (there is no
+    /restart), the liveness probe asks ComfyUI's HTTP server and not its
+    executor, and the gateway counts a heartbeating worker as capacity. A
+    non-zero exit is the one signal the kubelet acts on: start.sh waits on
+    both children and ends the container when either exits, so the
+    container restarts with a fresh ComfyUI, and the queue is served by
+    workers that can serve it in the meantime. Reading /queue as "not idle"
+    when it cannot be read at all is deliberate — a ComfyUI that does not
+    answer is not one to hand the next job to either, and in the pod that
+    case ends the container through start.sh regardless.
+    """
+    global comfy_wedged, interrupt_sent
+
+    after_interrupt, interrupt_sent = interrupt_sent, False
+    deadline = time.time() + INTERRUPT_DRAIN_TIMEOUT
+    readable = False
+
+    while time.time() < deadline:
+        try:
+            idle = comfy_idle()
+            readable = True
+
+            if idle:
+                return
+
+        except Exception:  # noqa: BLE001 - unreadable is not idle; see above
+            pass
+
+        time.sleep(0.5)
+
+    # The one case that is not a wedge: nothing was interrupted, and /queue
+    # never answered — ComfyUI is busy with something other than a prompt
+    # (freeing VRAM after a large model, a custom node pinning the event
+    # loop on unload). A prompt that was never abandoned cannot be the thing
+    # it is stuck on, and exiting here would cost the pool a warm card for a
+    # cold start over an HTTP pause. The liveness probe, which asks the same
+    # server, is the judge of a pause that does not end; the next submit
+    # fails loudly on its own if it has not.
+    if not after_interrupt and not readable:
+        log(f"job {job_id}: ComfyUI's /queue did not answer for "
+            f"{INTERRUPT_DRAIN_TIMEOUT}s after prompt {prompt_id} completed — "
+            f"carrying on; the liveness probe decides whether this is a pause")
+        return
+
+    comfy_wedged = True
+    log(f"job {job_id}: ComfyUI is still executing prompt {prompt_id} "
+        f"{INTERRUPT_DRAIN_TIMEOUT}s after it was interrupted — this worker will "
+        f"exit after reporting the job, so the pod restarts with a ComfyUI that "
+        f"can be interrupted instead of taking jobs it cannot run")
 
 
 _showback_script = None
@@ -1774,7 +2222,7 @@ def main() -> int:
         f"ready, polling {QUEUE_KEY}")
 
     try:
-        while not shutting_down:
+        while not shutting_down and not comfy_wedged:
             heartbeat(conn)
 
             # Move, don't pop. BLMOVE parks the job in this worker's processing
@@ -1784,7 +2232,8 @@ def main() -> int:
             #
             # Short timeout rather than blocking forever, so the SIGTERM flag
             # is noticed promptly instead of at the end of the grace period.
-            raw = conn.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=5, src="RIGHT", dest="LEFT")
+            raw = conn.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=QUEUE_POLL_TIMEOUT,
+                              src="RIGHT", dest="LEFT")
 
             if raw is None:
                 continue
@@ -1881,6 +2330,10 @@ def main() -> int:
             conn.delete(WORKER_KEY)
         except Exception:  # noqa: BLE001
             pass
+
+    if comfy_wedged:
+        log("exiting: ComfyUI is wedged on an abandoned prompt (see above)")
+        return 1
 
     log("exiting cleanly")
 

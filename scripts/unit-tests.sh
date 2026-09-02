@@ -424,6 +424,201 @@ trap - EXIT
 rm -f "$HUB_PY_BACKUP" "$ENVELOPE_LOG"
 
 # ---------------------------------------------------------------------------
+# Wave 2C additions below (S3, S4 in the audit plan).
+# ---------------------------------------------------------------------------
+
+log "scripts/06-status.sh — ec2_hourly_rate on an unknown instance type (S3)"
+
+# ec2_hourly_rate() used to return 0 for anything not in its case statement,
+# indistinguishable from a genuinely free line and silently under-reporting
+# the burn rate exactly when someone changes GPU_INSTANCE_TYPE to something
+# new. It now warns by name and returns empty instead. Source only the
+# function under test, in a subshell, rather than running the rest of
+# 06-status.sh — that assumes aws/rosa/oc are on PATH and a cluster exists,
+# neither of which this suite has.
+STATUS_SH="$REPO_ROOT/scripts/06-status.sh"
+
+extract_ec2_hourly_rate()
+{
+    sed -n '/^ec2_hourly_rate()/,/^}/p' "$STATUS_SH"
+}
+
+ec2_hourly_rate_unknown_warns()
+{
+    (
+        eval "$(extract_ec2_hourly_rate)"
+        ec2_hourly_rate m5.not-a-real-type 2>&1 >/dev/null \
+            | grep -qi "no on-demand rate on file for instance type 'm5.not-a-real-type'"
+    )
+}
+
+expect_true "an unknown instance type prints a warning naming the type" \
+    ec2_hourly_rate_unknown_warns
+
+ec2_hourly_rate_unknown_is_empty()
+{
+    (
+        eval "$(extract_ec2_hourly_rate)"
+        [[ -z "$(ec2_hourly_rate m5.not-a-real-type 2>/dev/null)" ]]
+    )
+}
+
+expect_true "an unknown instance type returns nothing rather than a silent 0" \
+    ec2_hourly_rate_unknown_is_empty
+
+ec2_hourly_rate_known_type_unaffected()
+{
+    (
+        eval "$(extract_ec2_hourly_rate)"
+        [[ "$(ec2_hourly_rate g6.xlarge 2>/dev/null)" == "0.805" ]]
+    )
+}
+
+expect_true "a known instance type still returns its rate with no warning" \
+    ec2_hourly_rate_known_type_unaffected
+
+# ---------------------------------------------------------------------------
+
+log "lib/common.sh — ASSUME_YES only comes from --yes, never from the environment (S4)"
+
+# The comment on confirm_destructive claims ASSUME_YES is set only by an
+# explicit --yes argument, never by an environment default. Before this fix
+# that was aspirational: `set -a; source .env; set +a` exports whatever .env
+# happens to set, and an ASSUME_YES already exported by the calling shell
+# survived untouched. load_env now unsets ASSUME_YES both before and after
+# sourcing .env, so simulate the exact scenario the comment promises against
+# — ASSUME_YES exported in the environment before a script ever looks at its
+# own argv — and confirm confirm_destructive still asks (and, with no
+# terminal attached, still refuses) rather than silently proceeding.
+assume_yes_env_does_not_bypass_confirm()
+{
+    (
+        export ASSUME_YES=true
+        load_env
+        CLUSTER_NAME=test-cluster confirm_destructive "test" </dev/null >/dev/null 2>&1
+    )
+}
+
+expect_false "ASSUME_YES=true in the environment does not bypass confirm_destructive" \
+    assume_yes_env_does_not_bypass_confirm
+
+# ---------------------------------------------------------------------------
+
+log "scripts/lint.sh — namespace hardening shapes (W4, P8, P9)"
+
+# The rules added with the Redis ACL, the ServiceAccount-token removal and the
+# namespace NetworkPolicy. Same mechanism as the manifest fixtures above — a
+# deliberately-broken file copied under a zz-fixture- name into the directory
+# lint already scans, then removed — and the same rule about the expected
+# message: each fixture below violates exactly one invariant and the assertion
+# names it, so a fixture cannot keep passing once the rule it was written for
+# is deleted.
+#
+# Every one of these is invisible to enterprise/test/run.sh by construction. It
+# runs one Redis with one password on one laptop, no Kubernetes at all, so it
+# can see neither a pod's ServiceAccount token, nor a NetworkPolicy, nor which
+# Redis user a connection authenticated as.
+
+LINT_LOG="$(mktemp -t comfy-lint-fixture.XXXXXX)"
+
+trap cleanup_manifest_fixture_drops EXIT
+
+expect_true "lint fails a worker manifest that mounts a ServiceAccount token nothing in the pod uses" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-mounts-sa-token.yaml" \
+    "does not set automountServiceAccountToken: false"
+
+# W4's two halves, one fixture each. The Secret key is the loud half — a
+# reviewer can see `key: password` in a diff — and the URL is the silent one:
+# a redis:// URL with no username authenticates as `default` however correct
+# the password beside it, so the least-privilege user is bypassed with every
+# pod healthy and every job running. A single fixture breaking both would pass
+# with either rule deleted.
+expect_true "lint fails a worker manifest that takes the ADMIN Redis password" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-holds-admin-redis-password.yaml" \
+    "the ADMIN Redis credential"
+
+expect_true "lint fails a worker manifest whose REDIS_URL names no user, silently authenticating as default" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/worker-redis-url-has-no-user.yaml" \
+    "with no username"
+
+# The regression the namespace default-deny creates, and the only one it
+# creates. A Deployment nothing selects is not left unrestricted, it is cut
+# off — and it fails silently: Ready pod, passing probes, every connection
+# timing out, nothing in the events naming a network policy.
+expect_true "lint fails a Deployment in the multi-user namespace that no NetworkPolicy selects" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/deployment-no-network-policy.yaml" \
+    "is not selected by any NetworkPolicy"
+
+# I1's warm floor. The failure is not that KEDA rejects this — it accepts it
+# happily, clamps to maxReplicaCount, and the floor simply never arrives, with
+# no error anywhere and a person waiting out a cold start at nine in the
+# morning that the setting existed to have already paid for.
+expect_true "lint fails a ScaledObject whose warm floor asks for more workers than maxReplicaCount allows" \
+    lint_fails_on_manifest_fixture "$LINT_FIXTURES/warm-floor-above-max-replicas.yaml" \
+    "warm floor that never arrives"
+
+cleanup_manifest_fixture_drops
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+# Landing additions: the two mirror rules the hub/worker fixes needed (G2, G9).
+# ---------------------------------------------------------------------------
+
+log "scripts/lint.sh — the workspace naming and the job key shapes are mirrored (G2, G9)"
+
+# Same technique as the envelope test above: drift the real file the way a
+# later change plausibly would, run lint, restore whatever happens.
+
+WORKER_PY="$REPO_ROOT/enterprise/worker/worker_agent.py"
+WORKER_PY_BACKUP="$(mktemp -t comfy-worker-backup.XXXXXX)"
+MIRROR_LOG="$(mktemp -t comfy-mirror-lint.XXXXXX)"
+cp "$WORKER_PY" "$WORKER_PY_BACKUP"
+
+restore_worker_py()
+{
+    [[ -f "$WORKER_PY_BACKUP" ]] && cp "$WORKER_PY_BACKUP" "$WORKER_PY"
+}
+trap restore_worker_py EXIT
+
+lint_fails_with()
+{
+    local needle="$1" rc=0
+    "$LINT_SH" > "$MIRROR_LOG" 2>&1 || rc=$?
+    (( rc != 0 )) && grep -q "$needle" "$MIRROR_LOG"
+}
+
+# (1) the digest length changes on the worker only: every directory the
+# worker creates from now on has a name the gateway will never compute.
+python3 - "$WORKER_PY" <<'PYEOF2'
+import sys
+path = sys.argv[1]
+content = open(path).read()
+line = "WORKSPACE_DIGEST_CHARS = 12\n"
+assert content.count(line) == 1, "WORKSPACE_DIGEST_CHARS moved — update this test"
+open(path, "w").write(content.replace(line, "WORKSPACE_DIGEST_CHARS = 16\n", 1))
+PYEOF2
+expect_true "lint fails when the worker's workspace digest length drifts from the gateway's" \
+    lint_fails_with "shared workspace block differs"
+restore_worker_py
+
+# (2) the state key is renamed on the worker only: the gateway keeps reading
+# an empty hash, the reaper keeps arming a TTL on a key nothing writes.
+python3 - "$WORKER_PY" <<'PYEOF2'
+import sys
+path = sys.argv[1]
+content = open(path).read()
+line = '    return f"comfy:job:{job_id}:state"\n'
+assert content.count(line) == 1, "state_key() moved — update this test"
+open(path, "w").write(content.replace(line, '    return f"comfy:jobs:{job_id}:state"\n', 1))
+PYEOF2
+expect_true "lint fails when the worker's state_key() shape drifts from the gateway's" \
+    lint_fails_with "state_key() differs"
+restore_worker_py
+
+trap - EXIT
+rm -f "$WORKER_PY_BACKUP" "$MIRROR_LOG"
+
+# ---------------------------------------------------------------------------
 
 printf '\n'
 

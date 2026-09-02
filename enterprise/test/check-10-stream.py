@@ -1,22 +1,11 @@
 """Assertions against the running gateway + worker."""
-import json, sys, time, urllib.request
+import json, os, socket, struct, sys, time, urllib.request, uuid
 import websocket
 
-GW = "http://127.0.0.1:8100"
-failures = []
+from harness import GW, check, connect_redis, failures
 
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-def post(path, body):
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
+GW_URL = GW.base_url
+get, post = GW.get, GW.post
 
 print("\n== readiness")
 check("readyz reports Redis reachable", get("/readyz")["ok"])
@@ -128,11 +117,11 @@ check("image url is scoped under a per-submitter output workspace "
       workspace_depth >= 1, images)
 
 print("\n== serving the image off the shared volume")
-body = urllib.request.urlopen(GW + images[0]["url"], timeout=10).read()
+body = urllib.request.urlopen(GW_URL + images[0]["url"], timeout=10).read()
 check("image is served", b"fake png" in body)
 
 try:
-    urllib.request.urlopen(GW + "/outputs/../../etc/passwd", timeout=10)
+    urllib.request.urlopen(GW_URL + "/outputs/../../etc/passwd", timeout=10)
     check("path traversal is blocked", False, "it was NOT blocked")
 except urllib.error.HTTPError as exc:
     check("path traversal is blocked", exc.code in (403, 404), exc.code)
@@ -143,7 +132,7 @@ check("job state is completed", state.get("status") == "completed", state)
 
 print("\n== attribution and metrics")
 req = urllib.request.Request(
-    GW + "/api/generate",
+    GW_URL + "/api/generate",
     data=json.dumps({"workflow": {"3": {"class_type": "KSampler", "inputs": {}}}}).encode(),
     headers={"Content-Type": "application/json", "X-Forwarded-User": "alice"})
 job2 = json.loads(urllib.request.urlopen(req, timeout=10).read())
@@ -151,7 +140,7 @@ state2 = get(f"/api/jobs/{job2['job_id']}")
 check("the authenticated user is stamped onto the job",
       state2.get("user") == "alice", state2)
 
-metrics = urllib.request.urlopen(GW + "/metrics", timeout=10).read().decode()
+metrics = urllib.request.urlopen(GW_URL + "/metrics", timeout=10).read().decode()
 check("prometheus metrics are served",
       "comfy_queue_depth" in metrics and "comfy_workers_registered" in metrics,
       metrics.splitlines()[:2])
@@ -186,6 +175,138 @@ try:
     check("unknown job is a 404", False)
 except urllib.error.HTTPError as exc:
     check("unknown job is a 404", exc.code == 404, exc.code)
+
+
+def raw_post(path, data, headers):
+    """Like post(), but returns (status, body) for error responses too."""
+    req = urllib.request.Request(GW_URL + path, data=data, headers=headers, method="POST")
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return resp.getcode(), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+WORKFLOW_BYTES = json.dumps({"workflow": {"3": {"class_type": "KSampler", "inputs": {}}}}).encode()
+
+status, body = raw_post("/api/generate", b"{this is not json", {"Content-Type": "application/json"})
+check("a body that is not JSON is refused with 400, not a 500", status == 400, (status, body[:80]))
+
+status, body = raw_post("/api/generate", WORKFLOW_BYTES, {"Content-Type": "text/plain"})
+check("a POST whose Content-Type is not application/json is refused with 415 -- "
+      "the body is parsed as JSON whatever the header says, so a form post or a "
+      "cross-site text/plain submission must not be able to queue a job",
+      status == 415, (status, body[:80]))
+
+status, body = raw_post("/api/generate", WORKFLOW_BYTES,
+                        {"Content-Type": "application/json; charset=utf-8"})
+check("a Content-Type carrying a charset parameter is still application/json",
+      status == 200, (status, body[:80]))
+
+# The declared-length path: the handler refuses on Content-Length before it
+# reads a byte of the body, so the response is on the wire while this socket
+# has sent none of it -- which is why this is a raw socket rather than urllib,
+# whose sendall of two megabytes would hit the closed connection first.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+sock = socket.create_connection(("127.0.0.1", 8100), timeout=10)
+sock.sendall((f"POST /api/generate HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+              f"Content-Type: application/json\r\n"
+              f"Content-Length: {MAX_BODY_BYTES + 1}\r\n\r\n").encode())
+sock.sendall(b"{")
+status_line = b""
+try:
+    status_line = sock.recv(64).split(b"\r\n", 1)[0]
+except OSError as exc:
+    status_line = repr(exc).encode()
+sock.close()
+check("a body declared larger than MAX_BODY_BYTES is refused with 413 before it is read",
+      b" 413 " in status_line, status_line)
+
+print("\n== the landing page is served")
+page = urllib.request.urlopen(GW_URL + "/", timeout=10).read().decode()
+check("GET / serves index.html", "ComfyUI" in page and "/api/generate" in page, page[:80])
+
+print("\n== a WebSocket for a job that does not exist is closed, not held open")
+# Before this, /ws/<anything> was accepted and parked on a 15-second XREAD loop
+# forever, one Redis connection each, for an id that names no job and never
+# will. Closed with an application code (4404) so a browser can tell "no such
+# job" from "the gateway went away"; recv_frame() reads the close frame itself
+# rather than websocket-client's "" rendering of it.
+ws3 = websocket.WebSocket()
+ws3.connect(f"ws://127.0.0.1:8100/ws/no-such-job-{uuid.uuid4().hex[:8]}", timeout=10)
+ws3.settimeout(10)
+close_code = None
+try:
+    frame = ws3.recv_frame()
+    if frame.opcode == websocket.ABNF.OPCODE_CLOSE and len(frame.data) >= 2:
+        close_code = struct.unpack("!H", frame.data[:2])[0]
+    else:
+        close_code = f"opcode {frame.opcode}: {frame.data[:60]!r}"
+except Exception as exc:  # noqa: BLE001
+    close_code = repr(exc)
+ws3.close()
+check("the server closes a WebSocket for an unknown job with code 4404 within "
+      "seconds, instead of holding it open on a ping loop",
+      close_code == 4404, close_code)
+
+print("\n== url rewriting confines what a raw ComfyUI event reports")
+# Live `executed` events reach the browser through rewrite_image_urls() with
+# whatever {filename, subfolder} ComfyUI (or a custom node) put in them -- the
+# worker's confinement applies to the /history manifest it builds the terminal
+# event from, not to the events it forwards verbatim. The stream is written
+# directly: this is about what the gateway does with an event, not about how
+# a worker produces one. A filename or subfolder component that is not a bare
+# single path component must lose its URL (the event itself is still
+# delivered); ordinary shapes must still get one.
+r = connect_redis()
+fake_job = f"rewrite-{uuid.uuid4().hex[:12]}"
+state_k, stream_k = f"comfy:job:{fake_job}:state", f"comfy:job:{fake_job}:events"
+r.hset(state_k, mapping={"status": "running"})
+r.expire(state_k, 120)
+REPORTED = [
+    {"filename": "ok.png", "subfolder": "ws-abc", "type": "output"},
+    {"filename": "flat.png", "subfolder": "", "type": "output"},
+    {"filename": "deep.png", "subfolder": "ws-abc/run1", "type": "output"},
+    {"filename": "../../etc/passwd", "subfolder": "", "type": "output"},
+    {"filename": "x.png", "subfolder": "../../etc", "type": "output"},
+    {"filename": "x.png", "subfolder": "/abs", "type": "output"},
+    {"filename": "a/b.png", "subfolder": "", "type": "output"},
+    {"filename": "..", "subfolder": "ws-abc", "type": "output"},
+    {"filename": "x.png", "subfolder": "ws-abc//run1", "type": "output"},
+]
+r.xadd(stream_k, {"data": json.dumps({"type": "executed", "data": {
+    "node": "9", "prompt_id": "p-rewrite", "output": {"images": REPORTED}}})})
+r.xadd(stream_k, {"data": json.dumps({"type": "completed", "data": {"images": []}})})
+r.expire(stream_k, 120)
+
+ws4 = websocket.WebSocket()
+ws4.connect(f"ws://127.0.0.1:8100/ws/{fake_job}", timeout=10)
+ws4.settimeout(10)
+executed = None
+while True:
+    try:
+        m = json.loads(ws4.recv())
+    except Exception:  # noqa: BLE001
+        break
+    if m.get("type") == "executed":
+        executed = m
+    if m.get("type") in ("completed", "failed", "cancelled"):
+        break
+ws4.close()
+
+got = (executed or {}).get("data", {}).get("output", {}).get("images", [])
+urls = [image.get("url") for image in got]
+check("the executed event itself was delivered with every image entry intact",
+      len(got) == len(REPORTED), urls)
+check("ordinary entries are rewritten to gateway URLs",
+      urls[:3] == ["/outputs/ws-abc/ok.png", "/outputs/flat.png", "/outputs/ws-abc/run1/deep.png"],
+      urls[:3])
+check("a filename or subfolder that is not made of bare path components gets NO "
+      "url -- traversal, an absolute subfolder, a separator inside filename, "
+      "'..' as a filename and an empty component are all dropped rather than "
+      "handed to the browser as /outputs/../...",
+      all(url is None for url in urls[3:]), urls[3:])
+r.delete(state_k, stream_k)
 
 print()
 if failures:

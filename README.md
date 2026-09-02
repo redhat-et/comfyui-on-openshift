@@ -1,54 +1,86 @@
 # ComfyUI on OpenShift
 
-[![ci](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml/badge.svg)](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml)
+**One GPU pool, a whole team — not a card per person.**
 
-A ComfyUI (PyTorch) inference backend on GPU nodes, built for **ROSA** — Red
-Hat OpenShift Service on AWS — and portable to any OpenShift 4.x cluster you
-already have.
+[![ci](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml/badge.svg)](https://github.com/redhat-et/comfyui-on-openshift/actions/workflows/ci.yaml)
 
 ComfyUI is a single-user desktop application wearing a web UI. It has no
 authentication, its custom-node system executes arbitrary Python by design, and
-it runs on the most expensive idle resource in your cloud account. Put it in
-front of a team and you own two problems at once: an unauthenticated
-remote-code-execution endpoint, and a GPU per person because a GPU is
-indivisible under Kubernetes.
+a GPU is indivisible under Kubernetes, so putting it in front of a team means
+an unauthenticated remote-code-execution endpoint *and* a card per person.
+OpenShift already solves both — cluster SSO, a machine pool that scales to zero
+nodes, network policy, arbitrary-UID isolation, the driver lifecycle, audit
+logging, in-cluster image builds — and this repository is the wiring: about
+9,000 lines of Python and shell that connect stock ComfyUI to that platform,
+built for **ROSA** (Red Hat OpenShift Service on AWS) and portable to any
+OpenShift 4.x cluster, plus every piece of failure handling you would otherwise
+meet at 2am — the late subscriber, the worker that dies mid-render, the reap
+that fails halfway, the output filename that spells a path.
 
-**OpenShift already solves both, and this repo is the wiring.** Cluster SSO,
-a queue that lets GPU workers appear and vanish, a machine pool that autoscales
-to *zero nodes*, driver lifecycle, arbitrary-UID isolation, network policy,
-audit logging, in-cluster image builds with no registry credential to rotate —
-none of that is written here. It is the platform. What is written here is the
-~9,700 lines of Python that connect ComfyUI to it, and every place that
-connection turns out to be subtle.
+## The number
 
-Two configurations share one cluster, one GPU operator, and one set of volumes:
-a single-user pod for one person and one GPU, and a multi-user configuration
-with a queue, cluster SSO, and a GPU pool that scales to zero. The queue and
-gateway logic is covered by an end-to-end test suite that runs on your laptop
-in about a minute — no cluster, no GPU, no AWS account (`make test`).
+Ten designers, this repo's own rates (`g6.xlarge`, L4 24 GB, $0.976/hour
+all-in — $0.805 to AWS for the card and $0.171 to Red Hat for its vCPUs):
 
-## Who is reading this
+| Ten users | GPU line, per month | Assumes |
+|---|---:|---|
+| A pod per person, running | ~$7,100 | ten cards × 730 hours |
+| One autoscaled pool, light use | ~$120 | 0.4 GPU-hours per person per day — a dozen two-minute renders — so ~120 card-hours a month |
+| One pool with a five-worker warm floor, weekdays 9–6 | ~$950 | a team iterating hard all day (26% duty while iterating, ~2.4 GPU-hours per person per day) and nobody ever waiting for a card: 5 × 0.976 × ~195 hours |
 
-Four people arrive here with four different fears. The rest of this README is
-one argument — that the platform underneath is doing the work, and that the
-code here is the wiring — but which face of it you need first depends on which
-of them you are.
+Both pool rows are the same queueing model at two duty cycles, and "Sizing the
+pool" below reconciles them. Either way the answer is nowhere near a card
+each, and the cluster floor of $1.06/hour (~$775/month) sits under all three.
 
-| You are | What you are afraid of | Start here |
-|---|---|---|
-| **A designer** | That "on a platform" means a worse version of the tool you already know | **"What changes for the people using it"** — the loop, step by step, including the one click in ComfyUI-Manager that fetches a missing model onto storage that outlives the cluster. Two things genuinely change; both are named there rather than discovered later. |
-| **Cost or finance** | Spend that lands on the card with nobody's name on it | **"The numbers, briefly"** — three cost states, each with a command and a known return time. **"Why it is cheap, which is not the reason people assume"** is the duty-cycle argument for the size of the number, which is not discipline. `GET /api/showback` answers who spent the card, and `QUOTA_GPU_SECONDS` caps one person's month — off by default, and it fails open. |
-| **A platform engineer** | Going on call for somebody else's creative tool | **"What you actually operate"** — a FastAPI process, a Python agent, one Redis, and the bill. The driver, the nodes, the control plane and the TLS are somebody else's pager, and that division is the reason this repository is under ten thousand lines of Python rather than a distributed system. |
-| **Security** | An unauthenticated remote-code-execution endpoint, which is exactly what ComfyUI is | **"Security — the strongest control is architectural"** — the GPU pods have no Service and no Route and ComfyUI binds to loopback, so the endpoint is unreachable rather than defended. **"Proof, not promises"** is what has been attacked, what was measured, and the six assertions this suite caught being unable to fail. |
+## Thirty seconds
 
-"Which path are you on?" further down routes by task instead — what you want
-to do next, rather than what you are worried about.
+```bash
+cp .env.example .env && $EDITOR .env
+make tools preflight account    # CLIs; read-only check; GPU quota + budget alarm (days of lead time)
+make up                         # cluster, GPU operator, storage, one ComfyUI pod on one GPU   (~55 min)
+make enterprise                 # or: the queue, SSO and the pool that scales to zero (STORAGE_MODE=rwx)
+```
+
+Zero-cost evaluation, before any of that: **`make test`** runs the real
+gateway and the real worker agent against a real Redis and a stub ComfyUI on
+your laptop. No cluster, no GPU, no AWS account, about a minute.
+
+## Against the alternatives
+
+| | Cost at 10 users | Cold start | SSO + audit | Per-user showback + quota | RCE containment | Custom nodes | Who operates it | Your VPC / data residency |
+|---|---|---|---|---|---|---|---|---|
+| **One shared box, ComfyUI `--multi-user`** | list price of one card, always on; ten people queue on one process | none | none — `--multi-user` is a per-user workspace flag in the frontend, not authentication | none | none: every user runs on the box, and any custom node runs as the server | Manager, live, for everyone at once | whoever owns the box | yours |
+| **A pod or VM per person** | a card each, ~$7,100/mo before anyone remembers to turn one off | none while running; minutes from stopped | whatever you put in front of each one | the per-instance bill, by construction | one blast radius per person, each on a node with credentials | per person, live | you, ten times | yours |
+| **RunPod/Modal-style serverless ComfyUI** | per-second GPU billing with the vendor's markup; cheapest at very low duty | seconds to about a minute on a warm image, longer on a fresh pull | the vendor's account and API keys, not your IdP | per API key, from the vendor's invoice | the vendor's container isolation | your image; rebuild to change | the vendor | no — workflows, models and outputs run in the vendor's cloud |
+| **Hosted ComfyDeploy / ViewComfy / Comfy Cloud** | per-seat or per-second subscription | seconds; the vendor keeps it warm | the vendor's login; team SSO depends on plan | the vendor's dashboard | the vendor's | the vendor's catalog and image pipeline | the vendor | no — your data leaves your VPC |
+| **A generic Kubernetes Helm chart** | a card per replica, always on; scale-to-zero is yours to build | none while a replica runs | whatever ingress auth you bolt on | none | a reachable ComfyUI Service by default; any NetworkPolicy is yours to write | your image | you: a cluster, a driver, and the app | yours |
+| **KServe / Ray Serve** | a resident GPU per served model; a design library is many models | seconds once resident; scale-to-zero costs the same cold start as here | the platform's | per deployment, not per user | the serving container; arbitrary node Python does not fit a fixed serving API | the model is the unit, not the graph — ComfyUI's per-job DAG does not fit | you, plus the serving stack | yours |
+| **This repo** | ~$120/mo at 0.4 GPU-h/person/day; ~$950/mo with a five-worker warm floor; plus the $1.06/h cluster floor | **8–17 min unless a warm floor is set** (~$190/mo per warm card, weekdays 9–6) | cluster SSO via oauth-proxy; access is a namespace role; every grant in the cluster audit log | `GET /api/showback` per user; `QUOTA_GPU_SECONDS` per month, off by default, fails open | ComfyUI on loopback with no Service and no Route; namespace default-deny; a worker can reach Redis and DNS and nothing else, as a least-privilege Redis user | **baked into the image — a rebuild**, not a click in Manager | you operate one namespace; the driver, nodes, control plane and TLS are somebody else's pager. **The gateway is not the canvas** | yours — ROSA in your AWS account, or any OpenShift you already have |
+
+The two places this loses are in its own row: the cold start when nothing is
+warm, and custom nodes needing a rebuild. Both are priced and both have a
+setting; "Where this loses" below is the long form.
+
+## Which path are you on?
+
+| You are | Start here |
+|---|---|
+| **A designer**, afraid "on a platform" means a worse tool | "What changes for the people using it" — two things change, both named there rather than discovered later |
+| **Cost or finance**, afraid of spend with nobody's name on it | "The number", "Sizing the pool" and "The cost ladder": three states, each with a command and a return time; `GET /api/showback` says whose card it was |
+| **A platform engineer**, afraid of going on call for a creative tool | "What you actually operate": a FastAPI process, a Python agent, one Redis, and the bill |
+| **Security**, afraid of exactly what ComfyUI is | "Why this platform — security": the GPU pods are unreachable rather than defended. "Proof, not promises" is what has been attacked |
+| No AWS account yet | `docs/01-aws-account.md` — ~20 minutes of browser work — then "Thirty seconds" above |
+| Your own ComfyUI on a GPU, managed for you | `make up`, then `make forward` — the single-user path under "Running it" |
+| A team sharing a GPU pool, with SSO and scale-to-zero | `make enterprise`; `enterprise/README.md` to run it, `docs/06-enterprise-architecture.md` for why it is shaped that way |
+| Already have an OpenShift cluster | `PLATFORM=openshift` in `.env`, `oc login`, then `make gpu storage deploy` (or `make gpu storage enterprise`) — nothing in those steps is ROSA-specific |
+| Just evaluating the code | `make test`, then `enterprise/test/README.md` for what each assertion is defending |
+| Taking this over from someone | `docs/09-engineering-handoff.md` |
 
 ## What changes for the people using it
 
-Almost nothing. This is stock ComfyUI — the upstream project at a pinned tag,
-not a reimplementation and not a wrapper — so the loop a designer already has
-survives intact:
+Almost nothing. This is stock ComfyUI — the upstream project at a pinned
+commit, not a reimplementation and not a wrapper — so the loop a designer
+already has survives intact:
 
 | Their loop | On this platform |
 |---|---|
@@ -88,29 +120,86 @@ designer needs a GPU for a small fraction of their working day, so ten designers
 do not need ten GPUs. They need one pool, a queue, and a card that turns off in
 between.
 
-## One GPU, ten people
+## Sizing the pool, five to thirty people
 
-The sharpest number here, using this repo's own rates.
+Aggregate GPU-hours answer "what does a month cost." They do not answer "how
+many workers does the pool need running at once" — and that second number is
+what decides whether the tenth person to hit Queue Prompt waits behind the
+other nine, or gets a warm worker immediately.
 
-A `g6.xlarge` worker node is **$0.976/hour all-in** — $0.805 to AWS for the
-card, $0.171 to Red Hat for its vCPUs. A pod per person means a card per
-person, because a GPU is indivisible under Kubernetes:
+**The demand assumption, because it drives the number.** Every figure in this
+section is one model: a render takes about 2.5 minutes, the setup between
+renders takes about 7, so a designer who is iterating needs a card **26% of the
+time they are iterating** — about 2.4 GPU-hours across a nine-hour day if they
+never stop. That is the heavy end. "The number" above quotes 0.4 GPU-hours a
+day, which is the same designer doing a dozen renders spread across a day of
+mostly non-GPU work; a middle case, iterating for part of the day, lands near
+1.3 GPU-hours (14% of nine hours). The $120 headline is the light case and this
+section is the heavy one — the same arithmetic at different duty cycles, and
+neither is a card each.
 
-| Ten users | GPU line, per month |
-|---|---:|
-| A pod per person, running | ~$7,100 |
-| One autoscaled pool, ~4 GPU-hours/day of real generation | ~$120 |
+Treating each active user that way, and sizing so the average queueing wait
+stays under ~30 seconds — imperceptible against a render that takes minutes —
+the number of *concurrent* workers a pool needs grows far slower than headcount:
 
-That second row assumes about **0.4 GPU-hours per person per day** — roughly a
-dozen two-minute generations each. A designer iterating hard is closer to 1.3,
-which is three times the GPU line and still nowhere near a card each. The
-assumption is stated because it drives the number.
+| Team | Concurrent workers | Pool, warm during active hours | A dedicated pod each, same hours | Savings |
+|---:|---:|---:|---:|---:|
+| 5 | 3 | $3.99/hr | $5.94/hr | 33% |
+| 10 | 5 | $5.94/hr | $10.82/hr | 45% |
+| 15 | 6 | $6.92/hr | $15.70/hr | 56% |
+| 20 | 8 | $8.87/hr | $20.58/hr | 57% |
+| 25 | 9 | $9.84/hr | $25.46/hr | 61% |
+| 30 | 10 | $10.82/hr | $30.34/hr | 64% |
 
-That is not a discount, it is a structural consequence of separating the thing
-users touch from the thing that costs money. The ratio moves with your
-utilization; the direction does not.
+Both columns include the $1.06/hour cluster floor and $0.976/hour per
+`g6.xlarge`. Savings widen with team size because pooled capacity is a queueing
+problem, not a division problem: doubling the team does not double the overlap.
 
-## The numbers, briefly
+**This only holds if the pool is kept warm at the "concurrent workers" count
+during active hours** — interactive iteration is exactly the pattern
+`docs/06-enterprise-architecture.md` names as the wrong fit for scale-to-zero,
+because the 8–17 minute cold start lands mid-loop. That floor is a shipped
+setting, three lines in `.env`:
+
+```bash
+WARM_WORKERS=5                    # the "concurrent workers" column for your team
+WARM_TIMEZONE=America/New_York    # WARM_START / WARM_END default to 0 9 * * 1-5 / 0 18 * * 1-5
+MAX_GPU_WORKERS=8                 # at or above the floor; the default of 3 cannot hold 6-10
+```
+
+It is a KEDA `cron` trigger beside the queue trigger, and KEDA takes the
+maximum across triggers, so outside the window the queue still decides and a
+busy afternoon still bursts past the floor to `MAX_GPU_WORKERS`. For fifteen
+people or more, raise `MAX_GPU_WORKERS` *and* `GPU_VCPU_REQUEST` (the default
+of 32 vCPUs is eight `g6.xlarge`; ten workers need 40, and the quota increase
+takes days). `setup.sh` raises the ceiling to meet a floor above it and says
+so; the quota it cannot raise for you.
+
+**When this stops being true.** The saving lives in the duty cycle, and it is
+worth seeing how fast it goes. Holding the 2.5-minute render and varying the
+gap between renders — savings against a dedicated card each, by team size:
+
+| Gap between renders | Duty while iterating | 5 people | 10 | 20 | 30 |
+|---:|---:|---:|---:|---:|---:|
+| 12 min | 17% | 33% | 54% | 66% | 71% |
+| 7 min | 26% | 33% | 45% | 57% | 64% |
+| 4 min | 38% | 16% | 36% | 47% | 51% |
+| 2 min | 56% | 0% | 18% | 28% | 32% |
+| 1 min | 71% | −16% | 0% | 14% | 19% |
+
+Plainly: **below about 40% duty the pooled floor beats dedicated cards; above
+about 55% it does not**, and for a five-person team rendering every two
+minutes it saves nothing. A team of ten still comes out ahead at every row but
+the last. The model is conservative in two ways that both push the same
+direction — it assumes an infinite arrival population where five to thirty
+users is a finite one with shorter waits, and exponential service times where
+renders are near-deterministic and queue about half as long — so the table
+over-provisions rather than under-provisions. It also assumes everyone's active
+window fully overlaps, so staggered usage needs fewer workers than shown, and
+it excludes EFS, which is small and flat regardless of team size. Nobody has
+run this at thirty designers; `docs/09-engineering-handoff.md` §0 says so.
+
+## The cost ladder
 
 The smallest useful cluster — one ComfyUI pod on an L4, us-east-2, on-demand:
 
@@ -120,32 +209,18 @@ The smallest useful cluster — one ComfyUI pod on an L4, us-east-2, on-demand:
 | GPU parked (`make park`) | ~1.06 | ~5 min |
 | Cluster torn down (`make down`) | ~0.05 | ~15 min |
 
-```mermaid
-stateDiagram-v2
-    Running: Running · ~$2.04/hr
-    Parked: GPU parked · ~$1.06/hr
-    Down: Cluster deleted · ~$0.05/hr
-    Gone: Everything deleted · $0
-
-    [*] --> Running: make up
-    Running --> Parked: make park
-    Parked --> Running: back in ~5 min
-    Running --> Down: make down
-    Down --> Running: back in ~15 min
-    Down --> Gone: make destroy
-```
-
 | Habit | Monthly |
 |---|---:|
 | Left running 24/7 | ~$1,490 |
-| Weekdays 9–6, `make park` nightly | ~$800 |
-| Weekdays 9–6, `make down` nightly | ~$370 |
-| Up one day a week | ~$85 |
+| Weekdays 9–6, `make park` nightly | ~$965 |
+| Weekdays 9–6, `make down` nightly | ~$425 |
+| Up one day a week | ~$114 |
 
-**A single cron line is a 75% cut.** Not a migration and not a rewrite — a
-scheduled `make down` and a Monday-morning `make up`, with models on EFS or S3
-so the rebuild costs nothing but time you were asleep for. Three things to do
-about cost:
+Weekdays 9–6 is ~195 of a month's 730 hours; `docs/02-cost.md` shows the
+arithmetic for every row. **A single cron line is a ~70% cut.** Not a migration
+and not a rewrite — a scheduled `make down` and a Monday-morning `make up`, with
+models on EFS or S3 so the rebuild costs nothing but time you were asleep for.
+Three things to do about cost:
 
 1. **`make account` first.** A new AWS account has a GPU quota of exactly
    zero, and the increase is the one step with a lead time measured in days.
@@ -166,11 +241,8 @@ The other half of a cost question is whose cost it was. `GET /api/showback`
 reports one UTC month's GPU seconds per submitter, from the attribution the
 queue envelope was already carrying, and `QUOTA_GPU_SECONDS` turns that same
 accounting into a per-person ceiling — off by default, and deliberately
-failing open. Both are described in full under "Ideas worth doing next",
-items 7 and 11, including what the number over-counts and why.
-
-The full accounting — every fee, the monthly patterns, and where money leaks
-— is in `docs/02-cost.md`.
+failing open. `docs/10-roadmap.md` (Q4 and Q5) has what the number over-counts
+and why.
 
 ## How it fits together
 
@@ -195,37 +267,27 @@ flowchart LR
 
 Nothing in that picture is a component this repo invented. The queue is Redis,
 the scaling is KEDA and a machine pool, the login is the cluster's own identity
-provider, and the thing doing the generating is stock ComfyUI.
-
-## Which path are you on?
-
-| You | Do this |
-|---|---|
-| No AWS account yet | `docs/01-aws-account.md` — ~20 minutes of browser work — then the quickstart below |
-| Your own ComfyUI on a GPU, managed for you | The single-user quickstart below |
-| A team sharing a GPU pool, with SSO and scale-to-zero | The multi-user quickstart below |
-| Already have an OpenShift cluster | `PLATFORM=openshift` in `.env`, `oc login`, then `make gpu storage deploy` (or `make gpu storage enterprise`) — nothing in those steps is ROSA-specific |
-| Just evaluating the code | `make test` runs the gateway and worker against a real Redis and a stub ComfyUI, locally |
-| Taking this over from someone | `docs/09-engineering-handoff.md` |
+provider, and the thing doing the generating is stock ComfyUI. Queue depth is
+the only input to scaling, and it drives two layers: KEDA sets the worker pod
+count, and a GPU pod with nowhere to run is exactly what makes the machine pool
+provision a node — `Pending` is the mechanism, not a symptom. `docs/11-scaling.md`
+walks the sequence and says how far the shape goes.
 
 ## Why this platform, specifically
 
 This repo will run on any OpenShift, but ROSA with hosted control planes is
-where it is designed to feel best. Seven reasons, each of which is a file in
-this repository rather than a claim.
-
-This is the concentrated form of the argument, not the whole of it. The cost
-ladder above, the failure table below, and "Three things that will bite you"
-at the end are each the same case seen from a different side.
+where it is designed to feel best. Every reason below is a file in this
+repository rather than a claim.
 
 ### Cost — the platform can turn the GPU off, and turn the cluster off
 
-- **Scale-to-zero means zero *nodes*, not zero pods.** KEDA watches Redis
-  queue depth and drops the worker Deployment to 0 replicas; the ROSA machine
-  pool autoscaler then reclaims the GPU node underneath it. Only the second
-  layer saves money — an idle GPU node bills identically whether a pod is
-  scheduled on it or not — and it is the layer most tutorials skip.
-  (`enterprise/manifests/03-autoscale.yaml`)
+**Scale-to-zero means zero *nodes*, not zero pods.** KEDA watches Redis queue
+depth and drops the worker Deployment to 0 replicas; the ROSA machine pool
+autoscaler then reclaims the GPU node underneath it. Only the second layer
+saves money — an idle GPU node bills identically whether a pod is scheduled on
+it or not — and it is the layer most tutorials skip
+(`enterprise/manifests/03-autoscale.yaml`).
+
 ```mermaid
 flowchart LR
     Q[("Redis queue<br/>goes empty")] --> K{{"KEDA"}}
@@ -241,8 +303,7 @@ flowchart LR
 
 - **A ~15-minute rebuild makes teardown a habit instead of a heroic act.**
   HCP's flat $0.25/hour control-plane fee and fast build are what turn
-  `make down` into a cron line. On a cluster that takes forty minutes to
-  rebuild, nobody tears down and everybody overpays. (`docs/02-cost.md`)
+  `make down` into a cron line. (`docs/02-cost.md`)
 - **The bill is a command, not a spreadsheet.** `make status` reads your live
   machine pools and prints the hourly burn — including the ROSA service fee
   that people forget also applies to the GPU node's vCPUs.
@@ -259,16 +320,18 @@ flowchart LR
 - **Redis is the entire interface.** No browser ever holds a connection to a
   worker, so workers can vanish mid-shift with no connection state to repair.
   That property is what makes scale-to-zero possible at all.
-- **Elastic to a ceiling you set.** One queued job asks for one worker, up to
-  `MAX_GPU_WORKERS`. Burst rendering gets parallel cards; a quiet afternoon
+- **Elastic to a ceiling you set, with a floor you schedule.** One queued job
+  asks for one worker, up to `MAX_GPU_WORKERS`; `WARM_WORKERS` holds a floor
+  inside working hours. Burst rendering gets parallel cards; a quiet night
   gets none.
 
 ### Security — the strongest control is architectural
 
-- **The GPU pods are unreachable by construction.** Every worker binds ComfyUI
-  to `127.0.0.1` and has no Service and no Route. This is not defence in depth,
-  it is the primary control, and it removes ComfyUI's entire vulnerability
-  class from the network. (`docs/04-exposing.md`)
+**The GPU pods are unreachable by construction.** Every worker binds ComfyUI
+to `127.0.0.1` and has no Service and no Route. This is not defence in depth,
+it is the primary control, and it removes ComfyUI's entire vulnerability class
+from the network (`docs/04-exposing.md`).
+
 ```mermaid
 flowchart LR
     B["Browsers"] --> R["Route<br/>edge/reencrypt TLS"]
@@ -286,18 +349,27 @@ Everything on the left is reachable and authenticated. The worker on the right
 is reachable by nothing at all — which is why ComfyUI having no login of its own
 stops being a problem rather than becoming one.
 
+- **And it can reach almost nothing either.** The namespace is default-deny in
+  both directions (`enterprise/manifests/06-network-policy.yaml`); a worker's
+  only egress is Redis and DNS, so the arbitrary Python in a custom node has
+  no route to the internet, the instance metadata service, S3 or another
+  namespace. Its Redis credential is a least-privilege ACL user allowed the
+  commands the agent issues and nothing else, and neither it nor Redis mounts
+  a ServiceAccount token — only the gateway does, under `oauth`, because the
+  proxy sidecar really does call the API.
 - **SSO you already own.** An `oauth-proxy` sidecar puts the cluster's own
   identity provider in front of the gateway, and rebinds the gateway to
   loopback so the login cannot be bypassed from inside the cluster either.
 - **Authorization is a role, not a user database.** Access is a
   SubjectAccessReview against the namespace: grant with
   `oc adm policy add-role-to-user`, revoke by removing it, and read the whole
-  history in the cluster audit log. Nothing to build, secure, or forget to
-  secure.
-- **Least privilege all the way down.** Redis carries a generated password and
-  a NetworkPolicy admitting only the gateway and the workers; the S3 model role
-  is read-only so a compromised pod cannot corrupt the canonical store; the
-  gateway blocks path traversal on the output endpoint.
+  history in the cluster audit log. Under `AUTH_MODE=oauth` that identity also
+  scopes what a caller can read: their own outputs, their own showback row.
+- **Every path is handled as hostile.** The submitter's name, a save node's
+  `filename_prefix`, and the filename ComfyUI reports back all end up on the
+  shared volume, and all three are sanitized, joined, resolved and verified
+  inside the output root — asserted on every `make test`, with the escape one
+  check found in how the URL's halves were joined kept as a regression test.
 
 ### Operations — the hard parts are somebody else's job
 
@@ -312,25 +384,9 @@ stops being a problem rather than becoming one.
 - **Termination is routine, and handled.** The worker traps SIGTERM and drains
   the running job; a TTL'd heartbeat plus a per-worker processing list means
   even an OOM kill surfaces a real failure rather than a progress bar that
-  never moves.
-
-### Time to value
-
-- **Four commands to a working GPU cluster** — `make cluster gpu storage deploy`,
-  roughly 55 minutes, mostly unattended. Every script is idempotent;
-  re-running skips what is already done.
-- **Preflight catches the multi-day blocker first.** A new AWS account has a
-  GPU quota of exactly zero and the increase takes days. `make preflight` is
-  read-only and tells you before, not after, a twenty-minute cluster build.
-- **Evaluate it with no cluster, no GPU, and no AWS account.** `make test`
-  runs the real gateway and the real worker agent against a real Redis and a
-  stub ComfyUI, in about a minute.
-- **The eight-step EFS setup is scripted.** RWX storage on an STS cluster is
-  eight things that must all be right simultaneously; getting six right yields
-  a PVC stuck in `Pending` with no useful event. That is why it is a script.
-- **The failure modes are written down** — ten documents covering what
-  actually goes wrong, including a dedicated page on why the force-delete
-  everyone reaches for causes the symptom it claims to cure.
+  never moves; a liveness probe that checks the agent's own loop, not just
+  ComfyUI's HTTP server, restarts a pod that is holding a card and doing
+  nothing.
 
 ### Correctness — the bugs that only appear in a cluster, already fixed
 
@@ -341,72 +397,35 @@ stops being a problem rather than becoming one.
   onto one socket; without the filter, another job's terminal event ends yours
   and reports success on work still running.
 - **Backpressure instead of a silent Redis OOM.** The gateway rejects
-  submissions past a configurable depth and Redis runs `noeviction` — the
-  default would quietly evict queued jobs, which looks exactly like work
-  disappearing at random.
+  submissions past a configurable depth — inside the same atomic insert, so
+  concurrent submits cannot slip past it — and Redis runs `noeviction`.
 - **Long jobs keep their connection.** HAProxy's 30-second default kills a
   generation mid-render and reads like an application bug. Every Route carries
   a four-hour timeout.
+- **An abandoned prompt is interrupted.** A job that exceeds `JOB_TIMEOUT`
+  is sent ComfyUI's `/interrupt` and drained before the worker takes another,
+  so one wedged node cannot turn a pod into a black hole with every probe green.
 
 ### Portability and oversight
 
 - **Not a ROSA lock-in.** `PLATFORM=openshift`, `oc login`, and the same GPU,
-  storage and deploy steps run against any OpenShift 4.x cluster — on-prem,
-  bare metal, vSphere.
+  storage and deploy steps run against any OpenShift 4.x cluster.
 - **Metrics the cluster already knows how to graph.** The gateway exports
   `comfy_queue_depth`, `comfy_workers_registered` and
-  `comfy_estimated_wait_seconds`, and `setup.sh` applies a ServiceMonitor so
-  user-workload monitoring can alert on a wedged pool before a human notices.
+  `comfy_estimated_wait_seconds` from one cached snapshot every five seconds,
+  and `setup.sh` applies a ServiceMonitor so user-workload monitoring can
+  alert on a wedged pool before a human notices.
 - **Every job has a name attached.** The gateway stamps the authenticated
   username onto job state, so when the GPU bill asks whose job this was, there
   is an answer.
-- **Reproducible by policy.** ComfyUI is pinned to a tag both images build,
-  custom nodes are baked in from `app/src/custom_nodes/`, and runtime
-  installers are off by default — so the image that passed review is the image
-  that renders.
+- **Reproducible by policy.** ComfyUI and ComfyUI-Manager are pinned to commit
+  SHAs both images build, custom nodes are baked in from
+  `app/src/custom_nodes/`, and runtime installers are off by default — so the
+  image that passed review is the image that renders.
 
-## GPU machines scale up automatically with demand
+## Running it
 
-Nobody provisions anything. Queue depth is the only input, and it drives both
-layers — the pods, and then the machines underneath them:
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant D as Designers
-    participant Q as Redis queue
-    participant K as KEDA
-    participant M as Machine pool
-    participant W as GPU workers
-
-    Note over W: idle — 0 pods, 0 nodes, $0/hr for GPU
-
-    D->>Q: three workflows submitted
-    Note over Q: LLEN = 3
-    K->>Q: polls depth every 15s
-    K->>W: replicas 0 to 3<br/>(one worker per queued job)
-    Note over W: 3 pods Pending —<br/>no GPU exists to schedule onto
-    W->>M: Pending GPU pods
-    M->>M: provision nodes · 3–5 min
-    M->>W: nodes join, image pulls · 3–8 min
-    W->>Q: BLMOVE, drain the queue
-    Note over Q: LLEN = 0
-    K->>W: after 10 min cooldown,<br/>replicas back to 0
-    W->>M: nothing scheduled
-    M->>M: nodes reclaimed — billing stops
-```
-
-**`Pending` is the mechanism, not a symptom.** A GPU pod with nowhere to run is
-exactly what makes the machine pool provision a node — the thing that looks like
-a failure is the signal. The ceiling is `MAX_GPU_WORKERS`, so a burst cannot
-quietly become a four-figure afternoon.
-
-The timings are the honest part. The second worker pays the same cold start as
-the first, so autoscaling out serves a sustained batch well and often arrives
-after a short spike has already been drained by the worker that was already
-warm.
-
-## Single user — one pod, one GPU
+Single user — one pod, one GPU:
 
 ```bash
 cp .env.example .env && $EDITOR .env
@@ -421,9 +440,8 @@ make deploy       # build and run ComfyUI           (~15 min)
 make forward      # http://localhost:8188
 ```
 
-## Multi user — queue, SSO, GPU pool that scales to zero
-
-Same cluster, different last step:
+Multi user — queue, SSO, GPU pool that scales to zero. Same cluster, different
+last step:
 
 ```bash
 # STORAGE_MODE=rwx in .env — the gateway and the workers share a volume
@@ -431,115 +449,27 @@ make cluster gpu storage
 make enterprise                        # one script does the rest
 ```
 
-The shape of it is in **How it fits together** above.
+Every script is idempotent; re-running skips what is already done.
+`enterprise/README.md` runs the multi-user configuration, and
+`docs/06-enterprise-architecture.md` says why it is shaped that way.
 
-`enterprise/README.md` to run it, `docs/06-enterprise-architecture.md` for why
-it is shaped that way.
+## What happens when things fail
 
-<details>
-<summary><b>What happens when things fail</b> — every failure mode, what the system does, and what the user sees</summary>
-
-<br>
-
-Most of this repository's design is failure handling, so it is worth being able
-to read it in one place. Nothing below is aspirational: each row is a code path
-you can find, and most are covered by an assertion in `enterprise/test/`.
-
-Read it as evidence rather than as a list of defences. Almost nothing here is
-exceptional: a pool that scales to zero terminates workers as a matter of
-routine, a node drain is an upgrade doing its job, and a container restarted in
-place is `restartPolicy: Always` behaving exactly as documented. The platform
-generates this traffic by design, which is why the SIGTERM drain, the TTL'd
-heartbeat and the incarnation nonce are asserted rather than assumed — they
-are on the ordinary operating path, not on an unlikely day. Termination being
-routine is what makes scale-to-zero affordable; handling it is the price of the
-cost ladder above.
-
-#### Out of memory — three different failures that people call one thing
-
-ComfyUI makes it easy to exceed memory, and the three ways it happens are not
-handled alike. Knowing which one you hit is most of the diagnosis.
-
-| | What actually happens | What the user sees |
-|---|---|---|
-| **VRAM / CUDA OOM** — the common one: a resolution, batch size or model stack that does not fit the card | ComfyUI catches it and emits `execution_error`. The agent (`worker_agent.py`, `run_job()`) turns that into a terminal `failed` carrying ComfyUI's own exception message. The worker stays healthy and takes the next job. | `failed: Allocation on device ...` — the real message, not a generic error. Nothing is retried, because the same workflow would fail the same way on any card. |
-| **Host RAM OOM** — a large checkpoint load, a VAE decode, a wide batch | The container hits its own memory limit and the kernel kills ComfyUI inside that cgroup. `start.sh` waits on both children, so the container exits rather than limping on with a dead ComfyUI and a live agent claiming jobs it cannot run — `restartPolicy: Always` then restarts the container inside this same pod, which keeps its name and its `HOSTNAME`. | The job is stranded, then failed by the gateway's reaper (below) once the worker's heartbeat lapses — including across that restart, because the worker's identity is its pod name plus a nonce chosen at process start (`worker_agent.py`, note 9), not the pod name alone. At the queue level this is still indistinguishable from infrastructure death — but the container is not: it terminates as `OOMKilled` and `oc describe pod` names the reason. |
-| **Node-level pressure** — eviction rather than a container kill | The kubelet evicts with a grace period, so SIGTERM arrives first and the drain below applies. A GPU pod is Guaranteed QoS, so it is the last thing evicted, not the first. | Usually nothing: the job finishes before the pod goes. |
-
-That the second row says `OOMKilled` and not "the node decided" is a property of
-the manifest, not of luck: the GPU pod's memory limit is set to something the
-node can actually give it, so the container reaches its own ceiling first. A
-limit larger than the node — the shape this repo shipped with, `24Gi` on a
-16 GiB `g6.xlarge` — can never be reached, which turns the second row into the
-third and costs you the attribution. `scripts/lint.sh` fails a GPU pod that
-drifts back to it.
-
-```mermaid
-flowchart TD
-    X{"Out of memory"} --> V["<b>VRAM</b> — the card is full<br/>resolution, batch, model stack"]
-    X --> H["<b>Host RAM</b> — the node is full<br/>checkpoint load, VAE decode"]
-
-    V --> V1["ComfyUI catches it,<br/>emits execution_error"]
-    V1 --> V2["failed, carrying ComfyUI's<br/>own message.<br/>Worker healthy, takes the next job."]
-
-    H --> H1["Container hits its own limit,<br/>kernel kills ComfyUI"]
-    H1 --> H2["Container exits OOMKilled,<br/>restarted in the same pod —<br/>oc describe pod names the reason"]
-    H2 --> H3["Job stranded, then failed by the<br/>gateway's reaper once the<br/>heartbeat lapses, restart or not"]
-
-    classDef clean fill:#e8eefc,stroke:#5b7bc4,color:#12233f
-    classDef rough fill:#fde8e2,stroke:#d6552b,color:#4a1608
-    class V,V1,V2 clean
-    class H,H1,H2,H3 rough
-```
-
-#### Worker death
-
-| Failure | Handling | User-visible result |
-|---|---|---|
-| **Graceful termination** — scale-to-zero, a node drain, a rolling deploy, a spot interruption notice | The agent traps SIGTERM, stops accepting new work, and **finishes the job in flight** before exiting (`worker_agent.py`, note 4). Termination is routine on a pool that scales to zero, so this is the common path, not the exceptional one. | The generation completes normally. Asserted by the e2e suite. |
-| **Hard kill** — SIGKILL, kernel OOM, node death | The agent parks each job in a per-worker processing list with `BLMOVE` and holds a TTL'd heartbeat (note 5), and writes a `phase` breadcrumb as it goes (note 6). When the heartbeat lapses, the gateway's reaper reads that breadcrumb and either fails the stranded job **naming the dead worker**, or — only if the worker died before ComfyUI was ever handed the workflow — requeues it once. | Died mid-generation: `failed: worker comfy-worker-xxxx died`, loudly, rather than a progress bar that never moves. Failed and not requeued on purpose — a workflow that OOM-killed one worker would OOM-kill the next one too, at GPU prices — and the message points at `oc describe pod`, which *can* tell an OOM kill from a reclaim. Died before it started: a non-terminal `retry` event the browser reads past, and a second worker finishes the job. Both asserted by the e2e suite. |
-| **A worker that comes straight back** — the container is restarted inside its own pod, which is how `restartPolicy: Always` answers a kernel OOM | The heartbeat key and the processing list are named from the worker's *incarnation* — its pod name plus a nonce chosen at process start (`worker_agent.py`, note 9) — not from the pod name alone, which a restart keeps. The reaper's whole liveness test is pairing those two keys by name, so an id that outlives the process it names lets the replacement vouch for its own predecessor. | The restart is invisible to the stranded job: it is failed by the reaper on exactly the schedule it would have been if the pod had never come back. Without the nonce the *same* row above silently stops applying — the job never reaches a terminal state at all, its GPU seconds land in neither bucket, and its queue entry stays in Redis for the life of the pod. Asserted by the e2e suite, restart and all. |
-| **A worker that is alive and was called dead** — the reaper's whole liveness test is whether one heartbeat key exists, and `run_job()`'s prologue blocks in three places: an unbounded `mkdir` on the shared volume, a 30-second WebSocket connect, a 30-second POST | The heartbeat is refreshed by a thread that runs for the whole process rather than from inside the two loops (`worker_agent.py`, note 10), so it is a property of the process being alive. That shrinks the window and cannot close it, so the job also carries an **owner**: the reaper stamps its own mark over that field before it touches a stranded entry, and the worker re-reads it before handing ComfyUI the workflow and again before writing a terminal outcome. Reaped means abandon — no submit, no terminal event, no accrual. | Without both halves a live worker's job is requeued underneath it and ComfyUI is handed one workflow twice, on one GPU pool, with the second `completed` landing on a stream the browser stopped reading. Asserted by the e2e suite (`check-36-live-worker-fencing.py`), which kills nothing. The residual window is two Redis round trips wide and is written down rather than claimed closed — `docs/10-roadmap.md`, F4. |
-| **A reap that fails halfway** — the reaper is the only code that ever writes a terminal event for a job whose worker died, so its own crash is the job's last chance | The stranded entry is *read*, not popped: it leaves the processing list only after its reap has returned, a reap that raised is retried on a later tick, and an entry that can never be reaped is set aside on a capped, expiring list rather than dropped. Exclusion between the two gateway replicas is an explicit per-entry claim rather than a side effect of popping. | The trade is at-least-once for at-most-once: a gateway dying between a reap and its cleanup costs a duplicate terminal event on a stream the browser stopped reading at the first one, where popping first cost the job itself. Asserted by the e2e suite (`check-37-reap-durability.py`), which injects one fault per scenario rather than killing anything. |
-| **ComfyUI wedges or dies mid-job** | The agent's `recv()` is bounded and each job carries a deadline (`JOB_TIMEOUT`, 1800s). On every timeout it re-checks `/history` in case a completion event was simply missed. A socket that ComfyUI closes does not wait that deadline out: the close surfaces as an empty frame rather than an exception, the agent treats it as the close it is, asks `/history` once in case the prompt landed in the instant before the process went, and otherwise fails immediately naming the lost connection. | The job fails with a reason instead of the pod sitting `Running` and `Ready` while silently consuming nothing — which is worse than a crash, because KEDA sees a growing queue and adds more workers beside the dead one. Both outcomes of the closed socket are asserted by the e2e suite (`check-75-closed-socket.py`); before it existed, deleting the guard left the whole suite green. |
-
-#### The job itself
-
-| Failure | Handling | User-visible result |
-|---|---|---|
-| **Invalid workflow** — wrong format, missing input, unknown node | ComfyUI rejects it at submit and the agent propagates the rejection verbatim. | `failed: required input is missing: ckpt_name` rather than `failed`. The difference is most of the support burden. |
-| **Job runs too long** | The per-job deadline fires. | `failed: job exceeded 1800s`. Raise `JOB_TIMEOUT` if your workflows legitimately run longer. |
-| **Cancel** | Cooperative: a queued job is removed, a running one is asked to stop between events. Truly interrupting a running sampler would need ComfyUI's `/interrupt`, and the workers are not reachable from the gateway by design. | Queued jobs stop immediately; running ones stop at the next event boundary. |
-
-#### The connection
-
-| Failure | Handling | User-visible result |
-|---|---|---|
-| **The browser opens its WebSocket after the job already started** | Progress lives in a Redis Stream, not pub/sub. `XREAD` from `0-0` replays the whole history and then tails live in one call. | Nothing is lost. This is the common case — the POST and the socket open are two separate round trips — not an edge case. |
-| **Laptop sleeps, network drops, gateway pod rolls** | Same mechanism: reconnecting replays identically from the beginning. A PodDisruptionBudget keeps one gateway serving through drains and upgrades so both replicas cannot go at once. | The progress bar picks up where it was. |
-| **A long generation outlives the router's idle timeout** | Every Route carries both `haproxy.router.openshift.io/timeout: 4h` and `timeout-tunnel` — on edge and reencrypt Routes only the tunnel timeout governs the upgraded WebSocket. | Long jobs keep their connection. Without both annotations they drop at a fixed point every time, which reads exactly like an application bug. |
-
-#### The system
-
-| Failure | Handling | User-visible result |
-|---|---|---|
-| **Queue grows faster than the pool drains** | The gateway refuses submissions past `MAX_QUEUE_DEPTH`, and Redis runs `maxmemory-policy noeviction`. | An explicit rejection. The default eviction policy would silently drop queued jobs instead, which presents as work disappearing at random. |
-| **Redis restarts** | AOF persistence. | Queued and in-flight state survives a pod restart. It does not survive a zone outage — Redis is a single instance, deliberately, at one-GPU scale. |
-| **A dead pod will not release its volume** | `scripts/08-unstick-storage.sh --repair`, which confirms the EC2 instance is genuinely terminated before force-detaching. | Repairable. Do **not** reach for `oc delete pod --force --grace-period=0`: it strands the volume permanently instead of freeing it. `docs/08-stuck-volumes.md`. |
-| **No GPU capacity, or no quota** | The worker pod stays `Pending`. `make preflight` distinguishes the two — quota is a multi-day fix, capacity is a region or instance-family change. | `docs/05-troubleshooting.md`. |
-| **First job after an idle period** | Not a failure, but it looks like one: a node has to be provisioned and a ~10 GB image pulled. | 8–17 minutes, and the gateway says so rather than leaving a bar that has not moved. Removed entirely by one warm worker — see "Where this loses". |
-| **Someone requests a path outside the output directory** | Resolved and compared against the output root before anything is served. | `/outputs/../../etc/passwd` does not resolve. Asserted by the e2e suite. |
-| **A submitter's name, or a workflow's filename prefix, tries to become a path** | Both are caller-supplied and both end up on the filesystem, so both are handled as hostile. The username is sanitized to a name that cannot contain a separator, then joined, then resolved, then verified inside the output root — in that order. A `filename_prefix` carrying `..` or an absolute path is refused outright. | A username of `../../etc/passwd` gets an ordinary confined workspace rather than a traversal; a workflow trying to write outside its workspace fails with a message naming the prefix. Asserted by the e2e suite. |
-| **ComfyUI's own reported output filename tries to become a path** | Not caller-supplied, but not trusted either: `output_subfolder()` confines the reported `subfolder` *and* the reported `filename` on the same footing, and `collect_outputs()` refuses to build a served URL from either half until both pass. A filename that is not a single bare path component (a `/`, a `..`, a NUL) is dropped from the manifest outright rather than served under a rewritten name. | A node reporting `{subfolder: "", filename: "../../OUTSIDE/secret.txt"}` produces no image entry at all — not a traversal, and not a same-named file served from the wrong place either. Asserted by the e2e suite (`check-65-output-filename-confinement.py`). |
-| **Someone reads another user's output workspace** | Deliberately possible, not a bug: `/outputs/...` is served to any caller with the URL, and the workspace name a job lands in is a *pure, publicly computable* function of the username (allowlist slug + a truncated `sha256`) — no lookup or prior URL is needed, only the username itself. Output workspaces are scoped for organisation, not for isolation; see `docs/06-enterprise-architecture.md`. | Knowing (or guessing) `alice@example.com`'s username is enough to compute her workspace path and fetch whatever is in it. Real read isolation would need an identity the gateway can trust in every `AUTH_MODE`, which is a different, unbuilt item. |
-| **Under `AUTH_MODE=none`, a caller writes into someone else's workspace** | `X-Forwarded-User` is client-supplied in this mode (`hub.py` says so in three places), and the worker writes into whichever workspace that header names, overwriting an existing same-named file there. Inherent to `AUTH_MODE=none`: with nobody authenticated, there is no "someone else" for the header to misrepresent. | Setting `X-Forwarded-User: alice` writes into (and can silently overwrite) alice's output workspace, no login required — on top of the GPU budget `AUTH_MODE=none` already warns about. Run `AUTH_MODE=oauth` if either matters to you. |
-
-</details>
+Most of this repository's design is failure handling. Termination is routine
+on a pool that scales to zero, a node drain is an upgrade doing its job, and a
+container restarted in place is `restartPolicy: Always` behaving as documented
+— so the SIGTERM drain, the TTL'd heartbeat, the incarnation nonce, the
+phase breadcrumb and the ownership fence are on the ordinary operating path,
+not on an unlikely day. Three kinds of out-of-memory that people call one
+thing, five ways a worker can die, a wedged ComfyUI, a laptop that sleeps, a
+queue that outgrows the pool, a username that spells a path: each is a code
+path you can find, and most are covered by an assertion in `enterprise/test/`.
+The full table — what actually happens and what the user sees, row by row —
+is in `docs/05-troubleshooting.md` under "What happens when things fail".
 
 ## Where this loses, and what to do about it
 
-Both boundaries are narrow, both are priced, and both have a flag that changes
-them.
+Both boundaries are narrow, both are priced, and both have a setting.
 
 **Interactive iteration against a cold pool.** The first job after an idle
 period is 8–17 minutes: provision a node, pull a ~10 GB image, initialise CUDA,
@@ -563,325 +493,71 @@ gantt
     Generate                    :crit, 0, 120
 ```
 
-The fix is a warm worker, and it is one variable:
-
-```bash
-SCALE_TO_ZERO=false     # in .env — pins one worker; KEDA still scales 1..N above it
-```
-
-That removes the cold start entirely — the first job of the day starts in
-seconds, and the pool still bursts to `MAX_GPU_WORKERS` under load. It costs
-one GPU node for as long as you leave it up: **~$195/month if you pin it
-weekdays 9–6 and `make park` or `make down` at night**, which is less than one
-designer waiting fifteen minutes every morning.
+The fix is a warm worker, and there are two ways to get one. `SCALE_TO_ZERO`
+is all or nothing: `true` scales pods and GPU nodes to zero and pays an 8–17
+minute cold start on the first job; `false` pins exactly one worker
+permanently and skips KEDA, the ScaledObject and machine-pool autoscaling with
+it. `WARM_WORKERS` (needs `SCALE_TO_ZERO=true`) is the middle setting: a KEDA
+`cron` trigger holds N workers between `WARM_START` and `WARM_END` in
+`WARM_TIMEZONE`, and because KEDA takes the maximum across triggers the queue
+still decides outside the window and a busy afternoon still scales past the
+floor to `MAX_GPU_WORKERS`. 0 = off. Either way the first job of the day
+starts in seconds, at the cost of one GPU node per warm worker for as long as
+it is held: **~$190/month per card held weekdays 9–6**, which is less than one
+designer waiting fifteen minutes every morning. The gateway's
+PodDisruptionBudget applies in both modes.
 
 Worth being precise about what "cold" costs, because the two layers are
 separable:
 
 | What is cold | Cost of the first job | Removed by |
 |---|---:|---|
-| No node — provision + ~10 GB image pull | 6–13 min | pinning the machine pool at 1 during work hours |
-| Node warm, no pod — CUDA init + checkpoint load | 1.5–4 min | a warm worker pod (`SCALE_TO_ZERO=false`) |
+| No node — provision + ~10 GB image pull | 6–13 min | a warm worker, which holds its node |
+| Node warm, no pod — CUDA init + checkpoint load | 1.5–4 min | a warm worker pod (`WARM_WORKERS`, or `SCALE_TO_ZERO=false`) |
 | Warm worker | seconds | — |
 
-So the honest shape for a design team is not "scale-to-zero or don't". It is:
-**one warm card during working hours, zero at night and at weekends.** The
-cold start then happens at most once, before anyone is at their desk, and
-scale-to-zero still does its job for the other fourteen hours a day. See
-"Ideas worth doing next" for scheduling that automatically.
+So the honest shape for a design team is not "scale-to-zero or don't". It is
+**a floor during working hours, zero at night and at weekends** — the cold
+start happens at most once, before anyone is at their desk, and scale-to-zero
+still does its job for the other fourteen hours a day. "Sizing the pool"
+above says how high the floor should be and when it stops paying for itself.
 
-Scale-to-zero earns its keep unmodified on bursty, batch and out-of-hours work,
-where a ten-minute wait for a job nobody is watching costs nothing.
+**Custom nodes need a rebuild.** Manager can tell you a node is missing, but a
+node installed at runtime lands on a container filesystem that a pool scaling
+to zero throws away, and a worker has no route to the internet to fetch it
+anyway. The durable path is `app/src/custom_nodes/` plus
+`app/requirements-extra.txt` and a rebuild — which is also the path that gives
+you a reviewable image. If your team installs nodes several times a day, that
+is a real cost; if it installs them several times a quarter, it is a feature.
 
 **One person, one GPU, nothing to share.** If you are not exercising OpenShift
 semantics and there is no team to serve, a plain EC2 instance with podman is
 $0.81/hour and this is a heavier answer than the question. `docs/02-cost.md`
 says so itself, with a comparison table.
 
-## Running alongside model-serving workloads
-
-This is not a model server and is not trying to be one. The difference is the
-unit of work, not the quality of either.
-
-A serving engine like vLLM holds one model resident and multiplexes many
-requests against it — continuous batching, a shared KV cache, throughput from
-packing concurrent sequences into a single forward pass. That is the right
-shape when the model is fixed and the requests are many.
-
-ComfyUI's unit of work is a graph, not a prompt: a DAG of dozens of nodes whose
-composition changes per job, over a model set the user keeps changing.
-Diffusion is not autoregressive, so there is no KV cache to share and no
-token-level interleaving to exploit — batching means batching identical
-configurations, which ComfyUI already does inside a single workflow. And the
-custom-node ecosystem, arbitrary Python per node, is both why designers use it
-and exactly what does not fit behind a fixed serving API.
-
-The economics follow from that, and they are what decides it. A serving engine
-earns its throughput by keeping a model resident, so serving N models means N
-deployments, each pinning a GPU — and a server that has scaled to zero is not
-serving. Adapters can be multiplexed onto a shared base model; different base
-checkpoints cannot. A design team's library is many base models — SD1.5, SDXL,
-FLUX, a video model, and whatever last week's template pulled in — so residency
-would mean close to a machine per model, held warm whether or not anyone
-touches it that afternoon.
-
-This workload inverts both sides of that. Many models, few requests each,
-loaded per job from a shared volume onto a card that turns off in between. It
-is the same observation as the loop at the top of this README: the models are
-many and the requests are few, so residency optimises the wrong thing.
-
-None of which makes them competitors. They are layers, and **everything this
-README argues applies to both** — the GPU operator, the machine pool that
-scales to zero, cluster SSO, the audit log, quota and the cost controls are
-properties of the platform, not of ComfyUI. A cluster built this way hosts a
-serving deployment as readily as it hosts this one.
-
-If you run both, give them separate machine pools. A serving deployment wants a
-warm resident GPU and suffers under scale-to-zero; this workload is bursty and
-depends on it. They also draw on the same GPU quota, which is the constraint
-that bites first — `make preflight` checks it, and it is a multi-day fix.
-
-## How far this scales
+## How far this scales, and what else the cluster can host
 
 Roughly a hundred designers on the architecture as it stands, and the limit is
-not the one people expect.
-
-The economics are worth stating first, because they run backwards from the
-intuition: **this is expensive per person for a small team and cheap for a large
-one.** The cluster floor — control plane, base workers, NAT gateway — is about
-$1.06/hour whether one person uses it or a hundred. Across five designers that
-is over $150 each per month before a single image is generated; across a hundred
-it is under $8. If your team is small, the honest comparison is not against
-dedicated cloud GPUs, it is against the workstations they already have.
-
-### Why it is cheap, which is not the reason people assume
-
-Not "we remember to turn the cluster off". A designer needs a GPU for roughly
-**14% of their working day** — call it 1.3 GPU-hours out of nine. Finding a
-template, chasing the models it wants, wiring the graph and fixing what it
-reports back is the other 86%, and none of it touches a card. The inference is
-a couple of minutes at the end of a long setup.
-
-So a dedicated GPU sits idle about **six of every seven working hours**, not
-through carelessness but because that is the shape of the work. Splitting the
-saving for thirty designers, GPU line only:
-
-| Arrangement | Card-hours/month | |
-|---|---:|---|
-| A card each, running 24/7 | 21,900 | — |
-| A card each, off outside work hours | 5,940 | **3.7×** — just turning it off |
-| Pooled, scaling with demand | 1,257 | **4.7× more** — recovering the setup time |
-
-The assumptions, because they are what drive the rows: thirty designers,
-nine-hour days, twenty-two working days a month. The first row is
-30 × 730 card-hours, the second 30 × 9 × 22. The third is **not** simply
-30 × 1.3 × 22 — that is 858 card-hours of generation, and a pool does not pack
-that perfectly. A worker stays up for `cooldownPeriod` (600s in
-`03-autoscale.yaml`) after its queue empties, and a cold pool pays for a node
-before it pays for a job, so the pooled row carries the pool's own idle on top
-of the generation itself. Treat 1,257 as an estimate of that overhead rather
-than as arithmetic you can reproduce from the two numbers above; nobody has
-run this at thirty designers, and `docs/09-engineering-handoff.md` §0 says so.
-
-The first factor is not architectural: anyone disciplined enough to shut
-instances down nightly gets it without a cluster. The second is, and it is the
-one worth defending. **The queue does not create a saving; it converts one
-person's setup time into another person's inference capacity.** You can turn a
-card off overnight. You cannot turn it off for the forty minutes somebody
-spends wiring a graph and have it back the instant they press run — not without
-a pool and a queue.
-
-That also explains the `SCALE_TO_ZERO`, `cooldownPeriod` and warm-worker knobs:
-each is a decision about how much of that recovered idleness to hand back in
-exchange for latency.
-
-**The bottleneck is storage, not GPUs.** Every cold worker reads a 7 GB
-checkpoint over NFS, and a pool that scales means "this node does not have that
-model yet" is the normal case rather than the exception. More designers means
-more distinct models, which means more first-loads. The queue, the gateway, the
-reaper and the security model are all nowhere near their limits.
-
-The reason is a design detail worth naming: **models and outputs have opposite
-requirements and share one volume.** Models are read-only, huge, identical
-across pods, and perfectly cacheable — a per-node copy is ideal. Outputs are
-written by one pod and read by another, which is the *only* reason this design
-requires `ReadWriteMany`. EFS exists to solve outputs; models were put on it
-because it was already there.
-
-### Five changes, cheapest first
-
-1. **Bake the hot model set into the worker image.** If five checkpoints cover
-   most jobs, ship them in the image — the node pulls it anyway, so the
-   container runtime becomes the cache. A day's work, and the right thing to
-   price before building anything cleverer.
-2. **Managed multi-AZ Redis.** Redis is the queue, the progress log and the job
-   state, currently one pod that survives a restart but not a zone. ElastiCache
-   removes that single point of failure with no application change at all —
-   same protocol. The highest ratio of risk removed to work done here.
-3. **Outputs to S3, with presigned URLs.** Workers write results straight to
-   object storage and the gateway returns a URL rather than serving bytes off a
-   mount. This is the one that removes the `ReadWriteMany` requirement outright.
-4. **Models to S3, hot copies on node-local NVMe — then group them.** Stage on
-   first use so every later load is local. Then cache hit rate becomes a
-   placement problem: group models by family, give each family a machine pool,
-   pre-warm it, route by declared model. Blocked on a real unknown — ROSA HCP
-   exposes no MachineSet, so how instance store is attached at all is
-   unanswered. That is the spike in `docs/10-roadmap.md`.
-5. **Kueue for scheduling, MIG on the big cards.** The fair-queueing here is
-   correct and measured, and it is also a small scheduler written by hand;
-   Kueue is the Kubernetes-native one, with quota-aware queueing and fair
-   sharing across teams. And on A100/H100 — unlike L4 — MIG partitions a card
-   in hardware with genuinely isolated memory, which is the property
-   time-slicing lacks and the reason time-slicing is rejected above. Only worth
-   it at hundreds of GPUs.
-
-With those, this design reaches several hundred designers and low hundreds of
-GPUs without a rewrite; the shape stays the same. Past that it is multi-cluster
-with a federated queue, and the hard problems stop being technical.
-
-### One thing to know about the big cards
-
-You cannot buy three H100s. AWS sells them as `p5.48xlarge` — eight of them,
-192 vCPU, one node — so the smallest unit you can scale to is eight, the ROSA
-service fee alone is about $8.21/hour on that node before EC2, and the worker
-sizing in `enterprise/manifests/02-worker.yaml` is calibrated for a 4-vCPU
-16 GiB machine and would need rework. Going up the range is a decision about
-VRAM, not throughput: it buys the workflows that do not fit at all. If the queue
-is simply long, two L4s beat one L40S at about the same price.
+storage rather than the queue: every cold worker reads a 7 GB checkpoint over
+NFS, and more designers means more distinct models and more first-loads. The
+economics run backwards from the intuition — the $1.06/hour cluster floor makes
+this expensive per person for five people and cheap for a hundred — and the
+saving is not "we remember to turn the cluster off": the queue converts one
+person's setup time into another person's inference capacity, which no amount
+of discipline does. Five changes, cheapest first, take the design to several
+hundred designers without a rewrite; the AWS accelerator catalog and where each
+card fits, and why this is a layer beside a model server like vLLM rather than
+a competitor to it, are in the same place: **`docs/11-scaling.md`**.
 
 ## Ideas worth doing next
 
-Ordered by payoff per unit of work. Five have landed, and half of a sixth,
-along with four foundation items that were never on this list — worker resource
-sizing, a versioned queue payload, test-harness discovery, and the heartbeat
-keepalive and ownership fence that stop a live worker's job being requeued
-underneath it. A cross-wave sweep landed two more that were on no list at all:
-the worker's Redis identity now names the process rather than the pod, and a
-reap that fails halfway leaves the job recoverable. **Struck items stay here:
-shipped ones because a roadmap that never visibly moves is a wish list, and
-decided-against ones because the reasoning is the useful part.**
-`docs/10-roadmap.md` is the worked version and the record: what landed, what
-each item deferred to a real cluster, and which two of these should not be done
-at all.
-
-1. **Schedule the warm window instead of pinning it.** A pair of cron lines —
-   `rosa edit machinepool gpu --min-replicas 1` at 08:30 and `--min-replicas 0`
-   at 18:30 on weekdays, with the KEDA `minReplicaCount` following it — gives
-   the cold-start-free morning above without paying for a card overnight. This
-   is the single highest-value change on the list for a design team, and it is
-   two cron entries and one patch. *(Small.)*
-2. **Shrink the cold start itself.** The ~10 GB image pull dominates node
-   warm-up. Split the worker image so the CUDA + torch layers are a stable base
-   that rarely changes, and keep a low-priority placeholder pod on the GPU pool
-   so the autoscaler holds one warm node without a real job occupying the card.
-   *(Medium — the placeholder/priority-class pattern is standard cluster
-   autoscaler practice.)*
-3. **Stage models on the node's local NVMe — a spike, not yet a work item.** It cannot be scoped from this repository: ROSA HCP exposes no MachineSet, and the three plausible routes differ enormously in blast radius, with one of them colliding head-on with the arbitrary-UID posture. Answer that before cluster day, not on it. `g6` instances have instance
-   store. An init container that copies the active checkpoint from EFS to local
-   disk turns every subsequent load from an NFS read into a local read, which
-   is the difference EFS costs you today. *(Medium.)*
-4. ~~**Narrow retry**~~, and spot separately. These looked like one item and are
-   not. Blanket retry re-runs the poison pill: a host-RAM OOM kills the pod and
-   is indistinguishable at the queue level from a node reclaim, so "retry on
-   worker death" retries the workflow that will kill the next worker too. The
-   retry half has **shipped** on exactly those terms: jobs that died *before*
-   ComfyUI ever saw the workflow are requeued once, phase breadcrumbs make
-   every other death diagnosable, and nothing that reached a GPU is ever
-   replayed (`docs/10-roadmap.md`, Q2). Spot never needed retry at all: an
-   interruption gives two minutes of notice and the existing SIGTERM drain
-   finishes anything that fits in them — its real trade is that longer
-   generations are lost. *(Spot remains optional; see `docs/10-roadmap.md`.)*
-5. ~~**NVIDIA time-slicing.**~~ **Not doing this** — the decision is made and the reasoning is worth keeping. The device
-   plugin can advertise several replicas of one card, but time-slicing provides
-   **no memory isolation**: co-resident workflows share the full 24 GB and their
-   peak VRAM sums. ComfyUI exceeds VRAM easily on a single tenant, so this turns
-   a deterministic per-workflow failure into a non-deterministic one where the
-   victim is whichever job allocates second. MIG partitions memory properly and
-   is not available on L4. *(Revisit only on MIG-capable hardware.)*
-6. ~~**Per-user output workspaces.**~~ **Shipped** — each job now writes into its own
-   `/output/<workspace>/`, named from the submitter's identity by the worker
-   agent, and every output that comes back is confined there whether or not
-   the save node cooperated (`docs/10-roadmap.md`, Q3). Two things it is worth
-   knowing it does *not* do. Reads are not caller-scoped: the workspaces are
-   organisation and confinement, not access control, because the only identity
-   here is a header that is client-supplied under `AUTH_MODE=none` and a
-   guarantee that evaporates in one of two modes is worse than a documented
-   absence. And usernames are sanitized rather than rejected — an oauth-proxy
-   name is an email, so `@` and `.` are the ordinary case. *(The half that
-   still needs a cluster is the directory mode: an arbitrary, unstable UID
-   means a workspace one pod creates must be group-writable and setgid for the
-   next one.)*
-7. ~~**Showback from the data you already collect.**~~ **Shipped** —
-   `GET /api/showback` reports one UTC month's GPU seconds per submitter, from
-   the attribution the queue envelope was already carrying
-   (`docs/10-roadmap.md`, Q4). Three things are worth knowing about the number
-   before you put it in front of anyone. A **GPU second is one second a worker
-   held the card** — wall clock between `running` and the job's terminal
-   state, which includes the checkpoint load and any time the agent spent
-   parked, and bills a job that failed after twenty minutes for twenty
-   minutes. That over-count is deliberate: the pool runs one job per pod on a
-   dedicated card, so nobody else could have used it, and an honest over-count
-   that says what it includes beats a precise number nobody can reproduce.
-   Time from jobs whose **worker died holding the card** is recorded but not
-   billed to the submitter — it lands in `excluded_gpu_seconds`, because the
-   gateway knows only when it *noticed* the death, not when it happened, and
-   that number is inflated by the detection lag; kept visible, it doubles as a
-   signal that workers are dying mid-generation. And the accumulator is one
-   Redis Hash per month with an expiry and a capped identity count, because
-   the name every total is keyed by is a client-supplied header. *(It lives in
-   Redis, whose PVC is gp3 — so it does **not** survive `make down`. Capture it
-   before a teardown; `docs/09-engineering-handoff.md` §5 has the two lines.)*
-8. ~~**Fair queueing.**~~ **Shipped** — one physical Redis list still, with each
-   job spliced in at a fairness-computed position rather than always at the
-   back, so `LLEN` still means "total jobs waiting", the KEDA trigger needed no
-   change, and the pop is the same `BLMOVE` into the per-worker processing
-   list. One submitter, or none, degrades to plain FIFO by construction. The
-   enqueue cost was measured rather than assumed, and the first implementation
-   stalled Redis for 117.7 ms at full queue depth before it was fixed, against
-   1.6 ms after — `enterprise/test/bench-fair-enqueue.py` keeps both numbers
-   re-measurable, and "Proof, not promises" has the shape of the fix.
-9. **Scale on queue *wait*, not queue depth.** Depth is a proxy; what a user
-   feels is time-to-first-pixel. *(Medium.)* *(The gauge half — Q6 in
-   `docs/10-roadmap.md` — is landed: `/metrics` exports
-   `comfy_estimated_wait_seconds`, the age of the queue entry served next,
-   derived from the `submitted_at` already on every queue envelope. It reads
-   zero or absent only when the queue is actually empty, and keeps growing
-   with wall-clock time — including with zero workers running, which is the
-   scale-to-zero case a Prometheus-scaler trigger needs a real number for.
-   Pointing KEDA's Prometheus scaler at it is I4 and still needs a cluster.)*
-10. **A model lockfile.** `models.lock` next to `COMFYUI_REF`, enforced by the
-    S3 sync job, so an image tag and a model set pin together and a workflow
-    that rendered last quarter still renders. Reject anything that is not
-    `.safetensors` while you are there — `.ckpt` files are Python pickles and
-    loading one executes whatever is inside it. *(Medium.)*
-11. ~~**A cost circuit breaker in the gateway.**~~ **Shipped, as the quota
-    half** — `QUOTA_GPU_SECONDS` in `.env` gives each user a GPU-second ceiling
-    per UTC month, and past it `/api/generate` refuses with a `429` that says
-    how much was used, that other submitters are unaffected, and when the
-    quota resets (`docs/10-roadmap.md`, Q5). It is **off by default**, and it
-    reads the showback accounting from item 7 rather than adding a second one —
-    so a refusal is explainable from `GET /api/showback`. The AWS Budgets half
-    was deliberately *not* built: it would put cloud credentials on the one pod
-    that is the whole public attack surface, to enforce a figure that lags real
-    spend by hours. Two properties matter more than the feature. It **fails
-    open** — unreadable accounting, an unreachable Redis, a garbled setting,
-    all let the job through, loudly, because a breaker that trips on a broken
-    dependency halts a cluster you are already paying for. And it is kept out
-    of `/readyz` by a lint rule that walks the call graph, because a quota
-    check on the readiness probe would take the entire gateway out of service
-    the moment one person went over. It is a guardrail on past accrual, not a
-    reservation: someone who queues twenty jobs at once goes over while they
-    run. The budget alarm remains the backstop.
-12. **Build the images with OpenShift Pipelines.** Bumping `COMFYUI_REF`
-    becomes a pipeline run with a signed output rather than a laptop running
-    `setup.sh`. *(Medium, and the right move once more than one person owns
-    this.)*
-
-`docs/10-roadmap.md` turns this list into a work plan — what each item
-touches, what proves it, what order they can safely land in, and which of them
-cannot be finished without a real cluster. `docs/06-enterprise-architecture.md`
-has the complementary list: what is deliberately *not* here and why, including
-Redis HA, multi-GPU workers, and interrupting a running sampler.
+The list of twelve, ordered by payoff per unit of work — six landed, one half
+landed, one decided against, four ahead — lives in **`docs/10-roadmap.md`** with what each
+touches, what proves it, and which cannot be finished without a real cluster.
+Struck items stay on it: shipped ones because a roadmap that never visibly
+moves is a wish list, and decided-against ones because the reasoning is the
+useful part. `docs/06-enterprise-architecture.md` has the complementary list —
+what is deliberately *not* here and why.
 
 ## What you actually operate
 
@@ -909,12 +585,12 @@ flowchart TB
     class G,A,R,B yours
 ```
 
-That division is why this repository is under ten thousand lines of Python and
-not a distributed system. When you are deciding whether to add something, the
-first question is whether OpenShift already does it — because in this problem
-domain it usually does, and the version you would write is the version nobody
-maintains. `docs/09-engineering-handoff.md` is the long form, for whoever picks
-this up next.
+That division is why this repository is about 9,000 lines of Python and shell
+and not a distributed system. When you are deciding whether to add something,
+the first question is whether OpenShift already does it — because in this
+problem domain it usually does, and the version you would write is the version
+nobody maintains. `docs/09-engineering-handoff.md` is the long form, for
+whoever picks this up next.
 
 ## What is in here
 
@@ -936,177 +612,84 @@ scripts/
   10-push-models.sh       rsync local models into the cluster
   99-teardown.sh          park | cluster | all
   lint.sh                 everything CI checks, runnable locally
-  unit-tests.sh           the parsing edge cases, pinned
+  unit-tests.sh           the parsing edge cases and the lint fixtures, pinned
   ci-smoke-comfyui.sh     real ComfyUI on CPU proving the model-path contract
 manifests/base/           single-user Deployment and Service, kustomize
 app/
   Containerfile           OpenShift-compatible ComfyUI image
   src/                    >>> your code goes here <<<
 enterprise/               the multi-user configuration
-  setup.sh                one script: Redis, images, KEDA, SSO, route
+  setup.sh                one script: Redis, images, KEDA, SSO, route, policy
   teardown.sh
   gateway/                FastAPI hub — queue jobs, stream progress, serve images
   worker/                 ComfyUI + Redis agent, bound to loopback
-  manifests/
-  test/                   the e2e suite — real Redis, stub ComfyUI, no cluster
+  manifests/              Redis, gateway, worker, KEDA, oauth-proxy, NetworkPolicy
+  test/                   the e2e suite and the pytest layer — real Redis, stub ComfyUI, no cluster
 docs/
   01-aws-account.md       the browser-only steps
   02-cost.md              the numbers, and how to keep them down
   03-storage.md           gp3 vs EFS vs S3, and why models are the hard part
   04-exposing.md          how to let other people reach it, safely
-  05-troubleshooting.md   the failures you will actually hit
-  06-enterprise-architecture.md   hub and spoke, Streams, scale-to-zero economics
+  05-troubleshooting.md   the failures you will actually hit, and what the system does about each
+  06-enterprise-architecture.md   hub and spoke, Streams, what the worker can reach
   07-design-review.md     what changed from the original design doc, and why
   08-stuck-volumes.md     when a dead pod will not release the volume
   09-engineering-handoff.md  taking ownership: invariants, runbook, open items
-  10-roadmap.md           the ideas below, as a work plan with lanes and gates
-.github/workflows/ci.yaml lint + the e2e suite, on every PR
+  10-roadmap.md           the ideas, as a work plan with lanes and gates
+  11-scaling.md           how far this goes, and which AWS cards it runs on
+.github/workflows/
+  ci.yaml                 four jobs on every PR: lint (+ kubeconform), the e2e suite,
+                          real ComfyUI on CPU, the gateway image as an arbitrary UID
+  nightly.yaml            both GPU images built, booted as an arbitrary UID, scanned
 ```
-
-Scripts are idempotent. Re-running any of them is safe and skips what is
-already done.
 
 ## Proof, not promises
 
-Four CI jobs run on every pull request, and the local `make` targets are the
-same ones CI invokes, so local and CI checks cannot drift.
+Four CI jobs run on every pull request — `lint` (shellcheck, YAML, Python, the
+manifest shape rules, and every manifest validated against the Kubernetes,
+OpenShift and KEDA schemas), `e2e`, `comfyui-smoke` (the pinned ComfyUI booted
+on CPU with the images' own path flags, asserting checkpoints are visible and
+custom nodes load) and `image-uid` (the gateway image run as UID 1000670000
+with GID 0, exactly as `restricted-v2` will run it). The local `make` targets
+are the same ones CI invokes, so local and CI cannot drift. `nightly.yaml`
+does for the two GPU images what a PR job cannot afford to.
 
-- **End-to-end with real components.** The real gateway and real worker agent
-  against a real Redis and a stub ComfyUI. It asserts that a late subscriber
-  loses nothing, a reconnect replays identically, SIGTERM drains rather than
-  drops, and a SIGKILLed worker's job fails loudly with the dead worker named.
-- **Real ComfyUI, on CPU.** The pinned tag boots with the images' own path
-  flags and asserts that checkpoints are visible and custom nodes load.
-- **The arbitrary-UID trap, without a cluster.** The gateway image is run as
-  UID 1000670000 with GID 0, exactly as `restricted-v2` will run it.
-- **Lint.** shellcheck, YAML, Python, and pinned parsing edge cases.
+`make test` runs 40 shell unit assertions, 210 pytest cases against the pure
+functions in both Python files, and 378 end-to-end assertions across 21 check
+files — the real gateway and the real worker agent against a real Redis and a
+stub ComfyUI, in about a minute. The count is the least interesting thing
+about it. **An assertion nobody has watched fail is a decoration, and this
+suite has caught ten of its own being exactly that**, plus two behaviours no
+assertion reached at all: three "the queue is empty afterwards" assertions
+proven unable to fail by mutation testing and replaced by counting the command
+Redis actually executed; a guard for a server-side socket close deleted
+outright with the whole suite staying green; a watcher armed after the submit
+it was watching, in two files; "at least three progress events" passing on an
+agent that filters progress and not terminals; four estimated-wait assertions
+run against a one-entry queue where the head and the tail are the same entry;
+and a requeue that jumped the queue invisibly to every other check. Each
+replacement is named, with what it replaced, in `enterprise/test/README.md`
+under "The assertions that could not fail", along with the ten hostile strings
+driven through the output path on every run and the one performance claim
+that was measured rather than reasoned.
 
-The file-level half of those guarantees is now **mechanically enforced rather
-than reviewed**: `scripts/lint.sh` fails the build on a worker that lost its GPU
-toleration, a Route that lost `timeout-tunnel`, a Service that regained the
-gateway's own port, a Containerfile that lost its `chgrp 0` block, or a GPU pod
-whose memory limit no longer fits the node. The end-to-end suite runs no cluster
-and reads no manifest, so it can see none of them.
+The file-level half of the guarantees is enforced rather than reviewed:
+`scripts/lint.sh` fails the build on a worker that lost its GPU toleration, a
+Route that lost `timeout-tunnel`, a Service that regained the gateway's own
+port, a Deployment no NetworkPolicy selects, a Redis ACL user widened past its
+allowlist, a warm floor above `maxReplicaCount`, a Containerfile that lost its
+`chgrp 0` block, or a GPU pod whose memory limit no longer fits the node. The
+end-to-end suite runs no cluster and reads no manifest, so it can see none of
+them.
 
-`docs/07-design-review.md` is the most useful artifact here: a written account
-of every claim the original design's manifests did not implement and every line
-of its Python that would not have run. It is the list of things you would
-otherwise have discovered at 2am.
-
-### The output path has been attacked, and the attack is in the suite
-
-Every path that ends on the shared volume begins as something a caller chose.
-The submitter's name arrives in a request header, a save node's
-`filename_prefix` arrives inside the workflow, and the output filename comes
-back from ComfyUI. All three are handled as hostile, and ten hostile strings
-are driven through the running system on every `make test`: four usernames (an
-eight-deep traversal, an absolute path, an empty value, 2000 characters), a
-`filename_prefix` carrying `..`, two reported output filenames
-(`../../OUTSIDE/secret.txt`, and a bare `sub/evil.png` that never spells `..`
-at all), a `/outputs/../../etc/passwd` request, and two hostile submitter
-identities pushed through the showback accounting. None of them escapes
-`OUTPUT_ROOT`. The legitimate cases are asserted in the same files —
-`alice.smith@example.com` and a filename with parentheses must still
-round-trip to a real, servable URL — because sanitizing hard enough to break
-the usernames an IdP actually issues is its own failure.
-
-There are two layers, and the second one has already caught what the first one
-missed. Sanitization makes a separator unrepresentable in a workspace name;
-the join is then resolved and re-verified against `OUTPUT_ROOT`, and the
-gateway independently refuses to serve any `/outputs/...` path that resolves
-outside it. `check-65-output-filename-confinement.py` exists because subfolder
-confinement alone was not enough: `output_subfolder()` confined the subfolder
-correctly and `collect_outputs()` then concatenated the raw reported filename
-onto it, so the escape lived in how the URL's two halves were joined rather
-than in what either half returned. That check reproduces the escape against the
-live agent's own output first, and only then asserts the fix — a hostile
-filename produces no image entry at all, rather than one served from a
-rewritten name.
-
-One part of this is reasoned rather than tested, and it is worth saying so:
-resolve-then-verify is what would catch a symlink already planted in the output
-volume, which no string rule can see, and nothing in the suite plants one. The
-order of operations is the argument there (`worker_agent.py`,
-`workspace_path()`), not a green check.
-
-### The assertions that could not fail, and what replaced them
-
-`make test` runs 289 assertions — 29 shell unit assertions and 260 in the
-end-to-end suite across 17 check files. The count is the least interesting
-thing about it. An assertion nobody has watched fail is a decoration, and this
-suite has caught six of its own being exactly that:
-
-- Three assertions of the form "`comfy:queue` is empty afterwards" were
-  **proven unable to fail** by mutation testing. One agent polls one queue
-  here, so an entry a wrong implementation put back has already been popped
-  again by the time a check looks — `LLEN` reads 0 either way. They were
-  replaced by counting the command Redis actually executed
-  (`enterprise/test/queue_watch.py`).
-- The worker's guard for a server-side socket close was **deleted outright and
-  the whole suite stayed green**: no check reached it, because the one
-  dead-ComfyUI fixture closed in a way that made the client raise instead.
-  That is what `check-75-closed-socket.py` was written for.
-- A re-gate against a live mutation that really did requeue a rejected job
-  found the assertion still passing, because the watcher was armed after the
-  submit rather than before it (`check-20-failure-paths.py`, and the same
-  construction in `check-70-oom-paths.py`).
-- **"At least three progress events"** passed on an agent that filters progress
-  and not terminals: the stub's foreign terminal event arrives *after* all
-  three, so the job ends on somebody else's completion with three progress
-  events already delivered. `check-10-stream.py` now counts foreign events over
-  the job's whole stream and requires the one terminal event to carry this
-  job's own `prompt_id`.
-- **Every estimated-wait assertion ran against a one-entry queue**, where index
-  `-1` and index `0` are the same entry — so nothing could tell which end of
-  the queue the gauge reads, and a gauge reading the head reports ~0 on an
-  hour-old backlog. `check-80-estimated-wait.py` now submits a second job
-  behind the manufactured stale one.
-- **A requeue that jumps the queue is invisible to every other check**: the job
-  is still requeued once, still completes, and `comfy:queue` still receives
-  exactly one write. Only its position changes.
-  `check-55-retry-placement.py` builds a two-lane backlog with a real middle
-  and asserts the whole service order afterwards.
-
-The harness itself had the same shape of hole, and it is worth naming beside
-them: `run.sh` folded only a check's exit status, so a check that kept printing
-its `FAIL` lines while its `sys.exit(1)` went missing left the suite — and CI,
-which reads the same status — green over its own output. It now reads each
-check's output for the shared `check()` helper's own line format as well.
-
-So the useful thing to do with this suite is to distrust the authors and check.
-Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM handler, or
-the workspace confinement, and run `make test`: something goes red, and which
-assertion goes red tells you what that code was actually holding. It is a
-faster way to find out what the suite is worth than reading it.
-`docs/10-roadmap.md` states the standing rule in the other direction — an
-existing assertion may be replaced only by one that is strictly stronger, in
-the same commit, with both shown in review.
-
-### The fair-enqueue cost was measured, not assumed
-
-Fair queueing means placing a new job relative to the jobs already queued,
-which means reading them, inside one Lua `EVAL`. Redis executes one command at
-a time, so that read is time no other client gets — including every worker
-parked in `BLMOVE`, which is to say the pool stops being handed work for the
-duration. One submitter's insert is therefore a cluster-wide cost, and it was
-measured rather than reasoned about.
-
-| One `/api/generate`, 499-deep queue | ~26 KB workflow | ~103 KB workflow |
-|---|---:|---:|
-| Whole envelope in the list | 117.7 ms | 1235 ms |
-| Ordering record in the list, workflow at `comfy:job:<id>:payload` | 1.6 ms | 2.2 ms |
-
-The second column is the more useful one: what the insert reads per entry is
-now fixed, so the cost has stopped tracking a size the *client* chooses.
-`enterprise/test/bench-fair-enqueue.py` is committed, imports the real `hub.py`
-rather than reimplementing the call shape, and uses its own key namespace, so
-the numbers are re-measurable against any Redis — the recorded ones are an
-M-series laptop with redis-server 8. `make test` does not run it: it is a
-measurement rather than an assertion, and `run.sh` discovers only `check*.py`.
-The e2e suite structurally cannot see this at all, since it runs a queue three
-jobs deep with a two-node workflow where every version of the insert is
-instant; `make lint` pins the shape the number depends on, and
-`docs/09-engineering-handoff.md` section 3 has the row.
+So the useful thing to do with this suite is to distrust the authors and
+check. Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM
+handler, or the workspace confinement, and run `make test`: something goes
+red, and which assertion goes red tells you what that code was actually
+holding. `docs/07-design-review.md` is the written account of every claim the
+original design's manifests did not implement and every line of its Python
+that would not have run — the list of things you would otherwise have
+discovered at 2am.
 
 ## Configuration
 
@@ -1119,9 +702,12 @@ Everything lives in `.env`. The ones you are most likely to change:
 | `GPU_INSTANCE_TYPE` | `g6.xlarge` | L4 24 GB, ~$0.80/hr — fits SDXL comfortably |
 | `STORAGE_MODE` | `rwo` | `rwx` for EFS shared across pods — see docs/03-storage.md |
 | `COMFYUI_IMAGE` | empty | empty means build in-cluster from `app/Containerfile` |
-| `COMFYUI_REF` | `v0.32.0` | ComfyUI tag both images build — pinning is deliberate |
-| `SCALE_TO_ZERO` | `true` | `false` pins one warm worker — see "Where this loses" |
-| `ENABLE_MANAGER` | `false` | **Turn this on for the single-user path.** It is what keeps the familiar loop intact: load a workflow, Manager lists every model you are missing, one click puts them on the persistent volume. Leave it off for the shared pool — there it hands every UI user code execution on a node with cloud credentials, and nothing it writes survives the node being reclaimed. `app/Containerfile` has the full reasoning. |
+| `COMFYUI_REF` | the `v0.32.0` commit | ComfyUI revision both images build — a commit, because a tag can move |
+| `SCALE_TO_ZERO` | `true` | `false` pins exactly one worker and skips KEDA — see "Where this loses" |
+| `WARM_WORKERS` | `0` (off) | hold this many workers inside `WARM_START`–`WARM_END` in `WARM_TIMEZONE`; needs `SCALE_TO_ZERO=true` — see "Sizing the pool" |
+| `MAX_GPU_WORKERS` | `3` | ceiling for both autoscalers; raise it, and `GPU_VCPU_REQUEST`, for a floor above it |
+| `ENABLE_MANAGER` | `false` | **Turn this on for the single-user path.** It is what keeps the familiar loop intact: load a workflow, Manager lists every model you are missing, one click puts them on the persistent volume. Leave it off for the shared pool — there it hands every UI user code execution on a node with cloud credentials, and the workers have no route to the internet for it anyway. `app/Containerfile` has the full reasoning. |
+| `QUOTA_GPU_SECONDS` | `0` (off) | per-user GPU-second ceiling per UTC month; fails open |
 | `BUDGET_ALERT_EMAIL` | empty | **set this** |
 
 ## Three things that will bite you

@@ -1,0 +1,48 @@
+---
+# Fixture: a new workload added to the multi-user namespace that no
+# NetworkPolicy in enterprise/manifests selects.
+#
+# This is the regression the default-deny in 06-network-policy.yaml creates and
+# the only one it creates: the namespace denies ingress and egress to every pod
+# that is not named by a rule, so a Deployment added without one starts, passes
+# its probes, reports Ready, and cannot reach Redis, DNS or anything else. There
+# is nothing in its logs, its events or `oc describe` that names a network
+# policy — every connection simply times out — which is why this is a lint rule
+# rather than something the next person is expected to remember.
+#
+# Deliberately nothing like the worker: no GPU request, no toleration, no Redis
+# credentials, so none of the other manifest rules have an opinion about it. It
+# does set automountServiceAccountToken: false, because that rule does apply to
+# every Deployment here and the missing policy must be this file's only
+# violation.
+#
+# Valid YAML, so yaml.safe_load_all accepts it happily.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-thumbnailer
+  labels:
+    app: comfy-thumbnailer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: comfy-thumbnailer
+  template:
+    metadata:
+      labels:
+        # No policy in enterprise/manifests names this label, so the only rule
+        # that covers this pod is the catch-all deny.
+        app: comfy-thumbnailer
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: thumbnailer
+          image: comfy-thumbnailer:latest
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

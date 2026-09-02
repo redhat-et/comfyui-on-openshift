@@ -26,9 +26,27 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 : "${MAX_GPU_WORKERS:=3}"
 : "${SCALE_TO_ZERO:=true}"
 : "${ENABLE_MANAGER:=false}"
-: "${COMFYUI_REF:=v0.32.0}"
+# The commit v0.32.0 points at today, not the tag: a tag is a mutable pointer
+# and upstream can move it, which is the same silent-change failure the
+# Containerfiles' torch pin exists to prevent. COMFYUI_REF in .env still
+# overrides this with any ref you like — the build fetches an explicit object,
+# so a SHA, a tag and a branch all work.
+: "${COMFYUI_REF:=c2bcbecd82ec5ae66594340b395c24ef0217b238}"
 : "${GPU_NODE_LABEL:=nvidia.com/gpu.present=true}"
 : "${QUOTA_GPU_SECONDS:=0}"
+# Who may read every submitter's showback row under AUTH_MODE=oauth (comma-
+# separated identities as oauth-proxy reports them). Empty by default: each
+# caller sees their own row and the totals, and nothing that names a colleague.
+: "${SHOWBACK_OPERATORS:=}"
+
+# The scheduled warm floor (docs/10-roadmap.md, I1). 0 is off, and off is the
+# default: this is the one setting in the file that spends money while nobody
+# is looking. See the WARM FLOOR block in 03-autoscale.yaml for what it does
+# and why it is a KEDA trigger rather than a cron job editing the machine pool.
+: "${WARM_WORKERS:=0}"
+: "${WARM_START:=0 9 * * 1-5}"
+: "${WARM_END:=0 18 * * 1-5}"
+: "${WARM_TIMEZONE:=UTC}"
 
 # Off unless the operator chose a number, and off rather than fatal if they
 # chose something that is not one: this is a cost breaker, and a breaker that
@@ -42,6 +60,38 @@ fi
 
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-openshift-keda}"
 
+# Same posture as QUOTA_GPU_SECONDS above: a whole number, or the default with
+# a warning. Everything below does arithmetic on these two, and a non-numeric
+# value there is a shell error in the middle of a deploy rather than a
+# configuration mistake anybody can read off the output.
+if ! printf '%s' "$MAX_GPU_WORKERS" | grep -qE '^[0-9]+$'; then
+    warn "MAX_GPU_WORKERS=${MAX_GPU_WORKERS} is not a whole number — using 3"
+    MAX_GPU_WORKERS=3
+fi
+
+if ! printf '%s' "$WARM_WORKERS" | grep -qE '^[0-9]+$'; then
+    warn "WARM_WORKERS=${WARM_WORKERS} is not a whole number — the warm floor will be OFF"
+    WARM_WORKERS=0
+fi
+
+# The ceiling both autoscalers get. A warm floor above MAX_GPU_WORKERS is a
+# floor the pool can never reach — KEDA would clamp it to maxReplicaCount and
+# the machine pool would refuse to provide the nodes — so the ceiling is
+# raised to meet it rather than the floor silently lowered. Said out loud,
+# because it changes what the deployment can cost.
+EFFECTIVE_MAX_WORKERS="$MAX_GPU_WORKERS"
+
+if (( WARM_WORKERS > MAX_GPU_WORKERS )); then
+    warn "WARM_WORKERS=${WARM_WORKERS} is above MAX_GPU_WORKERS=${MAX_GPU_WORKERS};"
+    warn "raising the ceiling to ${WARM_WORKERS} so the floor is reachable."
+    EFFECTIVE_MAX_WORKERS="$WARM_WORKERS"
+fi
+
+if (( WARM_WORKERS > 0 )) && [[ "$SCALE_TO_ZERO" != "true" ]]; then
+    warn "WARM_WORKERS=${WARM_WORKERS} has no effect with SCALE_TO_ZERO=false —"
+    warn "that path skips KEDA entirely and pins the pool at one worker."
+fi
+
 require_cluster
 require_tools oc
 
@@ -49,8 +99,14 @@ log "Target"
 info "cluster    $(oc whoami --show-server)"
 info "namespace  $APP_NAMESPACE"
 info "auth       $AUTH_MODE"
-info "workers    0..${MAX_GPU_WORKERS} ($GPU_INSTANCE_TYPE)"
+info "workers    0..${EFFECTIVE_MAX_WORKERS} ($GPU_INSTANCE_TYPE)"
 info "scale-to-0 $SCALE_TO_ZERO"
+
+if (( WARM_WORKERS > 0 )); then
+    info "warm floor ${WARM_WORKERS} worker(s), ${WARM_START} to ${WARM_END} (${WARM_TIMEZONE})"
+else
+    info "warm floor off (WARM_WORKERS=0)"
+fi
 
 # Any spelling of zero, not the literal "0": hub.py treats <= 0 as off, and a
 # banner that says "0.0 GPU-seconds per user" while the gateway is enforcing
@@ -109,11 +165,36 @@ ok "volumes present"
 
 log "Secrets"
 
+# Alphanumeric only: this value is substituted into a redis-server `--user`
+# ACL rule and into a redis:// URL's credentials, and neither place wants to
+# meet a '+', a '/' or an '='.
+redis_password()
+{
+    head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32
+}
+
+# TWO passwords, because there are two Redis users (00-redis.yaml). `password`
+# is the admin credential — the gateway's, KEDA's, and the readiness probe's.
+# `worker_password` belongs to the least-privilege `comfy-worker` ACL user and
+# is the only Redis credential a GPU pod, and therefore any custom node
+# running in one, ever sees.
 if oc get secret comfy-redis -n "$APP_NAMESPACE" >/dev/null 2>&1; then
-    ok "comfy-redis exists (delete it to rotate the password)"
+    if oc get secret comfy-redis -n "$APP_NAMESPACE" \
+        -o jsonpath='{.data.worker_password}' 2>/dev/null | grep -q .; then
+        ok "comfy-redis exists (delete it to rotate both passwords)"
+    else
+        # A namespace deployed before the worker had its own user. Add the
+        # second password rather than recreating the Secret: rotating the admin
+        # password here would leave the running gateway pods authenticating
+        # with the old one until they happen to restart.
+        oc patch secret comfy-redis -n "$APP_NAMESPACE" --type merge \
+            -p "{\"stringData\":{\"worker_password\":\"$(redis_password)\"}}" >/dev/null
+        ok "comfy-redis gained worker_password (the worker's own ACL user)"
+    fi
 else
     oc create secret generic comfy-redis -n "$APP_NAMESPACE" \
-        --from-literal=password="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32)"
+        --from-literal=password="$(redis_password)" \
+        --from-literal=worker_password="$(redis_password)"
     ok "comfy-redis created"
 fi
 
@@ -310,9 +391,21 @@ EOF
 
 # Keep one copy of custom nodes. The single-user path reads app/src/custom_nodes;
 # copy it into the worker build context so both images carry the same nodes.
+mkdir -p "${ENTERPRISE_DIR}/worker/custom_nodes"
+
 if [[ -d "${REPO_ROOT}/app/src/custom_nodes" ]]; then
-    mkdir -p "${ENTERPRISE_DIR}/worker/custom_nodes"
     cp -r "${REPO_ROOT}/app/src/custom_nodes/." "${ENTERPRISE_DIR}/worker/custom_nodes/" 2>/dev/null || true
+fi
+
+# And one copy of their pip dependencies, for the same reason and by the same
+# route. app/Containerfile has always installed app/requirements-extra.txt; the
+# worker image never did, so a node pack that needs one pip package worked
+# single-user and failed at import in the pool — reported by ComfyUI as a
+# logged traceback and a missing node type, on a GPU node already provisioned
+# and paid for.
+if [[ -f "${REPO_ROOT}/app/requirements-extra.txt" ]]; then
+    cp "${REPO_ROOT}/app/requirements-extra.txt" \
+        "${ENTERPRISE_DIR}/worker/custom_nodes/requirements-extra.txt"
 fi
 
 GATEWAY_IMAGE="$(build_image comfy-gateway "${ENTERPRISE_DIR}/gateway")"
@@ -345,11 +438,25 @@ apply_gateway()
 {
     sed -e "s#image: comfy-gateway:latest#image: ${GATEWAY_IMAGE}#" \
         -e "s#QUOTA_GPU_SECONDS_PLACEHOLDER#${QUOTA_GPU_SECONDS}#" \
+        -e "s#AUTH_MODE_PLACEHOLDER#${AUTH_MODE}#" \
+        -e "s#SHOWBACK_OPERATORS_PLACEHOLDER#${SHOWBACK_OPERATORS}#" \
         "${MANIFESTS}/01-gateway.yaml" \
         | oc apply -n "$APP_NAMESPACE" -f -
 }
 
 oc apply -n "$APP_NAMESPACE" -f "${MANIFESTS}/00-redis.yaml"
+
+# Before the workloads, not after. The namespace default-denies once this
+# lands, so applying it first means a pod that comes up is a pod the policy
+# already covers, rather than one that works for a minute and then stops.
+#
+# It also carries the egress hole the BuildConfig pods above need. On a FIRST
+# run those builds have already finished by the time this file exists, and on
+# every run after it they are covered — which is the order that matters,
+# because the failure is a build hanging on `git fetch` with nothing in its log
+# about network policy.
+oc apply -n "$APP_NAMESPACE" -f "${MANIFESTS}/06-network-policy.yaml"
+
 apply_gateway
 
 # The worker's nodeSelector has to name a label the machine pool declares, or
@@ -362,14 +469,47 @@ sed -e "s#image: comfy-worker:latest#image: ${WORKER_IMAGE}#" \
 
 ok "workers select ${GPU_NODE_LABEL}"
 
+# Every value is substituted by KEY, not by matching the key plus its default:
+# matching a literal "maxReplicaCount: 3" silently stops substituting the day
+# someone edits the manifest's default, and MAX_GPU_WORKERS quietly stops
+# working. | as the delimiter for the two cron expressions, because a cron
+# expression may legally contain a /.
+#
+# WARM_WORKERS=0 deletes the whole trigger rather than sending desiredReplicas
+# 0: KEDA's cron scaler wants a positive number, and "no floor" is better said
+# by having no trigger. That deletion is also what makes a re-run idempotent in
+# both directions — turn the floor off in .env, re-run, and it is gone, which
+# is the property the cron-job implementation of I1 could not offer.
+render_scaled_object()
+{
+    if (( WARM_WORKERS > 0 )); then
+        # The trigger ships commented out behind `#WARM ` (see the manifest);
+        # the first expression strips that prefix, and the rest substitute
+        # into the lines it just uncovered — sed applies its expressions in
+        # order to each line, so the order here is load-bearing.
+        sed -E \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s/^([[:space:]]*)#WARM /\1/" \
+            -e "s/^([[:space:]]*maxReplicaCount:).*/\1 ${EFFECTIVE_MAX_WORKERS}/" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s/^([[:space:]]*desiredReplicas:).*/\1 \"${WARM_WORKERS}\"/" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s|^([[:space:]]*start:).*|\1 \"${WARM_START}\"|" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s|^([[:space:]]*end:).*|\1 \"${WARM_END}\"|" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s|^([[:space:]]*timezone:).*|\1 ${WARM_TIMEZONE}|" \
+            "${MANIFESTS}/03-autoscale.yaml"
+    else
+        sed -E \
+            -e "s/^([[:space:]]*maxReplicaCount:).*/\1 ${EFFECTIVE_MAX_WORKERS}/" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/d" \
+            "${MANIFESTS}/03-autoscale.yaml"
+    fi | sed -e "s/NAMESPACE_PLACEHOLDER/${APP_NAMESPACE}/"
+}
+
 if [[ "$SCALE_TO_ZERO" == "true" ]]; then
-    # Match the key, not the key plus its default value: matching a literal
-    # "maxReplicaCount: 3" silently stops substituting the day someone edits
-    # the manifest's default, and MAX_GPU_WORKERS quietly stops working.
-    sed -E -e "s/^([[:space:]]*maxReplicaCount:).*/\1 ${MAX_GPU_WORKERS}/" \
-        -e "s/NAMESPACE_PLACEHOLDER/${APP_NAMESPACE}/" \
-        "${MANIFESTS}/03-autoscale.yaml" | oc apply -n "$APP_NAMESPACE" -f -
-    ok "ScaledObject: 0..${MAX_GPU_WORKERS} workers on queue depth"
+    render_scaled_object | oc apply -n "$APP_NAMESPACE" -f -
+    ok "ScaledObject: 0..${EFFECTIVE_MAX_WORKERS} workers on queue depth"
+
+    if (( WARM_WORKERS > 0 )); then
+        ok "warm floor: ${WARM_WORKERS} worker(s) held from ${WARM_START} to ${WARM_END} ${WARM_TIMEZONE}"
+    fi
 else
     oc scale deployment/comfy-worker --replicas 1 -n "$APP_NAMESPACE"
     ok "workers pinned at 1"
@@ -519,8 +659,8 @@ configure_machinepool_autoscaling()
     # the cluster's only untainted pool — ROSA requires one untainted pool with
     # at least 2 replicas (single-AZ), which the base pool provides.
     if rosa edit machinepool --cluster "$CLUSTER_NAME" gpu \
-        --enable-autoscaling --min-replicas 0 --max-replicas "$MAX_GPU_WORKERS" --yes 2>/dev/null; then
-        ok "GPU pool autoscales 0..${MAX_GPU_WORKERS} — the node goes away when idle"
+        --enable-autoscaling --min-replicas 0 --max-replicas "$EFFECTIVE_MAX_WORKERS" --yes 2>/dev/null; then
+        ok "GPU pool autoscales 0..${EFFECTIVE_MAX_WORKERS} — the node goes away when idle"
         return 0
     fi
 
@@ -530,7 +670,7 @@ configure_machinepool_autoscaling()
     info "or 'make down' on a schedule instead — see docs/02-cost.md."
 
     rosa edit machinepool --cluster "$CLUSTER_NAME" gpu \
-        --enable-autoscaling --min-replicas 1 --max-replicas "$MAX_GPU_WORKERS" --yes \
+        --enable-autoscaling --min-replicas 1 --max-replicas "$EFFECTIVE_MAX_WORKERS" --yes \
         || warn "could not enable autoscaling on the GPU pool at all; it stays at a fixed size."
 }
 
@@ -563,7 +703,7 @@ cat <<EOF
 
   Workers:  0 right now — they start when you queue something.
             The first job after an idle period waits for a GPU node to be
-            provisioned and a ~10 GB image to be pulled. Budget 10-15 minutes
+            provisioned and a ~10 GB image to be pulled. Budget 8-17 minutes
             for it; subsequent jobs start in seconds.
 
   Watch it happen:

@@ -57,34 +57,39 @@ one; the two ends of the list are then minutes apart in age, and the gauge is
 required to match the one at the served-next end. Both ages are read back off
 the queue itself rather than restated from the constant this file chose.
 """
-import json, os, re, signal, sys, time, urllib.error, urllib.request, uuid
-import redis
+import json, os, re, signal, sys, time, urllib.request, uuid
 
-GW = "http://127.0.0.1:8100"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
+from harness import GW, QUEUE_KEY, check, connect_redis, failures, poll_status as _poll_status
+
+get, post = GW.get, GW.post
+
 GAUGE_NAME = "comfy_estimated_wait_seconds"
-failures = []
 
 
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body, headers=None):
-    hdrs = {"Content-Type": "application/json"}
-    hdrs.update(headers or {})
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(), headers=hdrs)
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
+# /metrics and /api/stats serve one shared snapshot per STATS_CACHE_SECONDS
+# (hub.py's cached_stats(): the endpoints are polled unauthenticated, and each
+# call used to be a keyspace SCAN). So a read taken right after the queue
+# changed can legitimately be up to that old, and every read here first waits
+# the window out -- the assertions below are about the gauge's VALUE, and a
+# stale snapshot is not a wrong value.
+STATS_CACHE_SECONDS = float(os.environ.get("STATS_CACHE_SECONDS", "5"))
+HEARTBEAT_TTL = int(os.environ.get("HEARTBEAT_TTL", "60"))
 
 
 def read_metrics():
-    return urllib.request.urlopen(GW + "/metrics", timeout=10).read().decode()
+    # Waiting the window out lengthens the freeze below past HEARTBEAT_TTL,
+    # and a lapsed heartbeat IS a death to the reaper, which would then
+    # requeue the frozen agent's own job and move the queue under these
+    # assertions. So the frozen agent's heartbeat is re-armed while waiting
+    # -- check-55-retry-placement.py's technique; only the expiry is touched.
+    deadline = time.time() + STATS_CACHE_SECONDS + 0.5
+
+    while time.time() < deadline:
+        for key in r.scan_iter(match="comfy:worker:*"):
+            r.expire(key, HEARTBEAT_TTL)
+        time.sleep(0.2)
+
+    return urllib.request.urlopen(GW.base_url + "/metrics", timeout=10).read().decode()
 
 
 def gauge_value(text, name):
@@ -114,25 +119,11 @@ def exposed_as_gauge(text, name):
     )
 
 
-def poll_status(job_id, terminal=("completed", "failed", "cancelled"), timeout=30):
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        try:
-            last = get(f"/api/jobs/{job_id}").get("status")
-            if last in terminal:
-                return last
-        except urllib.error.HTTPError:
-            pass
-        time.sleep(0.5)
-    return last
+def poll_status(job_id):
+    return _poll_status(GW, job_id, timeout=30, interval=0.5)
 
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
+r = connect_redis()
 
 agent_pid = int(sys.argv[1])
 WORKFLOW = {"3": {"class_type": "KSampler", "inputs": {}}}
@@ -268,6 +259,12 @@ try:
         except json.JSONDecodeError:
             entries.append({})
 
+    # The gauge is read BEFORE the ages are computed: read_metrics() waits
+    # the cache window out, and the ages must be taken from the same moment
+    # as the snapshot they are compared with. The list cannot change in
+    # between -- the agent is frozen.
+    text_3 = read_metrics()
+
     now = time.time()
     head, tail = (entries[0], entries[-1]) if entries else ({}, {})
     head_age = now - (head.get("submitted_at") or now)
@@ -290,7 +287,7 @@ try:
           tail_age - head_age >= STALE_AGE * 0.5,
           {"head_age": round(head_age, 1), "tail_age": round(tail_age, 1)})
 
-    value_3 = gauge_or_zero(read_metrics(), GAUGE_NAME)
+    value_3 = gauge_or_zero(text_3, GAUGE_NAME)
 
     # Both ages are read off the list itself rather than restated from
     # STALE_AGE, so this compares the gauge against the queue's own contents.

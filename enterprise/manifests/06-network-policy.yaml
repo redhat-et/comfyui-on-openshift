@@ -1,0 +1,259 @@
+---
+# The namespace's network policy, in one file because it only makes sense read
+# as one thing: a default deny, then the four flows that are allowed to exist.
+#
+# ROSA runs OVN-Kubernetes and enforces NetworkPolicy, so everything here is
+# load-bearing rather than documentation. On a cluster with no policy plugin it
+# is documentation, and the pods are as open as they were before.
+#
+# WHAT THIS IS FOR. The worker pod runs whatever custom-node Python was baked
+# into the image, on a GPU node, inside your VPC. Before this file, that code
+# could open a connection to anything: the instance metadata service, another
+# namespace's Service, S3, or an address of its own choosing on the internet.
+# The Redis ACL user landed beside this stops it doing anything interesting to
+# the queue; this stops it having anywhere to go.
+#
+# IF SOMETHING IS UNREACHABLE AFTER APPLYING THIS, read `gateway-ingress`
+# below first — the assumption about where the router's traffic comes FROM is
+# the one that varies between clusters, and it is the one that takes the app
+# off the internet when it is wrong.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  # Empty selector: every pod in the namespace, including ones nobody has
+  # written yet. That is the point — a workload added later is denied until
+  # somebody says what it may talk to, rather than inheriting the namespace's
+  # openness by default. scripts/lint.sh fails a Deployment here that no
+  # policy with a real selector covers, so "denied by default" cannot quietly
+  # become "broken with no error".
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# DNS, for everything. Split out rather than repeated in each policy below
+# because every pod needs it and a missing DNS rule presents as a name that
+# does not resolve — which reads like a broken Service, not a network policy.
+#
+# Both ports on both protocols: OpenShift's dns-default pods listen on 5353 and
+# the Service publishes 53, and which number a policy sees depends on where the
+# translation happened. Allowing both costs nothing and removes a whole class
+# of "it works on my cluster".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353
+---
+# The GPU workers: Redis and DNS. Nothing else. No internet.
+#
+# THIS IS THE POINT OF THE FILE. A worker pod executes arbitrary custom-node
+# Python — that is what a custom node is — on a node with an instance role, in
+# your VPC, with the shared model volume mounted. Its only legitimate
+# conversation is with Redis, because the whole hub-and-spoke design exists so
+# that the agent beside ComfyUI is the only way in or out of that pod.
+#
+# The consequence to say out loud: with this applied, ENABLE_MANAGER=true
+# cannot fetch anything at runtime. ComfyUI-Manager's node list, its installs
+# and its model downloads all need the internet and will simply hang. That is
+# already the documented stance — docs/06-enterprise-architecture.md says
+# Manager is off in this configuration because it hands every UI user code
+# execution on a GPU node, and because nothing it installs survives the pool
+# scaling to zero anyway. This makes the stance true instead of advisory. If
+# you genuinely need runtime downloads, the answer in that document is a job
+# that validates the source and the format, not an egress hole here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-egress-redis-only
+spec:
+  podSelector:
+    matchLabels:
+      app: comfy-worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# The gateway's inbound side.
+#
+# THE ASSUMPTION THAT VARIES BY CLUSTER is the first rule: that the router's
+# traffic arrives from a pod in openshift-ingress. On ROSA — and on any cluster
+# whose IngressController publishes through a LoadBalancerService — the router
+# runs as an ordinary pod there and this matches. Where the router is put on
+# the HOST network instead (some bare-metal and single-node installs), the
+# traffic arrives from a NODE address, no namespaceSelector matches it, and the
+# Route stops answering with no error anywhere except a browser timeout.
+#
+# If that is your cluster, replace this first `from` entry with an ipBlock for
+# your node network, or drop the policy:
+#
+#   oc delete networkpolicy gateway-ingress -n <namespace>
+#
+# The other three are the readers of /metrics: OpenShift's platform and
+# user-workload Prometheus, and KEDA. KEDA does not scrape the gateway today —
+# its Redis scaler dials Redis directly — but docs/10-roadmap.md's I4 moves the
+# trigger onto comfy_estimated_wait_seconds, and an allow rule for a scrape
+# that has not started yet costs nothing and is one less thing to debug later.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: comfy-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-user-workload-monitoring
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-keda
+        # Host-network traffic: OpenShift labels a synthetic namespace with
+        # this key so a policy can admit anything arriving from a node's own
+        # address — a router running host-networked (not the ROSA default,
+        # but a supported one), and kubelet probe traffic on a CNI that does
+        # not already exempt it (OVN-Kubernetes, ROSA's, does). The gateway
+        # sits behind oauth-proxy on 8443 and binds 8000 to loopback under
+        # oauth, so this admits nothing the Route does not already.
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/host-network: ""
+      ports:
+        # 8443 is the oauth-proxy sidecar (AUTH_MODE=oauth), 8000 the gateway
+        # itself (AUTH_MODE=none). Both are listed because which one is live
+        # depends on a .env setting, and a policy that named only one would
+        # take the other mode off the internet.
+        - protocol: TCP
+          port: 8443
+        - protocol: TCP
+          port: 8000
+---
+# The gateway's outbound side.
+#
+# hub.py itself dials exactly one thing, Redis — no outbound HTTP, no cloud
+# API, nothing. The 443/6443 rule is entirely for the oauth-proxy sidecar,
+# which must reach the Kubernetes API server (TokenReview, and the
+# SubjectAccessReview behind --openshift-sar) and the cluster's OAuth issuer to
+# exchange an authorization code. Neither of those is reliably a pod: on ROSA
+# with a hosted control plane the API server is outside the cluster entirely,
+# and the OAuth issuer is a public Route. There is no namespaceSelector that
+# names them, so this is a port restriction rather than a destination
+# restriction, and it is honest about being one.
+#
+# It is still worth having. The gateway is the pod on the public internet, and
+# what this forbids is every outbound connection that is not TLS on a control-
+# plane port: no plaintext, no arbitrary ports, no reaching another namespace's
+# Service.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: comfy-gateway
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+---
+# Redis: reachable by the gateway, the workers and KEDA, and by nothing else.
+# Moved here from 00-redis.yaml when the rest of the namespace gained policy,
+# so that all six rules can be read together; unchanged otherwise, including
+# the openshift-keda exception, which is load-bearing rather than decorative —
+# a bare podSelector means "pods in this namespace" and the KEDA scaler dials
+# from its own operator pod in openshift-keda. Leave it out and the
+# ScaledObject sits in ScalerFailed while the queue grows and nothing scales.
+#
+# No egress rule for Redis at all. It answers; it never dials. The DNS policy
+# above covers it as a matter of course and it does not use that either.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-allow-app-only
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: comfy-gateway
+        - podSelector:
+            matchLabels:
+              app: comfy-worker
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-keda
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# The exception that is easy to forget until the second `./enterprise/setup.sh`
+# fails: both images are built IN this namespace, by BuildConfig pods that need
+# to reach a registry, GitHub and PyPI. They are ordinary pods here, so
+# default-deny denies them, and the failure arrives an hour into a working day
+# as a build that hangs on `git fetch` rather than as anything about network
+# policy.
+#
+# Selected by the label OpenShift puts on every build pod, so this covers
+# builds that do not exist yet and disappears when the build does. It is a
+# deliberate hole with a bounded lifetime, and it is the reason the worker
+# image is built here rather than pulled from somewhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-build-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: openshift.io/build.name
+        operator: Exists
+  policyTypes: [Egress]
+  egress:
+    - {}

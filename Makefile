@@ -92,9 +92,12 @@ status:
 unstick:
 	@scripts/08-unstick-storage.sh --repair
 
-# Units first (instant, no dependencies), then the e2e suite (needs
-# redis-server and the pip deps — see CONTRIBUTING.md).
+# Fastest first: the pytest layer (in-process, no dependencies beyond pytest
+# itself and what hub.py/worker_agent.py already import), then the shell
+# units (instant, no dependencies), then the e2e suite (needs redis-server
+# and the pip deps — see CONTRIBUTING.md).
 test:
+	@python3 -m pytest enterprise/test/unit -q
 	@scripts/unit-tests.sh
 	@enterprise/test/run.sh
 

@@ -56,19 +56,19 @@ entry exists (an `LLEN` afterwards cannot tell one requeue from two, or from
 none, once the agent resumes), and the queue's service order is read off the
 raw list both before and after the requeue.
 """
-import json, os, signal, sys, time, urllib.error, urllib.request, uuid
-import redis
+import json, os, signal, sys, time, uuid
 
+from harness import (
+    GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, check, connect_redis, failures,
+    poll_status as _poll_status, state_key, until as _until,
+)
 from queue_watch import QueueWriteWatcher
 
 # See check-30-sigkill.py: run.sh's stdout is a pipe, and a check killed by
 # CHECK_TIMEOUT loses every buffered PASS/FAIL line with it.
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
+get, post = GW.get, GW.post
 
 # Read the way hub.py reads them, so run.sh's shrunk values move this check's
 # budgets with them instead of pinning it to numbers nothing else uses.
@@ -84,31 +84,7 @@ LANE_A = "retryplace-userA"
 LANE_B = "retryplace-userB"
 LANE_C = "retryplace-userC"
 
-failures = []
-
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body, user=None):
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(), headers=headers)
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
+r = connect_redis()
 
 
 def service_order():
@@ -145,34 +121,13 @@ def rearm_worker_heartbeats():
 
 
 def until(predicate, timeout):
-    """Poll until the predicate holds; report whether it ever did. The caller
-    asserts on state it reads itself afterwards."""
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        if predicate():
-            return True
-
-        rearm_worker_heartbeats()
-        time.sleep(0.2)
-
-    return False
+    """harness.until, re-arming the frozen agent's heartbeat on every failed
+    poll so the reaper does not read the freeze itself as a death."""
+    return _until(predicate, timeout, on_wait=rearm_worker_heartbeats)
 
 
 def terminal_status(job_id, timeout=60):
-    deadline = time.time() + timeout
-    last = None
-
-    while time.time() < deadline:
-        try:
-            last = get(f"/api/jobs/{job_id}").get("status")
-            if last in ("completed", "failed", "cancelled"):
-                return last
-        except urllib.error.HTTPError:
-            pass
-        time.sleep(0.2)
-
-    return last
+    return _poll_status(GW, job_id, timeout=timeout, interval=0.2)
 
 
 agent_pid = int(sys.argv[1])

@@ -77,16 +77,13 @@ Then, CRITICALLY: with (1)'s over-quota submitter still over quota, /readyz
 must still read healthy. Tripping the breaker must never show up there.
 """
 import json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
-import redis
 
+from harness import QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, check, connect_redis, failures
 from queue_watch import QueueWriteWatcher
 
 sys.stdout.reconfigure(line_buffering=True)
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0")
-REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 
 # A dedicated gateway process, not the shared one on 8100 -- so this check can
 # pin QUOTA_GPU_SECONDS to a value it controls instead of trusting whatever
@@ -101,15 +98,7 @@ QUOTA_GPU_SECONDS = 100.0
 SHOWBACK_KEY_PREFIX = "comfy:showback:"
 SHOWBACK_USER_PREFIX = "u:"
 
-failures = []
-
-r = redis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
+r = connect_redis()
 
 
 def showback_period(now):

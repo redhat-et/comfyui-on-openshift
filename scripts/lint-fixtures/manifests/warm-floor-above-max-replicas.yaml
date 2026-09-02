@@ -1,0 +1,46 @@
+---
+# Fixture: a ScaledObject whose scheduled warm floor asks for more workers than
+# maxReplicaCount allows. Otherwise shaped like the ScaledObject in
+# enterprise/manifests/03-autoscale.yaml.
+#
+# KEDA takes the maximum across triggers and then clamps the result to
+# maxReplicaCount, so this combination is not rejected by anything: the
+# ScaledObject applies, the HPA reconciles, the cron window opens, and the pool
+# stays at 3. Nothing logs a complaint. What it costs is the whole point of the
+# feature — somebody waits 8-17 minutes for the first job of the morning that
+# the floor existed to have already paid for.
+#
+# `enterprise/setup.sh` raises the ceiling to meet WARM_WORKERS rather than
+# letting this happen; this fixture is the hand-edited case, and the proof that
+# the rule survives a change to that substitution.
+#
+# Valid YAML, so yaml.safe_load_all accepts it happily.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: comfy-worker
+spec:
+  scaleTargetRef:
+    name: comfy-worker
+  minReplicaCount: 0
+  maxReplicaCount: 3
+  pollingInterval: 15
+  cooldownPeriod: 600
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.comfyui.svc.cluster.local:6379
+        listName: comfy:queue
+        listLength: "1"
+        activationListLength: "0"
+        enableTLS: "false"
+        databaseIndex: "0"
+      authenticationRef:
+        name: comfy-redis-auth
+    - type: cron
+      metadata:
+        timezone: UTC
+        start: "0 9 * * 1-5"
+        end: "0 18 * * 1-5"
+        # Five, against a ceiling of three.
+        desiredReplicas: "5"

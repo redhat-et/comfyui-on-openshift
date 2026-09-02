@@ -4,19 +4,36 @@
 # instead of discovering it years later. CI's e2e suite is the judge — a bump
 # PR whose checks pass has already proven itself against the blocking-read
 # paths that made the pins load-bearing in the first place.
+#
+# Each directory's updates are grouped into a single weekly PR rather than
+# one PR per dependency — three separate fastapi/uvicorn/redis bump PRs (say)
+# tell you nothing three lines in one PR description don't, and each one
+# alone re-runs the whole e2e suite for the same verification.
 version: 2
 updates:
   - package-ecosystem: pip
     directory: /enterprise/gateway
     schedule:
       interval: weekly
+    groups:
+      gateway-pip:
+        patterns:
+          - "*"
 
   - package-ecosystem: pip
     directory: /enterprise/worker
     schedule:
       interval: weekly
+    groups:
+      worker-pip:
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"

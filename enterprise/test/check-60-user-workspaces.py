@@ -65,19 +65,11 @@ text. The path-traversal assertion later in that same file
 that this endpoint's static guard holds for ANY path, not that outputs are
 namespaced per user.
 """
-import json, os, pathlib, sys, time, urllib.error, urllib.request, uuid
-import websocket
+import glob, json, os, pathlib, sys, urllib.error, urllib.request, uuid
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
+from harness import COMFY, GW, check, drain as _drain, failures
+
 OUTPUT_ROOT = pathlib.Path(os.environ["OUTPUT_ROOT"]).resolve()
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
 
 
 def seed_output():
@@ -92,21 +84,7 @@ def seed_output():
 
 
 def drain(job_id, timeout=15):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
-    terminal = None
-    while True:
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
+    _, terminal = _drain(job_id, timeout)
     return terminal
 
 
@@ -116,14 +94,8 @@ def submit_and_wait(user, timeout=15):
     which hub.py's request.headers.get(..., "") treats identically -- both
     are exercised below, deliberately, because they are different requests
     even though this endpoint currently treats them the same."""
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     workflow = {"3": {"class_type": "KSampler", "inputs": {}}}
-    req = urllib.request.Request(
-        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     terminal = drain(resp["job_id"], timeout=timeout)
     images = (terminal or {}).get("data", {}).get("images", [])
     return images[0]["url"] if images else None
@@ -142,18 +114,12 @@ def submit_with_save_node(user, prefix, timeout=15):
     Returns (terminal_event, node_id) -- not a URL, because the property
     under test here is what ComfyUI actually received, not what the gateway
     reported back afterward."""
-    headers = {"Content-Type": "application/json"}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     node_id = f"save-{uuid.uuid4().hex[:8]}"
     workflow = {
         "3": {"class_type": "KSampler", "inputs": {}},
         node_id: {"class_type": "SaveImage", "inputs": {"filename_prefix": prefix}},
     }
-    req = urllib.request.Request(
-        GW + "/api/generate", data=json.dumps({"workflow": workflow}).encode(), headers=headers
-    )
-    resp = json.loads(urllib.request.urlopen(req, timeout=10).read())
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     return drain(resp["job_id"], timeout=timeout), node_id
 
 
@@ -161,8 +127,7 @@ def received_prefix(node_id):
     """The filename_prefix fake_comfy actually saw for `node_id` on the most
     recent /prompt that carried it -- None if it never arrived (the traversal
     case below, which must fail before ever reaching ComfyUI)."""
-    body = json.loads(urllib.request.urlopen(COMFY + "/__received_prefixes__", timeout=10).read())
-    return body.get(node_id)
+    return COMFY.get("/__received_prefixes__").get(node_id)
 
 
 def workspace_dirs(url):
@@ -187,7 +152,7 @@ def confined(url):
 
 def fetch_ok(url):
     try:
-        return len(urllib.request.urlopen(GW + url, timeout=10).read()) > 0
+        return len(urllib.request.urlopen(GW.base_url + url, timeout=10).read()) > 0
     except Exception:
         return False
 
@@ -337,6 +302,36 @@ check("the rejected workflow never reached ComfyUI at all -- scoped_prefix() "
       "raises before the job is ever submitted, so nothing here spent a GPU "
       "on a workflow that was going to be refused",
       received_prefix(evil_node_id) is None, received_prefix(evil_node_id))
+
+print("\n== (e) a LINKED filename_prefix is replaced by the workspace default, and the agent says so")
+
+# In ComfyUI's API format an input can be a link -- [node_id, output_index],
+# the value arriving from another node (a string primitive, a text node) at
+# execution time. scoped_prefix() cannot follow one at submit time, so it
+# substitutes the default prefix inside the workspace: the confined answer,
+# and a silent change to what the user's workflow said. The substitution is
+# kept; what this scenario adds is that it is no longer silent -- the agent
+# logs one line naming the node, so "my prefix was ignored" has something to
+# find.
+seed_output()
+terminal_link, link_node_id = submit_with_save_node("erin", ["7", 0])
+check("a save node whose filename_prefix is a link still completes",
+      terminal_link and terminal_link["type"] == "completed", terminal_link)
+images = (terminal_link or {}).get("data", {}).get("images", [])
+erin_dirs = workspace_dirs(images[0]["url"]) if images else []
+got_link_prefix = received_prefix(link_node_id)
+check("the link reached ComfyUI replaced by the default prefix inside erin's "
+      "workspace -- a list is not a path, and an unconfined one is not an option",
+      erin_dirs and got_link_prefix == f"{erin_dirs[0]}/ComfyUI", got_link_prefix)
+
+# The agent's log is the only place the warning can land -- run.sh writes
+# every agent's stdout to agent*.log in this check's own working directory.
+agent_log_text = "".join(open(path, errors="replace").read() for path in glob.glob("agent*.log"))
+check("and the agent logged a warning naming that node, so the override is "
+      "visible to whoever is asked why the prefix in the workflow was not used",
+      f"node {link_node_id}" in agent_log_text and "filename_prefix" in agent_log_text
+      and "link" in agent_log_text,
+      [line for line in agent_log_text.splitlines() if link_node_id in line][:3])
 
 print()
 if failures:

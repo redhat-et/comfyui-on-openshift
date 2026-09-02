@@ -1,0 +1,67 @@
+---
+# Fixture: a worker Deployment whose REDIS_URL names no user, so
+# redis.from_url() authenticates as `default` however good the password beside
+# it is, and the least-privilege ACL user in
+# enterprise/manifests/00-redis.yaml is bypassed with nothing failing.
+#
+# This is the silent half of W4. The pod starts, every job runs, and the only
+# thing that changed is which Redis user arbitrary custom-node Python on a GPU
+# node is holding credentials for — `default`, which can FLUSHALL the queue,
+# rewrite another submitter's job state, or CONFIG SET the memory ceiling. A
+# URL without a username is also the natural thing to copy from the gateway's
+# manifest, where it is correct.
+#
+# Otherwise shaped like enterprise/manifests/02-worker.yaml — correctly sized,
+# correctly tolerated, no ServiceAccount token, carrying the app: comfy-worker
+# label the NetworkPolicy selects, and taking the right Secret KEY (the other
+# half of this invariant, isolated in its own fixture) — so the missing
+# username is this file's only violation.
+#
+# Valid YAML, so yaml.safe_load_all accepts it happily.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-worker
+  labels:
+    app: comfy-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: comfy-worker
+  template:
+    metadata:
+      labels:
+        app: comfy-worker
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: worker
+          image: comfy-worker:latest
+          env:
+            # No username: this authenticates as `default`.
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            # Correct on purpose — the URL above is the violation.
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: comfy-redis
+                  key: worker_password
+          resources:
+            # Correctly sized on purpose: requests equal limits, both within
+            # what the smallest supported GPU instance can give one pod.
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "2"
+              memory: 10Gi
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "2"
+              memory: 10Gi

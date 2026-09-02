@@ -1,0 +1,52 @@
+---
+# Fixture: a worker Deployment that mounts a ServiceAccount token it has no
+# reader for. Otherwise shaped like enterprise/manifests/02-worker.yaml —
+# correctly sized, correctly tolerated, and carrying the app: comfy-worker
+# label the NetworkPolicy selects — so the missing
+# automountServiceAccountToken: false is its only violation.
+#
+# Omitting the field is how the regression actually arrives: it is a default,
+# not a deletion, so a new pod spec copied from an older one silently mounts a
+# token. In this pod that token is readable by arbitrary custom-node Python
+# running on a GPU node inside the VPC, which is the whole reason the field is
+# set rather than left to its default.
+#
+# Valid YAML, so yaml.safe_load_all accepts it happily.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: comfy-worker
+  labels:
+    app: comfy-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: comfy-worker
+  template:
+    metadata:
+      labels:
+        app: comfy-worker
+    spec:
+      # automountServiceAccountToken intentionally omitted — the default is
+      # true, and the default is the bug.
+      nodeSelector:
+        GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: worker
+          image: comfy-worker:latest
+          resources:
+            # Correctly sized on purpose: requests equal limits, both within
+            # what the smallest supported GPU instance can give one pod.
+            requests:
+              nvidia.com/gpu: 1
+              cpu: "2"
+              memory: 10Gi
+            limits:
+              nvidia.com/gpu: 1
+              cpu: "2"
+              memory: 10Gi

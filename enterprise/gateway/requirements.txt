@@ -5,11 +5,22 @@
 # fails to import on Python 3.11+ (duplicate base class TimeoutError). Any
 # example you find using `import aioredis` predates that merge.
 #
-# The <7 ceiling is load-bearing, not caution: redis-py 8 introduced a default
+# The <7 ceiling on redis was load-bearing: redis-py 8 introduced a default
 # socket_timeout of 5 seconds, which makes every blocking XREAD/BLMOVE longer
-# than 5s raise "Timeout reading from ..." instead of waiting. Raise the
-# ceiling only after re-testing the blocking paths (./enterprise/test/run.sh)
-# and, if needed, passing socket_timeout=None explicitly.
-fastapi>=0.115,<0.117
-uvicorn[standard]>=0.32,<0.36
+# than 5s raise "Timeout reading from ..." instead of waiting. hub.py's
+# client() now passes socket_timeout=None explicitly, which is the one kwarg
+# that difference comes down to, so the ceiling can be lifted once the
+# blocking paths have been re-tested against redis-py 8
+# (./enterprise/test/run.sh — the WebSocket tail and the reaper are the
+# gateway's blocking paths). The worker's own pin is a separate decision:
+# enterprise/worker/requirements.txt.
+#
+# fastapi and uvicorn are capped at the next major rather than the next
+# minor: hub.py uses only the stable surface (lifespan, HTTPException, the
+# Request/WebSocket objects, the response classes, starlette's
+# run_in_threadpool), none of which either project has deprecated within
+# their 0.x lines, and a minor ceiling was a rebuild that silently stopped
+# resolving every few months for no code reason.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.32,<1
 redis>=5.2,<7

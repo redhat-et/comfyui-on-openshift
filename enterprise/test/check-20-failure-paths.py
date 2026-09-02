@@ -1,53 +1,12 @@
 """Failure paths: rejected workflow, cancel, and SIGTERM drain."""
-import json, os, signal, subprocess, sys, time, urllib.error, urllib.request
-import redis
-import websocket
+import os, signal, sys, time
 
+from harness import GW, QUEUE_KEY, REDIS_PASSWORD, REDIS_URL, check, connect_redis, drain, failures, state_key
 from queue_watch import QueueWriteWatcher
 
-GW = "http://127.0.0.1:8100"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-failures = []
+post = GW.post
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-def post(path, body=None):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(GW + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-def drain(job_id, timeout=90):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    ws.settimeout(timeout)
-    seen, terminal = [], None
-    while True:
-        try:
-            m = json.loads(ws.recv())
-        except Exception:
-            break
-        if m.get("type") == "ping":
-            continue
-        seen.append(m["type"])
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-    ws.close()
-    return seen, terminal
+r = connect_redis()
 
 
 print("\n== a workflow ComfyUI rejects becomes a 'failed' event, with the reason")
@@ -63,11 +22,7 @@ print("\n== a workflow ComfyUI rejects becomes a 'failed' event, with the reason
 # So count instead of watching for absence. Exactly one write may touch this
 # key for this job -- the submit's own insert -- and a requeue is a second.
 # check-30 scenario A uses the same construction for the same reason.
-watcher = QueueWriteWatcher(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    os.environ.get("REDIS_PASSWORD") or None,
-    QUEUE_KEY,
-).start()
+watcher = QueueWriteWatcher(REDIS_URL, REDIS_PASSWORD, QUEUE_KEY).start()
 
 job = post("/api/generate", {"workflow": {"__fail__": {"class_type": "KSampler"}}})
 job_id = job["job_id"]

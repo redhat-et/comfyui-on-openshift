@@ -74,16 +74,48 @@ COMFYUI_SMOKE_REF="$(grep '^COMFYUI_REF=' "${REPO_ROOT}/.env.example" | cut -d= 
 
 log "ComfyUI $COMFYUI_SMOKE_REF on CPU"
 
-git clone --quiet --depth 1 --branch "$COMFYUI_SMOKE_REF" \
-    https://github.com/comfyanonymous/ComfyUI.git "${WORK}/ComfyUI"
+# init + fetch + checkout rather than `git clone --branch`, for the reason the
+# Containerfiles give: --branch takes a branch or tag and refuses a commit,
+# and COMFYUI_REF is a commit now. This accepts either.
+git init -q "${WORK}/ComfyUI"
+git -C "${WORK}/ComfyUI" fetch --quiet --depth 1 \
+    https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_SMOKE_REF"
+git -C "${WORK}/ComfyUI" checkout -q FETCH_HEAD
 
-# CPU torch: the cpu wheel index is linux-only; macOS default wheels are
-# already CPU/Metal.
+# Same three version numbers app/Containerfile (and enterprise/worker/
+# Containerfile) install via TORCH_VERSION/TORCHVISION_VERSION/
+# TORCHAUDIO_VERSION — read from the Containerfile itself so a version bump
+# there does not silently unpin this script from what CI actually runs.
+# This is a real gate, not caution: below torch 2.8 ComfyUI's DynamicVRAM
+# check (main.py, see the Containerfile comment above TORCH_VERSION) falls
+# back to a legacy code path with only a log line to show for it, so an
+# unpinned resolve here could pass while proving nothing about the pinned
+# stack.
+TORCH_VERSION="$(grep '^ARG TORCH_VERSION=' "${REPO_ROOT}/app/Containerfile" | cut -d= -f2)"
+TORCHVISION_VERSION="$(grep '^ARG TORCHVISION_VERSION=' "${REPO_ROOT}/app/Containerfile" | cut -d= -f2)"
+TORCHAUDIO_VERSION="$(grep '^ARG TORCHAUDIO_VERSION=' "${REPO_ROOT}/app/Containerfile" | cut -d= -f2)"
+
+[[ -n "$TORCH_VERSION" && -n "$TORCHVISION_VERSION" && -n "$TORCHAUDIO_VERSION" ]] \
+    || die "could not read TORCH_VERSION/TORCHVISION_VERSION/TORCHAUDIO_VERSION from app/Containerfile"
+
+log "torch ${TORCH_VERSION} / torchvision ${TORCHVISION_VERSION} / torchaudio ${TORCHAUDIO_VERSION}"
+
+# The Containerfiles use TORCH_INDEX=.../whl/cu128 (a CUDA index); this
+# script has no GPU, so it installs the same three version numbers from the
+# CPU wheel index instead of the CUDA one — same pins, no multi-GB CUDA
+# download. The cpu wheel index is linux-only; macOS default wheels are
+# already CPU/Metal, so the version pins apply there without an index-url.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    python3 -m pip install --quiet torch torchvision torchaudio \
+    python3 -m pip install --quiet \
+        torch=="${TORCH_VERSION}" \
+        torchvision=="${TORCHVISION_VERSION}" \
+        torchaudio=="${TORCHAUDIO_VERSION}" \
         --index-url https://download.pytorch.org/whl/cpu
 else
-    python3 -m pip install --quiet torch torchvision torchaudio
+    python3 -m pip install --quiet \
+        torch=="${TORCH_VERSION}" \
+        torchvision=="${TORCHVISION_VERSION}" \
+        torchaudio=="${TORCHAUDIO_VERSION}"
 fi
 
 python3 -m pip install --quiet -r "${WORK}/ComfyUI/requirements.txt"

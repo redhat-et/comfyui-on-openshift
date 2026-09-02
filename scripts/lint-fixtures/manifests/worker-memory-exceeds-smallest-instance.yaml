@@ -39,6 +39,8 @@ spec:
       labels:
         app: comfy-worker
     spec:
+      # Present so this fixture keeps violating exactly one rule as lint grows.
+      automountServiceAccountToken: false
       nodeSelector:
         GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
       tolerations:

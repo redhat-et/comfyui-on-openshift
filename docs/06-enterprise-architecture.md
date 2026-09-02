@@ -85,6 +85,52 @@ parser.
 If you change `--listen 127.0.0.1` to `0.0.0.0` in `enterprise/worker/start.sh`,
 you have removed the security model, not just a network binding.
 
+## What the worker can reach, and with what
+
+Unreachable is half of it. The other half is what a worker pod can *initiate*,
+because the code running in it is whatever custom-node Python was baked into
+the image, on a node with an instance role, inside your VPC. Three controls,
+all in the manifests:
+
+- **The namespace is default-deny in both directions**
+  (`enterprise/manifests/06-network-policy.yaml`), and then six policies
+  allow exactly the flows that exist: DNS for everyone; the workers to Redis
+  and nothing else; the gateway in from the router in `openshift-ingress` and
+  from the Prometheus and KEDA namespaces, out to Redis and to TLS on the
+  control-plane ports the oauth-proxy sidecar needs; Redis in from the
+  gateway, the workers and KEDA; and build pods out to the internet, because
+  the images are built in-cluster. A worker therefore has no route to the
+  internet, the instance metadata service, another namespace's Service, or
+  S3 — which is also why `ENABLE_MANAGER=true` cannot fetch a node list or a
+  model at runtime in this configuration and will hang trying. The one
+  assumption that varies between clusters is that the router is a pod in
+  `openshift-ingress`; it is on ROSA, and the file says what to change where
+  it is not. `scripts/lint.sh` fails a Deployment no policy selects.
+- **The worker's Redis credential is its own ACL user**, `comfy-worker`
+  (`00-redis.yaml`), allowed the commands `worker_agent.py` issues against the
+  five `comfy:*` key patterns it names and nothing else — no `FLUSHALL`, no
+  `CONFIG`, no `SCAN`, no reading a key outside its own. That is the only
+  Redis credential a GPU pod holds; the gateway, KEDA and the readiness probe
+  use the default user. `setup.sh` adds the second password to an existing
+  Secret without rotating the first, and lint pins the ACL to `-@all` plus
+  the allowlist.
+- **No pod mounts a ServiceAccount token.** `automountServiceAccountToken:
+  false` on Redis, the gateway and the worker: nothing in the namespace calls
+  the Kubernetes API, so the projected token was a credential with no reader
+  except whatever else ended up executing in the pod. The oauth-proxy patch
+  turns it back on for the gateway alone, because the proxy really does call
+  TokenReview and SubjectAccessReview.
+
+Two smaller shapes in the same spirit. The worker has a **combined liveness
+probe**: one `exec` that asks ComfyUI on loopback whether it is up *and*
+checks that `AGENT_LIVENESS_FILE` — touched by the agent on every pass of its
+loop, idle or mid-job — is under 120 seconds old, so an agent parked forever
+on a blackholed Redis socket beside a healthy ComfyUI is restarted rather than
+holding a card. And the worker Deployment rolls **one pod at a time with no
+surge** (`maxUnavailable: 1`, `maxSurge: 0`), with a PodDisruptionBudget on
+the workers, on Redis and on the gateway pair, so a cluster upgrade drains the
+pool in sequence instead of all at once.
+
 ## Why Redis Streams, not pub/sub
 
 The obvious implementation publishes progress to a pub/sub channel and has the
@@ -150,9 +196,20 @@ the first thing to tune.
 **When scale-to-zero is the wrong choice:** interactive iteration, where a
 designer runs a prompt, looks at it, adjusts, and runs again over an afternoon.
 There, the cold start lands in the middle of a creative loop and the honest
-configuration is a warm worker during work hours and `make down` at night — a
-cron on the machine pool, not KEDA. Scale-to-zero earns its keep for bursty,
-batch, and out-of-hours work.
+configuration is a warm floor during work hours and zero at night. That is
+`WARM_WORKERS` in `.env`: a second, `cron`-type trigger on the same
+ScaledObject that holds N workers between `WARM_START` and `WARM_END` in
+`WARM_TIMEZONE`. KEDA takes the maximum across its triggers, so inside the
+window the pool never drops below N and a busy afternoon still scales past it
+to `MAX_GPU_WORKERS`; outside the window the queue is the only thing deciding
+and the pool drains as before. The floor lives in `.env`, so a `setup.sh`
+re-run reasserts it rather than resetting it — which is why it is a trigger
+and not a cron job editing the machine pool. Scale-to-zero earns its keep
+unmodified for bursty, batch, and out-of-hours work.
+
+`SCALE_TO_ZERO=false` is the other end: it pins exactly one worker
+permanently and skips KEDA, the ScaledObject and machine-pool autoscaling with
+it, so `WARM_WORKERS` does nothing there and `setup.sh` warns if you set both.
 
 ## Storage: why this configuration requires EFS
 
@@ -181,6 +238,17 @@ application namespace.
 
 Grant access by granting a role, revoke it by removing one, and the access shows
 up in the cluster audit log. No separate user database.
+
+Under `oauth` the gateway also trusts the identity for two things it refuses
+to trust it for under `none`. `/outputs/<path>` serves a file only if it lies
+inside the caller's own workspace — anyone else's is a 403, and the check is
+on the *resolved* path, so `/outputs/<mine>/../<theirs>/x` is refused too.
+And `/api/showback` returns only the caller's own row plus the pool totals
+(`users_total_gpu_seconds`, with `scoped_to` naming the caller) unless the
+caller is listed in `SHOWBACK_OPERATORS`, a comma-separated list of
+identities exactly as oauth-proxy reports them. Both are asserted by
+`enterprise/test/check-66-output-scoping.py` against a gateway started in
+`oauth` mode.
 
 `AUTH_MODE=none` exists for a solo test cluster. It publishes the gateway with
 no login. The GPU pods stay unreachable either way, so this is not catastrophic,
@@ -230,26 +298,26 @@ format rather than behind a button in a shared UI.
 
 ## What is deliberately not here
 
-- **Per-user *isolation* of outputs.** The workspaces themselves are here now —
-  `docs/10-roadmap.md` (Q3) landed them — so this entry is no longer "every
-  user shares one output directory". Each job writes into
+- **Per-user isolation of outputs under `AUTH_MODE=none`.** The workspaces
+  are here — `docs/10-roadmap.md` (Q3) landed them — so each job writes into
   `/output/<workspace>/`, named from the submitter's identity by the worker
   agent, and every output that comes back out is confined to that directory
-  whether or not the save node cooperated.
+  whether or not the save node cooperated. Under `AUTH_MODE=oauth`, reads are
+  scoped too (above): the gateway serves a caller only their own workspace.
 
-  What is still deliberately absent is **access control on reads**. The
-  workspaces are organisational and confining, not a security boundary: the
-  gateway serves `/outputs/...` to any caller who has the URL, exactly as it
-  did before. That is a decision, not an omission. The only identity this
-  system has is `X-Forwarded-User`, and under `AUTH_MODE=none` it is
+  What is deliberately absent is read isolation under `AUTH_MODE=none`. The
+  only identity this system has there is `X-Forwarded-User`, and it is
   client-supplied — `hub.py` says in three places that it must never be
-  treated as authorization. Scoping reads on it would be a control that works
-  under `AUTH_MODE=oauth` and silently evaporates under `AUTH_MODE=none`,
-  which is worse than a documented absence, because the illusion is what
-  people would rely on. It would also break the thing users actually do with
-  these URLs, which is send them to each other. Real read isolation needs an
-  identity the gateway can trust in *both* modes; that is a different item
-  from this one, and it is not here.
+  treated as authorization — so scoping reads on it would be a lock whose key
+  is written on the door. The gateway therefore serves `/outputs/...` to any
+  caller in that mode, and says so rather than pretending. The earlier
+  version of this entry declined to scope reads in *either* mode, on the
+  argument that a control that evaporates in one mode is worse than a
+  documented absence; that argument lost to a simpler one, which is that
+  under `oauth` the header comes from a real login and any logged-in user
+  could otherwise read any other's images by computing a workspace name.
+  `check-66-output-scoping.py` pins both halves: alice gets her file, bob
+  gets a 403, and the `none`-mode gateway still serves alice's file to bob.
 
   Three smaller consequences worth knowing. Usernames are sanitized to an
   allowlist slug plus a hash of the original, so an output directory is
@@ -261,20 +329,26 @@ format rather than behind a button in a shared UI.
   of its output directory, the caller wrote it, and it has an unambiguous
   safe form.
 
-  The third is the sharper way to say what "not a security boundary" means
-  in practice: `workspace_name()` (`worker_agent.py`) is a **pure, publicly
-  computable function of the username** — allowlist-slug the string, append
-  12 hex characters of `sha256(username)`, nothing else. The algorithm is
-  in this file's git history and in the worker's own source, and it takes no
-  secret as input. So a caller does not need to have SEEN one of alice's URLs
-  to read her outputs; knowing (or guessing) her username is enough to
-  *compute* `workspace_name("alice@example.com")` offline and construct the
-  path directly, the same way anyone can today. That is a strictly stronger
-  reach than "the URL is unguessable but discoverable" — it needs no
-  discovery step at all. It is still the deliberate trade this section
-  opens with (organisation, not isolation), not a bug: fixing it means
-  answering the identity question above, not hashing the workspace name
-  harder.
+  The third is why the `oauth` scoping had to exist: `workspace_name()`
+  (`worker_agent.py`, mirrored into `hub.py` as the `SHARED WORKSPACE` block
+  that lint keeps identical) is a **pure, publicly computable function of the
+  username** — NFC-normalise the string so that the composed and decomposed
+  spellings of one accented name are one name, allowlist-slug it, append 12
+  hex characters of its `sha256`, nothing else. It takes no secret as input, so knowing
+  a colleague's username is enough to compute their workspace path offline.
+  That is fine as *organisation*; it is exactly why, once an identity can be
+  trusted, the gateway has to check it on the way out. It is also why
+  `/api/showback` under `oauth` no longer lists every submitter to every
+  caller: the list of names was the lookup key.
+
+  On the same footing, what the worker reports back is not trusted either:
+  only manifest entries of `type: output` are served (a preview is a 404 into
+  the shared volume), an output ComfyUI reports inside *another* submitter's
+  workspace is refused rather than moved into this one, every subfolder
+  component is validated like a filename, URLs are percent-encoded, and the
+  raw `data.output` manifest is stripped from the per-node `executed` events
+  the worker forwards, so nothing unconfined reaches a browser on the way
+  through (`check-65-output-filename-confinement.py`, scenarios (e)–(i)).
 - **Job priority.** Still not here, on purpose, and the reasoning changed once
   `docs/10-roadmap.md` (Q1) landed fair queueing. A priority lane needs a claim
   from the caller — "I'm interactive" — and the only identity this gateway can
@@ -330,9 +404,19 @@ format rather than behind a button in a shared UI.
   terminates the pod `OOMKilled` and `oc describe pod` names it. The gateway
   cannot see that; the person reading the failure can, and the failure text
   says so.
-- **Interrupting a running sampler.** Cancel is cooperative — it stops a queued
-  job and asks a running one to stop between events. Truly interrupting mid-step
-  is ComfyUI's `/interrupt`, and the workers are not reachable from the gateway.
+- **A gateway that reaches into ComfyUI.** Cancel is cooperative on the
+  gateway's side — it removes a queued job and sets a flag on a running one —
+  and the workers are not reachable from the gateway, so the gateway itself
+  can never call ComfyUI's `/interrupt`. The *agent* can, and does: it reads
+  the cancel flag on every pass of its receive loop and sends `/interrupt` to
+  its own loopback ComfyUI, which takes effect between sampler steps. The
+  same call is made for any prompt the agent gives up on — a `JOB_TIMEOUT`,
+  a closed socket — and the agent then waits up to `INTERRUPT_DRAIN_TIMEOUT`
+  (60 s) for ComfyUI's queue to empty before taking the next job; a ComfyUI
+  that will not drain makes the agent exit so the pod restarts, rather than
+  queueing every later job behind a prompt that never finishes
+  (`check-67-job-timeout-interrupt.py`). What is deliberately absent is any
+  path by which anything *outside* the pod talks to ComfyUI.
 
 ## Sources
 

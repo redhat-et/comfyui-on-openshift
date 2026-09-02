@@ -18,6 +18,11 @@ without ever touching the manifests that actually ship.
 | `manifests/worker-no-gpu-toleration.yaml` | GPU worker Deployment with no `nvidia.com/gpu` toleration |
 | `manifests/route-missing-timeout-tunnel.yaml` | Route with `timeout` but no `timeout-tunnel` |
 | `manifests/gateway-svc-exposes-container-port.yaml` | Gateway Service listing the gateway's own container port (8000) alongside the proxy port |
+| `manifests/warm-floor-above-max-replicas.yaml` | `ScaledObject` whose `cron` warm-floor trigger asks for more workers than `maxReplicaCount` — KEDA clamps and the floor silently never arrives (I1, `docs/10-roadmap.md`) |
+| `manifests/deployment-no-network-policy.yaml` | A Deployment in the multi-user namespace that no `NetworkPolicy` `podSelector` names — cut off by the namespace default-deny, with a Ready pod and no event saying so |
+| `manifests/worker-holds-admin-redis-password.yaml` | Worker Deployment taking `comfy-redis/password` — the admin Redis credential — instead of the least-privilege ACL user's `worker_password` (W4) |
+| `manifests/worker-redis-url-has-no-user.yaml` | Worker Deployment whose `REDIS_URL` names no user, so `redis.from_url()` authenticates as `default` and the ACL user is bypassed with nothing failing (W4, the silent half) |
+| `manifests/worker-mounts-sa-token.yaml` | Worker Deployment with no `automountServiceAccountToken: false` — a projected API-server token in a pod whose only client is Redis, readable by whatever custom-node Python runs on that GPU node |
 | `manifests/worker-memory-exceeds-smallest-instance.yaml` | GPU worker Deployment whose memory `limits` do not fit the smallest GPU instance type this repo supports, and which is Burstable rather than Guaranteed (F1, `docs/10-roadmap.md`). Not a hypothetical regression: this is the `8Gi`/`24Gi` shape `enterprise/manifests/02-worker.yaml` and `manifests/base/deployment.yaml` both shipped with until F1 fixed them |
 
 The fourth case — a Containerfile losing its `chgrp 0` / `chmod g=u` block —

@@ -238,6 +238,24 @@ for f in sorted(glob.glob('manifests/base/*.yaml')
     except yaml.YAMLError as exc:
         bad(f, f"parse error: {exc}")
 
+# Every NetworkPolicy in the multi-user namespace that selects SOMETHING, by
+# name and by the labels it selects. The catch-all deny (podSelector: {}) is
+# deliberately excluded: it covers every pod trivially, so counting it as
+# coverage would make the rule below vacuous — which is the opposite of what it
+# is for. A workload with no policy naming it is denied in both directions by
+# that catch-all, and presents as a pod that starts, passes its probes, and
+# cannot talk to anything.
+network_policy_selectors = []
+
+for f, doc in docs:
+    if doc.get('kind') != 'NetworkPolicy' or not f.startswith('enterprise/manifests/'):
+        continue
+
+    labels = dig(doc, 'spec', 'podSelector', 'matchLabels') or {}
+
+    if labels:
+        network_policy_selectors.append((dig(doc, 'metadata', 'name'), labels))
+
 for f, doc in docs:
     kind = doc.get('kind')
     name = dig(doc, 'metadata', 'name')
@@ -326,6 +344,51 @@ for f, doc in docs:
                        "to limits, cpu and memory both) so that node pressure "
                        "evicts and OOM-kills everything else first")
 
+    # No pod in the multi-user namespace may mount a ServiceAccount token it
+    # does not use. Neither hub.py nor worker_agent.py imports a Kubernetes
+    # client or opens the API server — Redis is the only thing either dials —
+    # and Redis itself speaks Redis. A projected token in a pod with no API
+    # client is a credential lying in the filesystem for whatever else ends up
+    # running there, which on the worker is arbitrary custom-node Python on a
+    # node inside your VPC.
+    #
+    # Scoped to enterprise/manifests on purpose: manifests/base is the
+    # single-user overlay, whose optional S3 model sync runs an init container
+    # under an IRSA ServiceAccount and DOES need its token.
+    #
+    # The exception is written where the exception is created:
+    # 05-oauth-proxy-patch.yaml sets it back to true in the same file that adds
+    # the oauth-proxy sidecar, which really does call TokenReview and
+    # SubjectAccessReview. That file is a bare patch with no kind, so it is not
+    # a Deployment and this rule does not reach it.
+    if kind == 'Deployment' and f.startswith('enterprise/manifests/'):
+        mounts_token = dig(doc, 'spec', 'template', 'spec',
+                           'automountServiceAccountToken')
+        if mounts_token is not False:
+            bad(f, f"Deployment/{name} does not set "
+                   "automountServiceAccountToken: false. Nothing in this "
+                   "namespace's own pods calls the Kubernetes API, so the "
+                   "projected token is a credential with no reader except "
+                   "whatever else ends up executing in the pod")
+
+    # And every Deployment here must be named by a NetworkPolicy that selects
+    # it. enterprise/manifests/06-network-policy.yaml default-denies the
+    # namespace in both directions, so a workload added without a rule of its
+    # own is not "unrestricted", it is cut off — and it fails in the way that
+    # takes longest to diagnose: the pod starts, the container is healthy, the
+    # probes pass, and every connection it opens times out.
+    if kind == 'Deployment' and f.startswith('enterprise/manifests/'):
+        pod_labels = dig(doc, 'spec', 'template', 'metadata', 'labels') or {}
+        covered = [policy for policy, selector in network_policy_selectors
+                   if all(pod_labels.get(k) == v for k, v in selector.items())]
+
+        if not covered:
+            bad(f, f"{kind}/{name} is not selected by any NetworkPolicy in "
+                   "enterprise/manifests. The namespace default-denies ingress "
+                   "and egress, so this pod will start, pass its probes, and "
+                   "be unable to reach Redis, DNS or anything else — with "
+                   "nothing in its logs or events naming the cause")
+
     # The SIGTERM drain needs a window longer than the job it is draining.
     # The pool scales to zero, so termination is routine; a grace period
     # shorter than JOB_TIMEOUT means the kubelet SIGKILLs the agent partway
@@ -344,6 +407,37 @@ for f, doc in docs:
                    f"JOB_TIMEOUT={job_timeout} but "
                    f"terminationGracePeriodSeconds={grace} — a job may legally "
                    "run past the drain window and be SIGKILLed mid-render")
+
+    # The scheduled warm floor may not ask for more workers than the pool is
+    # allowed to have (docs/10-roadmap.md, I1). KEDA takes the maximum across
+    # triggers and then clamps to maxReplicaCount, so a cron trigger above the
+    # ceiling is not an error anywhere — it is a floor that silently never
+    # arrives, on the one setting in this configuration whose entire purpose is
+    # that somebody does not wait 8-17 minutes at nine in the morning.
+    #
+    # enterprise/setup.sh raises the ceiling to meet WARM_WORKERS when it
+    # renders this file, and says so; the rule is here for the hand-edited case
+    # and for the day that substitution is changed.
+    if kind == 'ScaledObject':
+        for trigger in (dig(doc, 'spec', 'triggers') or []):
+            if not isinstance(trigger, dict) or trigger.get('type') != 'cron':
+                continue
+
+            try:
+                desired = int(str(dig(trigger, 'metadata', 'desiredReplicas')))
+                ceiling = int(str(dig(doc, 'spec', 'maxReplicaCount')))
+            except (TypeError, ValueError):
+                # A placeholder rather than a number: setup.sh substitutes both
+                # of these at apply time, and an unsubstituted file is not a
+                # violation of anything.
+                continue
+
+            if desired > ceiling:
+                bad(f, f"ScaledObject/{name}'s cron trigger asks for "
+                       f"{desired} workers but maxReplicaCount is {ceiling}. "
+                       "KEDA clamps to the ceiling, so this is a warm floor "
+                       "that never arrives and reports no error while not "
+                       "arriving")
 
     # Both Route annotations or neither works. On edge and reencrypt routes
     # only timeout-tunnel governs the upgraded WebSocket, against a one-hour
@@ -379,13 +473,78 @@ for f, doc in docs:
 
     # Redis must not evict. The default policy silently drops queued jobs
     # under memory pressure, which presents as work vanishing at random.
+    #
+    # And the worker's ACL user must stay least-privilege. Widening it is the
+    # silent half of the pair below: the worker Deployment carrying the admin
+    # password is a visible, greppable mistake, whereas `+@all` appended to
+    # this rule list leaves every manifest looking correct, every test passing,
+    # and arbitrary custom-node Python holding a credential that can FLUSHALL
+    # the queue or CONFIG SET the memory ceiling out from under it.
     for c in containers:
         if c.get('name') != 'redis':
             continue
+
         args = [str(a) for a in (c.get('args') or [])]
+
         if 'noeviction' not in args:
             bad(f, "the redis container does not set maxmemory-policy "
                    "noeviction — the default evicts queued jobs")
+
+        if 'comfy-worker' not in args:
+            bad(f, "the redis container defines no comfy-worker ACL user. The "
+                   "worker authenticates as that user (02-worker.yaml's "
+                   "REDIS_URL names it); without the user here, either every "
+                   "worker fails to authenticate or somebody has quietly put "
+                   "the admin password back into the GPU pods")
+        else:
+            rules = args[args.index('comfy-worker'):]
+
+            if '-@all' not in rules:
+                bad(f, "the comfy-worker ACL user does not start from -@all. "
+                       "An allowlist that is not preceded by a deny-all is an "
+                       "addition to the default permissions, not a restriction "
+                       "of them")
+
+            widened = [r for r in rules
+                       if r in ('+@all', 'allcommands', '~*', 'allkeys',
+                                'nopass', '&*', 'allchannels')]
+
+            if widened:
+                bad(f, f"the comfy-worker ACL user carries {widened}, which "
+                       "undoes the point of it having its own user. This is "
+                       "the credential arbitrary custom-node Python on a GPU "
+                       "node can read out of its own environment")
+
+    # The worker must never hold the admin Redis password (W4). It runs
+    # arbitrary custom-node Python, and anything running in that container can
+    # read its own environment; the `password` key of comfy-redis is the
+    # gateway's and KEDA's credential for the whole keyspace.
+    if kind == 'Deployment' and dig(doc, 'spec', 'selector', 'matchLabels',
+                                    'app') == 'comfy-worker':
+        for c in containers:
+            for entry in (c.get('env') or []):
+                if not isinstance(entry, dict):
+                    continue
+
+                ref = dig(entry, 'valueFrom', 'secretKeyRef')
+
+                if isinstance(ref, dict) and ref.get('name') == 'comfy-redis' \
+                        and ref.get('key') == 'password':
+                    bad(f, f"{kind}/{name} container {c.get('name')} takes "
+                           f"env {entry.get('name')} from comfy-redis/password "
+                           "— the ADMIN Redis credential. The worker has its "
+                           "own least-privilege ACL user; it wants "
+                           "comfy-redis/worker_password")
+
+            url = env_of(c, 'REDIS_URL')
+
+            if url is not None and not re.match(r'^redis://[^/@]+@', url):
+                bad(f, f"{kind}/{name} container {c.get('name')} has "
+                       f"REDIS_URL={url!r} with no username. redis.from_url() "
+                       "then authenticates as `default`, the admin user, "
+                       "whatever password it is handed — so the least-"
+                       "privilege ACL user is bypassed silently and nothing "
+                       "fails")
 
     # Under AUTH_MODE=oauth the gateway itself must be rebound to loopback,
     # or the proxy is a formality: anything in the cluster reaches :8000
@@ -440,6 +599,18 @@ shape_require()
 }
 
 for containerfile in app/Containerfile enterprise/worker/Containerfile; do
+    # Both images clone their application source from a public git remote at
+    # build time, and a tag is a mutable pointer: upstream can move v0.32.0
+    # under you and the rebuild produces different software with the same
+    # Containerfile, no diff, and — as the torch pin's own comment records from
+    # the time it happened — no crash either. The clone shape fetches an
+    # explicit object, so COMFYUI_REF from .env may still be a tag or a branch;
+    # what is pinned here is the DEFAULT, which is what a bare build gets.
+    shape_require "$containerfile" '^ARG COMFYUI_REF=[0-9a-f]{40}$' \
+        "the ComfyUI clone's default ref must be a commit SHA, not a tag. A tag is a mutable pointer, so a rebuild months later silently ships different application source with an identical Containerfile — the same class of failure the torch pin above it exists to prevent, and it produced no error the last time it happened"
+    shape_require "$containerfile" '^ARG MANAGER_REF=[0-9a-f]{40}$' \
+        "the ComfyUI-Manager clone's default ref must be a commit SHA too, and this is the clone where it matters most: Manager is the component that installs and runs arbitrary Python from the internet, so an unpinned fetch of it is an unpinned fetch of everything it can reach"
+
     shape_require "$containerfile" 'chgrp -R 0' \
         "OpenShift runs the container as an arbitrary high UID with GID 0. Without the chgrp 0 / chmod g=u block ComfyUI cannot write temp/, input/ or user/, and the pod crash-loops on a permission error that reads like a storage problem"
     shape_require "$containerfile" 'chmod -R g=u' \
@@ -503,6 +674,25 @@ shape_require enterprise/worker/worker_agent.py \
 shape_require enterprise/worker/start.sh \
     'output-directory "\$OUTPUT_ROOT"' \
     "ComfyUI's output directory and the agent's OUTPUT_ROOT must be the same one variable. ComfyUI is long-lived with a single fixed --output-directory and the agent computes every submitter's workspace underneath it; hardcoding one side lets the pod start with the agent naming paths under a directory ComfyUI is not writing to, which 404s every generation and logs nothing"
+
+# The GPU worker image's ENTRYPOINT is start.sh, so anything appended to
+# `docker run <image> ...` lands in start.sh's positional parameters and
+# nowhere else. CI has no GPU and boots this image with `--cpu`; without the
+# forward that flag is swallowed silently, ComfyUI looks for a card that is not
+# there, and the failure reads like a broken image rather than a runner with no
+# card. Nothing in the e2e suite can see this: it runs worker_agent.py directly
+# against a stub, never through the entrypoint.
+# The other half of the same CI proof. A GitHub runner has no GPU and no Redis,
+# so the agent cannot start; without this switch the container would exit the
+# moment worker_agent.py failed to connect, and the image proof would report a
+# missing Redis as a broken image.
+shape_require enterprise/worker/start.sh \
+    '^AGENT_DISABLED=' \
+    "start.sh must honour AGENT_DISABLED. Nightly CI boots this image on a runner with no GPU and no Redis; with the agent started anyway the container exits on the failed Redis connection and the arbitrary-UID proof reports a missing dependency as an image regression"
+
+shape_require enterprise/worker/start.sh \
+    '^[[:space:]]*"\$@" &$' \
+    "start.sh is the worker image's ENTRYPOINT and must forward its own arguments to ComfyUI. Nightly CI boots this image with --cpu because GitHub runners have no GPU; swallowed, the flag produces a CUDA failure that looks like an image regression"
 
 (( SHAPE_BAD == 0 )) && ok "clean" || FAILURES=$(( FAILURES + 1 ))
 
@@ -944,6 +1134,119 @@ for problem in problems:
     print(f"  {PATH}: {problem}")
 
 sys.exit(1 if problems else 0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the output workspace naming is mirrored, not diverged (audit G2)"
+
+# A third contract in the same shape as the two above. The worker names each
+# submitter's output directory (workspace_name: slug plus digest) and the
+# gateway now refuses to serve a file outside the caller's directory, which
+# means the gateway has to compute the same name from the same identity. The
+# two files ship in two images; the function is duplicated between BEGIN/END
+# SHARED WORKSPACE markers, and this rule is what makes "change both or
+# neither" more than a comment. Drift here is not a crash: it is every
+# /outputs request answering 403 to its rightful owner — or, if the slug rule
+# alone diverges, two users mapped to one directory.
+
+if python3 - <<'EOF'
+import difflib, sys
+
+MARKERS = ("# BEGIN SHARED WORKSPACE", "# END SHARED WORKSPACE")
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+
+def block(path, begin, end):
+    lines = open(path).read().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(begin)]
+    ends = [i for i, line in enumerate(lines) if line.startswith(end)]
+    if len(starts) != 1 or len(ends) != 1 or ends[0] < starts[0]:
+        print(f"  {path}: expected exactly one {begin} ... {end} block, found "
+              f"{len(starts)} begin and {len(ends)} end marker(s) — the workspace "
+              "naming must be present in both files, delimited, and identical")
+        return None
+    return lines[starts[0]:ends[0] + 1]
+
+blocks = [block(path, *MARKERS) for path in FILES]
+if any(b is None for b in blocks):
+    sys.exit(1)
+if blocks[0] != blocks[1]:
+    print(f"  the shared workspace block differs between {FILES[0]} and "
+          f"{FILES[1]} — change both or neither:")
+    for line in difflib.unified_diff(blocks[0], blocks[1], FILES[0], FILES[1],
+                                     lineterm="", n=1):
+        print(f"    {line}")
+    sys.exit(1)
+sys.exit(0)
+EOF
+then
+    ok "clean"
+else
+    FAILURES=$(( FAILURES + 1 ))
+fi
+
+# ---------------------------------------------------------------------------
+
+log "the job key shapes and the cancel flag agree between gateway and worker (audit G9)"
+
+# The small contracts that live OUTSIDE the mirrored blocks: the Redis key a
+# job's state, stream and payload live under, the TTL both sides arm on them,
+# and the one Hash field the gateway writes and the worker polls to cancel a
+# running job. Each is a one-line definition that looks too small to mirror,
+# which is exactly how it drifts: rename the key on one side and the other
+# side still runs, reading an empty hash, never seeing a cancel, and expiring
+# nothing. This compares the function bodies by AST rather than by marker so
+# the definitions can stay where they read best in each file.
+
+if python3 - <<'EOF'
+import ast, re, sys
+
+FILES = ("enterprise/gateway/hub.py", "enterprise/worker/worker_agent.py")
+FUNCS = ("state_key", "stream_key", "payload_key")
+
+def load(path):
+    src = open(path).read()
+    tree = ast.parse(src)
+    funcs = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in FUNCS:
+            funcs[node.name] = ast.get_source_segment(src, node)
+    ttl = re.search(r'^EVENT_STREAM_TTL = (.+)$', src, re.M)
+    return src, funcs, ttl.group(1) if ttl else None
+
+hub_src, hub_funcs, hub_ttl = load(FILES[0])
+wrk_src, wrk_funcs, wrk_ttl = load(FILES[1])
+rc = 0
+
+for name in FUNCS:
+    if name not in hub_funcs or name not in wrk_funcs:
+        print(f"  {name}() must be a top-level def in both files")
+        rc = 1
+    elif hub_funcs[name] != wrk_funcs[name]:
+        print(f"  {name}() differs between the two files — change both or neither:")
+        print("    " + hub_funcs[name].replace("\n", "\n    "))
+        print("    " + wrk_funcs[name].replace("\n", "\n    "))
+        rc = 1
+
+if hub_ttl != wrk_ttl:
+    print(f"  EVENT_STREAM_TTL default differs: hub {hub_ttl!r} vs worker {wrk_ttl!r}")
+    rc = 1
+
+field = re.search(r'^CANCEL_REQUESTED_FIELD = "([^"]+)"$', hub_src, re.M)
+if not field:
+    print("  hub.py no longer defines CANCEL_REQUESTED_FIELD as a string literal")
+    rc = 1
+elif f'"{field.group(1)}"' not in wrk_src:
+    print(f"  the worker never mentions {field.group(1)!r}, the field the gateway "
+          "writes to cancel a running job")
+    rc = 1
+
+sys.exit(rc)
 EOF
 then
     ok "clean"

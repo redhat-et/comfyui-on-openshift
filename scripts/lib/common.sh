@@ -16,10 +16,23 @@ export REPO_ROOT
 
 load_env()
 {
+    # ASSUME_YES may only come from an explicit --yes argument to a script
+    # that accepts one (99-teardown.sh) — never from .env, and never from
+    # whatever happened to already be exported in the calling shell. Strip it
+    # both before and after sourcing .env: before, so an inherited
+    # `export ASSUME_YES=true` from a previous run does not survive into this
+    # one; after, because `set -a` below exports anything .env sets,
+    # including a stray ASSUME_YES=true line someone copied from a cron
+    # example. A script sets its own script-local ASSUME_YES afterward, once
+    # it has actually seen --yes on its own argv.
+    unset ASSUME_YES
+
     if [[ -f "${REPO_ROOT}/.env" ]]; then
         # shellcheck disable=SC1091
         set -a; source "${REPO_ROOT}/.env"; set +a
     fi
+
+    unset ASSUME_YES
 
     # Where the cluster lives.
     : "${PLATFORM:=rosa}"
@@ -52,7 +65,17 @@ load_env()
     : "${MAX_GPU_WORKERS:=3}"
     : "${SCALE_TO_ZERO:=true}"
     : "${ENABLE_MANAGER:=false}"
-    : "${COMFYUI_REF:=v0.32.0}"
+    : "${COMFYUI_REF:=c2bcbecd82ec5ae66594340b395c24ef0217b238}"   # v0.32.0
+
+    # Kept identical to the ARG defaults in app/Containerfile so a bare
+    # `podman build` and this repo's BuildConfig (scripts/05-deploy.sh) build
+    # the same image. See that file's comment above ARG COMFYUI_REF for why
+    # the four torch values move together.
+    : "${MANAGER_REF:=da5e88aae61c06e1396724e77dc5fa152732797f}"   # 4.2.2
+    : "${TORCH_INDEX:=https://download.pytorch.org/whl/cu128}"
+    : "${TORCH_VERSION:=2.8.0}"
+    : "${TORCHVISION_VERSION:=0.23.0}"
+    : "${TORCHAUDIO_VERSION:=2.8.0}"
 
     # Cost guardrails.
     : "${MONTHLY_BUDGET_USD:=600}"
@@ -67,6 +90,7 @@ load_env()
     export STORAGE_MODE MODELS_SIZE OUTPUT_SIZE MODELS_S3_BUCKET
     export APP_NAMESPACE COMFYUI_IMAGE
     export AUTH_MODE MAX_GPU_WORKERS SCALE_TO_ZERO ENABLE_MANAGER COMFYUI_REF
+    export MANAGER_REF TORCH_INDEX TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION
     export MONTHLY_BUDGET_USD BUDGET_ALERT_EMAIL GPU_VCPU_REQUEST
     export NETWORK_STACK_NAME OPERATOR_ROLE_PREFIX
 }
