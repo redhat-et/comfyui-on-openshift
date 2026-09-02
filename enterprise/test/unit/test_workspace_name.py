@@ -161,25 +161,22 @@ def test_cyrillic_homoglyph_does_not_collide_with_the_ascii_lookalike(mod):
     assert ascii_name != homoglyph_name
 
 
-def test_nfc_and_nfd_encodings_of_the_same_identity_are_not_normalized(mod):
+def test_nfc_and_nfd_encodings_of_the_same_identity_share_one_workspace(mod):
     """
     "cafe" is not the interesting case here -- an accented "e" is, because
     Unicode has two ways to spell it that render identically:
 
-      NFC: "café"        -- 4 code points, precomposed e-acute
-      NFD: "café"       -- 5 code points, plain 'e' + combining acute
+      NFC: "caf\u00e9"        -- 4 code points, precomposed e-acute
+      NFD: "cafe\u0301"       -- 5 code points, plain 'e' + combining acute
 
     A real IdP can hand back either form for what a human reading two support
-    tickets would call the same username. workspace_name() does not call
-    unicodedata.normalize anywhere, so the two forms hit the sanitizer as
-    different byte sequences: the combining accent is an "unsafe" character
-    in both cases (WORKSPACE_UNSAFE is ASCII-only) and collapses to '-', but
-    it lands after a different number of real letters, AND hashlib.sha256
-    hashes the raw (unnormalized) UTF-8 either way -- so the slug halves
-    differ ("caf" vs "cafe") and the digests differ too. This is documented
-    behaviour, not asserted as correct: two logins that are the same person
-    under Unicode canonical equivalence land in two different, unrelated
-    workspaces. See the final report for the file:line this test pins.
+    tickets would call the same username, and the proxy in front of the
+    gateway and the worker behind the queue need not agree on which. Before
+    workspace_name() normalised, the two forms hashed to two digests and the
+    same person got two unrelated workspaces -- and, once the gateway scoped
+    /outputs by the caller's computed name, a 403 on their own files whenever
+    the spellings differed. NFC is applied before the slug and the digest, so
+    both forms name one directory.
     """
     nfc = "caf\u00e9"        # precomposed e-acute, 4 code points
     nfd = "cafe\u0301"       # 'e' + combining acute accent, 5 code points
@@ -188,9 +185,5 @@ def test_nfc_and_nfd_encodings_of_the_same_identity_are_not_normalized(mod):
     assert unicodedata.normalize("NFC", nfd) == nfc  # ...that a human, or a
     # normalizing IdP, would call identical.
 
-    name_nfc = mod.workspace_name(nfc)
-    name_nfd = mod.workspace_name(nfd)
-
-    assert name_nfc != name_nfd, (
-        "documents current behaviour: workspace_name() does not Unicode-"
-        "normalize, so NFC/NFD variants of one identity get two workspaces")
+    assert mod.workspace_name(nfc) == mod.workspace_name(nfd)
+    assert mod.workspace_name(nfc).startswith("caf-")  # the accent is still not slug-safe

@@ -121,6 +121,7 @@ import json
 import os
 import pathlib
 import re
+import unicodedata
 import signal
 import socket
 import stat
@@ -1054,6 +1055,14 @@ def workspace_name(user: str) -> str:
     """The submitter's directory name. Total, never raises, never rejects."""
     if not user:
         return ANON_WORKSPACE
+
+    # NFC first: an identity provider can hand back "café" as four code points
+    # or as five (e plus a combining accent), and a human reads both as one
+    # person. Without this the digest below would give that person two
+    # unrelated workspaces, one per spelling, and the gateway's scoping would
+    # refuse them their own files whenever the proxy's spelling differed from
+    # the worker's. Canonical composition is the form both sides agree on.
+    user = unicodedata.normalize("NFC", user)
 
     slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
     digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]

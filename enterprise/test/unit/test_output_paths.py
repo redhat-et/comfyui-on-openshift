@@ -349,22 +349,18 @@ def test_output_subfolder_follows_and_rejects_a_symlink_escaping_output_root(
     assert (outside / "secret.png").read_bytes() == b"not yours"
 
 
-def test_output_subfolder_moves_a_file_out_of_another_users_workspace(
+def test_output_subfolder_refuses_a_file_inside_another_users_workspace(
         worker_agent_module, worker_output_root):
     """
-    Documents W5 (AUDIT-AND-PLAN.md): output_subfolder() only checks that the
-    reported path resolves (a) inside OUTPUT_ROOT and (b) not already inside
-    THIS caller's own workspace (worker_agent.py:1177, 1184). It does not
-    check whether the file is already sitting inside a DIFFERENT workspace --
-    so a manifest entry naming a file that genuinely belongs to another
-    submitter is os.replace()'d into the caller's own workspace, exactly like
-    an ownerless one. Given the same filename collision that can occur
-    whenever ComfyUI's own SaveImage counter restarts (worker restart, node
-    move), this moves bob's already-served image into alice's directory
-    instead of refusing to touch a path outside her own workspace. This test
-    pins today's behaviour; it does not assert it is correct -- see the
-    final report for file:line and the fix this wave deliberately leaves to
-    the worker-batch wave instead of touching worker_agent.py here.
+    W5 (AUDIT-AND-PLAN.md). output_subfolder() checks that the reported path
+    resolves inside OUTPUT_ROOT and is not already inside THIS caller's own
+    workspace; "not inside mine" used to be satisfied by "inside somebody
+    else's", and the move is an os.replace -- so a manifest entry naming a
+    file that belongs to another submitter was moved into the caller's
+    workspace and served to them: a cross-user read that was also a
+    deletion. Now a reported path whose first component looks like another
+    workspace is refused: nothing moves, nothing is served, and the caller
+    gets their own workspace back with an empty filename.
     """
     bob_dir = worker_output_root / "bob-111111111111"
     bob_dir.mkdir()
@@ -374,9 +370,9 @@ def test_output_subfolder_moves_a_file_out_of_another_users_workspace(
     subfolder, filename = worker_agent_module.output_subfolder(
         "alice-000000000000", "bob-111111111111", "out.png")
 
-    assert filename == "out.png"  # not refused
-    assert not bobs_file.exists()  # moved out from under bob
-    assert (worker_output_root / "alice-000000000000" / "bob-111111111111" / "out.png").exists()
+    assert (subfolder, filename) == ("alice-000000000000", "")  # refused, not served
+    assert bobs_file.read_bytes() == b"bobs-image"  # bob's file untouched
+    assert not (worker_output_root / "alice-000000000000" / "bob-111111111111").exists()
 
 
 # ---------------------------------------------------------------------------
