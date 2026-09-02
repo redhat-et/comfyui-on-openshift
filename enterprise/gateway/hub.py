@@ -113,6 +113,14 @@ MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "1"))
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 STATIC_ROOT = pathlib.Path(__file__).parent / "static"
 
+# How long one gather_stats() snapshot is served before the keyspace is
+# scanned again. index.html polls /api/stats every five seconds per open tab
+# and Prometheus scrapes /metrics, neither of them authenticated; without
+# this, each of those calls is a SCAN over the whole keyspace of a
+# single-threaded Redis, paid for by every worker parked in BLMOVE. 0 turns
+# the cache off.
+STATS_CACHE_SECONDS = float(os.environ.get("STATS_CACHE_SECONDS", "5"))
+
 # The ceiling on this process's Redis connection pool. Every open /ws/<job>
 # holds one connection for as long as it tails, so this is also the ceiling
 # on concurrent viewers per replica: past it a tail's read raises, retries
@@ -2342,7 +2350,9 @@ async def gather_stats() -> dict:
     # estimated wait that is briefly optimistic after a crash-restart.
     workers = 0
 
-    async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*"):
+    # COUNT well above the number of live workers, so this is one SCAN round
+    # trip rather than the server default's ten keys at a time.
+    async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*", count=1000):
         workers += 1
 
     return {
@@ -2352,9 +2362,34 @@ async def gather_stats() -> dict:
     }
 
 
+# One snapshot per STATS_CACHE_SECONDS, shared by every caller of /api/stats
+# and /metrics. The lock is what makes "shared" true under load: N tabs
+# polling in the same instant would otherwise all find the cache stale and
+# all scan, which is the burst the cache exists to collapse into one.
+_stats_cache: dict = {"expires": 0.0, "data": None}
+_stats_lock = asyncio.Lock()
+
+
+async def cached_stats() -> dict:
+    """gather_stats(), at most once per STATS_CACHE_SECONDS per process."""
+    if _stats_cache["data"] is not None and time.monotonic() < _stats_cache["expires"]:
+        return _stats_cache["data"]
+
+    async with _stats_lock:
+        # Whoever held the lock may have refreshed it while this caller waited.
+        if _stats_cache["data"] is not None and time.monotonic() < _stats_cache["expires"]:
+            return _stats_cache["data"]
+
+        data = await gather_stats()
+        _stats_cache["data"] = data
+        _stats_cache["expires"] = time.monotonic() + STATS_CACHE_SECONDS
+
+        return data
+
+
 @app.get("/api/stats")
 async def stats():
-    return await gather_stats()
+    return await cached_stats()
 
 
 # ---------------------------------------------------------------------------
@@ -2493,7 +2528,7 @@ async def metrics():
     the ServiceMonitor enterprise/setup.sh applies, which is what makes
     "queue deeper than N for 30 minutes" an alert instead of a support ticket.
     """
-    data = await gather_stats()
+    data = await cached_stats()
 
     text = (
         "# HELP comfy_queue_depth Jobs waiting in the Redis queue.\n"

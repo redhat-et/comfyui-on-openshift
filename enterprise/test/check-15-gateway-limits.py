@@ -238,7 +238,32 @@ try:
                 pass
         os.kill(agent_pid, signal.SIGCONT)
 
-    finally:
+    print(f"\n== C: a burst of /api/stats calls shares one SCAN (STATS_CACHE_SECONDS={STATS_CACHE_SECONDS})")
+
+    # Cold: let any earlier snapshot age out first, then measure one call.
+    time.sleep(STATS_CACHE_SECONDS + 0.5)
+    watcher = CommandWatcher(worker_scan).start()
+    status, first = request("GET", "/api/stats")
+    _n, single = watcher.stop()
+
+    check("fixture: one cold /api/stats call performs at least one SCAN of "
+          "comfy:worker:* (so the count below is measuring the real path)",
+          status == 200 and len(single) >= 1, {"status": status, "scans": single})
+
+    time.sleep(STATS_CACHE_SECONDS + 0.5)
+    watcher = CommandWatcher(worker_scan).start()
+    snapshots = [request("GET", "/api/stats")[1] for _ in range(6)]
+    _n, burst = watcher.stop()
+
+    check(f"six back-to-back /api/stats calls cost Redis no more SCANs than one "
+          f"cold call did ({len(single)}): {len(burst)} observed -- the polled "
+          f"endpoint must serve one shared snapshot per window, not a keyspace "
+          f"scan per browser tab per five seconds",
+          len(burst) <= len(single), {"burst": len(burst), "single": len(single)})
+    check("and the burst returned one identical snapshot",
+          all(s == snapshots[0] for s in snapshots), snapshots)
+
+finally:
     dgw.terminate()
     try:
         dgw.wait(timeout=10)
