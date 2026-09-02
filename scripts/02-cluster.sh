@@ -29,7 +29,7 @@ log "Preflight"
 
 GPU_VCPUS_PER_NODE="$(aws ec2 describe-instance-types \
     --instance-types "$GPU_INSTANCE_TYPE" \
-    --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text)"
+    --query 'InstanceTypes[0].VCpuInfo.DefaultVCpus' --output text 2>/dev/null || echo 4)"
 GPU_VCPUS_NEEDED=$(( GPU_REPLICAS * GPU_VCPUS_PER_NODE ))
 
 GPU_VCPU_QUOTA="$(aws service-quotas get-service-quota \
