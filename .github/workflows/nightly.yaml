@@ -118,19 +118,16 @@ jobs:
   # start.sh's normal job is to launch ComfyUI *and* worker_agent.py, and
   # exit the container if either one dies — worker_agent.py needs Redis,
   # which this runner does not have, so booting normally here would crash-
-  # loop on the agent half within seconds. This job depends on two things in
-  # enterprise/worker/start.sh that are not yet true as of this commit
-  # (tracked as platform-owner follow-up, not owned by this change):
+  # loop on the agent half within seconds. This job relies on two things
+  # enterprise/worker/start.sh does for exactly this purpose:
   #   1. the ComfyUI launch forwards "$@" (so `--cpu` below reaches
   #      `python3 main.py`, the same fix that makes app/Containerfile's CMD
   #      accept it);
-  #   2. an AGENT_DISABLED=1 environment variable causes start.sh to skip
-  #      launching worker_agent.py entirely and wait on ComfyUI's PID alone,
-  #      instead of `wait -n "$comfy_pid" "$agent_pid"` with an agent that
-  #      was never started.
-  # Without both, this job fails at the boot-proof step below with a clear
-  # curl-timeout, not a silent false pass — see CONTRIBUTING.md for how to
-  # reproduce locally.
+  #   2. AGENT_DISABLED=1 makes start.sh skip launching worker_agent.py and
+  #      wait on ComfyUI's PID alone. A CI and diagnostic switch only; the
+  #      pool never sets it.
+  # If either regresses, this job fails at the boot-proof step below with a
+  # clear curl timeout, not a silent false pass.
   gpu-worker-image:
     runs-on: ubuntu-latest
     timeout-minutes: 120
