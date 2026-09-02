@@ -66,6 +66,60 @@ app = FastAPI()
 clients = {}
 history = {}
 
+# ---------------------------------------------------------------------------
+# ONE PROMPT AT A TIME, like the real thing.
+#
+# ComfyUI executes prompts serially: a prompt submitted while another is
+# running waits in queue_pending until the running one finishes or is
+# interrupted, and GET /queue reports both lists. This stub used to run every
+# prompt concurrently, which made one whole class of failure unreachable: an
+# agent that gives up on a job (a timeout, a closed socket) without
+# interrupting it leaves ComfyUI still executing, and the agent's NEXT job
+# then sits in queue_pending with no event ever arriving for it. Concurrent,
+# the next job just ran, and check-67-job-timeout-interrupt.py could not
+# fail. So the lock below is the real ComfyUI's execution model, and
+# /queue and /interrupt below are enough of its API for an agent to ask
+# "is it idle yet?" and to make it so.
+# ---------------------------------------------------------------------------
+execution_lock = asyncio.Lock()
+queue_running = []   # prompt ids, in the real /queue's sense
+queue_pending = []
+
+# Interrupt bookkeeping: how many POST /interrupt calls arrived (a check
+# asserts the agent sent one), and which running prompts have been asked to
+# stop. Per prompt rather than one global flag, so an interrupt that lands
+# while nothing is running — the agent's cancel path on a prompt that has
+# already finished — cannot pre-empt the NEXT prompt before it starts.
+interrupts = 0
+interrupted = set()
+
+# `__unkillable__` is a prompt that ignores /interrupt — a custom node wedged
+# in a C call — and only ends when a check posts /__release__. That is the
+# path on which the agent must give up and exit rather than take more work,
+# and a check that uses it MUST release it afterwards or every later prompt
+# waits behind it forever. A counter rather than an Event: a prompt ends
+# when the count moves past the value it started under, so one check's
+# release cannot pre-end a prompt a later check starts.
+release_generation = 0
+
+
+@app.get("/__interrupts__")
+async def interrupts_endpoint():
+    return {"count": interrupts}
+
+
+@app.post("/__release__")
+async def release():
+    global release_generation
+    release_generation += 1
+    return {"released": release_generation}
+
+
+@app.get("/queue")
+async def queue_endpoint():
+    return {"queue_running": [[0, pid] for pid in queue_running],
+            "queue_pending": [[1, pid] for pid in queue_pending]}
+
 # How long POST /prompt stalls before answering when the workflow carries the
 # __slow_prompt__ marker (docs/10-roadmap.md, Q2). worker_agent.py's
 # submit_prompt() blocks on this response, so this is the window in which
@@ -199,7 +253,8 @@ async def prompt(body: dict):
     asyncio.create_task(run(body.get("client_id"), pid, slow="__slow__" in wf,
                             vram_oom="__vram_oom__" in wf, die="__die__" in wf,
                             empty_frame="__empty_frame__" in wf,
-                            close_after_history="__close_after_history__" in wf))
+                            close_after_history="__close_after_history__" in wf,
+                            never="__never__" in wf, unkillable="__unkillable__" in wf))
     return {"prompt_id": pid, "number": 1, "node_errors": {}}
 
 @app.get("/history/{pid}")
@@ -208,14 +263,50 @@ async def hist(pid: str):
 
 @app.post("/interrupt")
 async def interrupt():
+    global interrupts
+    interrupts += 1
+    interrupted.update(queue_running)
     return {}
 
-async def run(client_id, pid, slow=False, vram_oom=False, die=False,
-              empty_frame=False, close_after_history=False):
+async def run(client_id, pid, **flags):
+    """One prompt: pending until the lock is free, running until done."""
+    queue_pending.append(pid)
+    async with execution_lock:
+        queue_pending.remove(pid)
+        queue_running.append(pid)
+        try:
+            await execute(client_id, pid, **flags)
+        finally:
+            queue_running.remove(pid)
+            interrupted.discard(pid)
+
+async def execute(client_id, pid, slow=False, vram_oom=False, die=False,
+                  empty_frame=False, close_after_history=False,
+                  never=False, unkillable=False):
     global next_output_override
     ws = clients.get(client_id)
     await asyncio.sleep(0.1)
+
+    if never or unkillable:
+        # A generation that never ends on its own. `never` honours an
+        # interrupt the way the real sampler does between steps; `unkillable`
+        # does not, and ends only on /__release__. One progress event first,
+        # so the agent has seen the prompt alive before it goes quiet.
+        await send(ws, {"type": "progress", "data": {"value": 1, "max": 3, "prompt_id": pid}})
+        started_under = release_generation
+        while release_generation == started_under:
+            if never and pid in interrupted:
+                await send(ws, {"type": "execution_interrupted", "data": {"prompt_id": pid}})
+                return
+            await asyncio.sleep(0.05)
+        return
+
     for i in range(1, 4):
+        if pid in interrupted:
+            # What the real ComfyUI does on /interrupt: stops between steps,
+            # reports it, and moves on to the next prompt.
+            await send(ws, {"type": "execution_interrupted", "data": {"prompt_id": pid}})
+            return
         # An event for a DIFFERENT prompt, to prove prompt_id filtering works.
         await send(ws, {"type": "progress", "data": {"value": i, "max": 3, "prompt_id": "other-prompt"}})
         await send(ws, {"type": "progress", "data": {"value": i, "max": 3, "prompt_id": pid}})

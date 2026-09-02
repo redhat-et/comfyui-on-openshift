@@ -156,6 +156,13 @@ JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "60"))
 BOOT_TIMEOUT = int(os.environ.get("BOOT_TIMEOUT", "600"))
 
+# How long, after asking ComfyUI to /interrupt a prompt this agent has given
+# up on, to wait for ComfyUI's queue to actually empty before concluding it
+# never will. An interrupt takes effect between sampler steps, so a big node
+# (a model load, an upscale) can take a while to notice; a custom node stuck
+# in a C call never notices. See await_comfy_idle().
+INTERRUPT_DRAIN_TIMEOUT = int(os.environ.get("INTERRUPT_DRAIN_TIMEOUT", "60"))
+
 # TEST-ONLY. Never set this in a manifest. A pause, in seconds, immediately
 # before the point-10 claim that turns "dispatched" into "executing" — the
 # last instant at which a reap can still be free. The window between reading
@@ -855,6 +862,13 @@ def showback_accrue_call(state: str, destination: str,
 
 
 shutting_down = False
+
+# Set by await_comfy_idle() when ComfyUI would not stop executing a prompt
+# this agent had abandoned. Read by main()'s loop the same way shutting_down
+# is: the current job is still reported and cleaned up, and then the process
+# exits non-zero instead of taking another job. See await_comfy_idle() for
+# why exiting is the only honest option.
+comfy_wedged = False
 
 
 def log(message: str) -> None:
@@ -1600,6 +1614,12 @@ def run_job(conn: redis.Redis, job: dict) -> None:
     ws.connect(f"ws://{COMFY_ADDR}/ws?clientId={CLIENT_ID}", timeout=30)
     ws.settimeout(RECV_TIMEOUT)
 
+    # None until ComfyUI has been handed the workflow. Everything in the
+    # `except` and `finally` below that talks to ComfyUI about this prompt is
+    # conditional on it, because before the submit there is nothing at
+    # ComfyUI to interrupt or to wait for.
+    prompt_id = None
+
     try:
         # The last moment a cancel can still be free. /api/jobs/<id>/cancel is
         # cooperative and promises that "a job that has not been picked up yet
@@ -1756,11 +1776,33 @@ def run_job(conn: redis.Redis, job: dict) -> None:
                 finish(conn, job_id, "completed", collect_outputs(prompt_id, workspace))
                 return
 
+    except Exception:
+        # Leaving this function by an exception after the submit — the
+        # TimeoutError above, the closed-socket RuntimeError, a Redis error
+        # out of emit() — means this agent has stopped listening to a prompt
+        # ComfyUI may well still be executing. It has to be told to stop:
+        # ComfyUI runs one prompt at a time, so the next job this worker
+        # takes would otherwise sit in ComfyUI's queue behind the abandoned
+        # one, receive no event, and time out too — and so would the one
+        # after it. A custom node wedged in a C call turned a whole pod into
+        # a black hole this way, with the liveness probe (which asks
+        # ComfyUI's HTTP server, not its executor) green throughout.
+        if prompt_id is not None:
+            interrupt()
+
+        raise
+
     finally:
         try:
             ws.close()
         except Exception:  # noqa: BLE001
             pass
+
+        # Whatever way this job ended, the next BLMOVE must not happen while
+        # ComfyUI is still busy with this one. On the ordinary completion
+        # path this is one GET that finds an empty queue.
+        if prompt_id is not None:
+            await_comfy_idle(job_id, prompt_id)
 
 
 def forwardable(message: dict) -> dict:
@@ -1903,6 +1945,59 @@ def interrupt() -> None:
         pass
 
 
+def comfy_idle() -> bool:
+    """Is ComfyUI's own queue empty — nothing running, nothing pending?"""
+    queue = comfy_get("/queue", timeout=5)
+
+    return not queue.get("queue_running") and not queue.get("queue_pending")
+
+
+def await_comfy_idle(job_id: str, prompt_id: str) -> None:
+    """
+    Block until ComfyUI's queue is empty, for at most INTERRUPT_DRAIN_TIMEOUT
+    — and if it still is not, mark this worker wedged so main() exits.
+
+    Called on every way out of run_job() once a prompt has been submitted.
+    After a completion it returns at once. After an interrupt — a cancel,
+    a timeout, a closed socket — it is the confirmation that the interrupt
+    took: /interrupt is a request, acted on between sampler steps, and a
+    node that never yields never acts on it.
+
+    Why exit rather than carry on polling. This agent binds the only path
+    into ComfyUI, and ComfyUI executes serially: while it is still running
+    the abandoned prompt, every job this worker takes is a job that will
+    time out unseen. The pod cannot fix its own ComfyUI (there is no
+    /restart), the liveness probe asks ComfyUI's HTTP server and not its
+    executor, and the gateway counts a heartbeating worker as capacity. A
+    non-zero exit is the one signal the kubelet acts on: start.sh waits on
+    both children and ends the container when either exits, so the
+    container restarts with a fresh ComfyUI, and the queue is served by
+    workers that can serve it in the meantime. Reading /queue as "not idle"
+    when it cannot be read at all is deliberate — a ComfyUI that does not
+    answer is not one to hand the next job to either, and in the pod that
+    case ends the container through start.sh regardless.
+    """
+    global comfy_wedged
+
+    deadline = time.time() + INTERRUPT_DRAIN_TIMEOUT
+
+    while time.time() < deadline:
+        try:
+            if comfy_idle():
+                return
+
+        except Exception:  # noqa: BLE001 - unreadable is not idle; see above
+            pass
+
+        time.sleep(0.5)
+
+    comfy_wedged = True
+    log(f"job {job_id}: ComfyUI is still executing prompt {prompt_id} "
+        f"{INTERRUPT_DRAIN_TIMEOUT}s after it was interrupted — this worker will "
+        f"exit after reporting the job, so the pod restarts with a ComfyUI that "
+        f"can be interrupted instead of taking jobs it cannot run")
+
+
 _showback_script = None
 
 
@@ -2003,7 +2098,7 @@ def main() -> int:
         f"ready, polling {QUEUE_KEY}")
 
     try:
-        while not shutting_down:
+        while not shutting_down and not comfy_wedged:
             heartbeat(conn)
 
             # Move, don't pop. BLMOVE parks the job in this worker's processing
@@ -2110,6 +2205,10 @@ def main() -> int:
             conn.delete(WORKER_KEY)
         except Exception:  # noqa: BLE001
             pass
+
+    if comfy_wedged:
+        log("exiting: ComfyUI is wedged on an abandoned prompt (see above)")
+        return 1
 
     log("exiting cleanly")
 
