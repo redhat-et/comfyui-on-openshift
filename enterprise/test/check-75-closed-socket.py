@@ -47,68 +47,23 @@ Both budgets are read from `JOB_TIMEOUT` rather than picked: what is being
 asserted is "resolved without waiting for the deadline", so the deadline is
 the number the assertion has to be expressed in.
 """
-import json, os, time, urllib.request
-import websocket
+import os, time
 
-GW = "http://127.0.0.1:8100"
-COMFY = f"http://{os.environ.get('COMFY_HOST', '127.0.0.1')}:{os.environ.get('COMFY_PORT', '8999')}"
+from harness import GW, check, comfy_received_nodes, drain, failures
+
+get, post = GW.get, GW.post
 
 # hub.py and worker_agent.py read these the same way; a run.sh that shrinks
 # JOB_TIMEOUT moves this check's budget with it.
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 RECV_TIMEOUT = int(os.environ.get("RECV_TIMEOUT", "30"))
 
-failures = []
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body=None):
-    data = json.dumps(body).encode() if body is not None else b"{}"
-    req = urllib.request.Request(GW + path, data=data,
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
 
 def received_nodes():
     """Every workflow node key the stub ComfyUI has ever been handed. This is
     how "ComfyUI really did have this workflow" is asserted rather than
     assumed."""
-    return json.loads(urllib.request.urlopen(COMFY + "/__received__", timeout=10).read())["nodes"]
-
-
-def drain(job_id, timeout):
-    """Tail one job to its terminal event against a wall-clock deadline.
-
-    Absolute rather than a per-recv socket timeout: the gateway sends
-    keepalives and every one of them would reset a socket timeout, so a job
-    that never terminates would hang here until CHECK_TIMEOUT killed this
-    process. Same reasoning as check-30 and check-70.
-    """
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://127.0.0.1:8100/ws/{job_id}", timeout=10)
-    deadline = time.time() + timeout
-    seen, terminal = [], None
-
-    while time.time() < deadline:
-        ws.settimeout(max(1.0, deadline - time.time()))
-        try:
-            m = json.loads(ws.recv())
-        except Exception:  # noqa: BLE001 - closed or timed out; the deadline decides
-            break
-        if m.get("type") == "ping":
-            continue
-        seen.append(m["type"])
-        if m["type"] in ("completed", "failed", "cancelled"):
-            terminal = m
-            break
-
-    ws.close()
-    return seen, terminal
+    return comfy_received_nodes()
 
 
 def error_of(terminal):
