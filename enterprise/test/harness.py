@@ -45,6 +45,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import redis
@@ -239,6 +240,31 @@ def drain(job_id, timeout, ws_url=None, terminal_types=TERMINAL_TYPES, verbose=F
             break
     ws.close()
     return seen, terminal
+
+
+def poll_status(client, job_id, terminal=TERMINAL_TYPES, timeout=30, interval=0.5):
+    """Poll GET /api/jobs/{job_id} via `client` until its status reaches one
+    of `terminal`, or timeout -- returning the last status seen either way.
+    A 404 is swallowed rather than raised: a job pushed straight onto Redis
+    (bypassing generate(), as check-40-envelope.py's legacy-payload
+    assertions do) has no state hash until the worker creates one, so a 404
+    in the meantime is expected, not a failure.
+
+    check-40's and check-80's copies polled every 0.5s with a 30s default;
+    check-50-fair-queue.py's copy polled every 0.2s with a 60s default --
+    both kept as parameters rather than picking one, since a poll interval
+    is a real (if minor) timing difference between the original copies."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            last = client.get(f"/api/jobs/{job_id}").get("status")
+            if last in terminal:
+                return last
+        except urllib.error.HTTPError:
+            pass
+        time.sleep(interval)
+    return last
 
 
 # ---------------------------------------------------------------------------

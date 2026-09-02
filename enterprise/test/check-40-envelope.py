@@ -48,58 +48,19 @@ None of this exists yet: hub.py's lpush and worker_agent.py's payload[...]
 parsing are both exactly the two-key shape today, so every assertion below
 fails on HEAD.
 """
-import json, os, signal, sys, time, urllib.error, urllib.request, uuid
-import redis
+import json, os, signal, sys, time, uuid
 
-GW = "http://127.0.0.1:8100"
-QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
-failures = []
+from harness import GW, QUEUE_KEY, check, connect_redis, failures, poll_status as _poll_status, state_key
 
+get, post = GW.get, GW.post
 
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body):
-    req = urllib.request.Request(GW + path, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path):
-    return json.loads(urllib.request.urlopen(GW + path, timeout=10).read())
-
-
-def poll_status(job_id, terminal=("completed", "failed", "cancelled"), timeout=30):
-    """Poll /api/jobs/{id} until it reaches a terminal status. A job pushed
-    straight onto Redis (bypassing generate()) has no state hash until the
-    worker creates one, so a 404 in the meantime is expected, not a failure."""
-    deadline = time.time() + timeout
-    last = None
-    while time.time() < deadline:
-        try:
-            last = get(f"/api/jobs/{job_id}").get("status")
-            if last in terminal:
-                return last
-        except urllib.error.HTTPError:
-            pass
-        time.sleep(0.5)
-    return last
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
+r = connect_redis()
 
 agent_pid = int(sys.argv[1])
+
+
+def poll_status(job_id):
+    return _poll_status(GW, job_id, timeout=30, interval=0.5)
 WORKFLOW = {"3": {"class_type": "KSampler", "inputs": {}}}
 
 
