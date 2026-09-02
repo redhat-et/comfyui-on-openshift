@@ -104,60 +104,28 @@ succeed, only the accounting to have registered something. Running it before
       runs last and does not restart the agent it kills -- see above.
 """
 import json, os, signal, sys, time, urllib.error, urllib.request, uuid
-import redis
+
+from harness import (
+    COMFY, GW, anon_total, check, comfy_saw, connect_redis, excluded_total,
+    failures, showback as _showback, state_key, user_total, users_of,
+)
 
 sys.stdout.reconfigure(line_buffering=True)
 
-GW = "http://127.0.0.1:8100"
-COMFY = "http://127.0.0.1:8999"
+get, post = GW.get, GW.post
+
 SHOWBACK_PATH = "/api/showback"
 SHOWBACK_KEY_PATTERN = "comfy:showback:*"
-failures = []
 
-r = redis.from_url(
-    os.environ.get("REDIS_URL", "redis://127.0.0.1:6399/0"),
-    password=os.environ.get("REDIS_PASSWORD") or None,
-    decode_responses=True,
-)
-
-
-def check(name, cond, detail=""):
-    print(("  PASS  " if cond else "  FAIL  ") + name + ("  " + str(detail) if detail else ""))
-    if not cond:
-        failures.append(name)
-
-
-def post(path, body, headers=None, base=GW):
-    hdrs = {"Content-Type": "application/json"}
-    hdrs.update(headers or {})
-    req = urllib.request.Request(base + path, data=json.dumps(body).encode(), headers=hdrs)
-    return json.loads(urllib.request.urlopen(req, timeout=10).read())
-
-
-def get(path, base=GW):
-    return json.loads(urllib.request.urlopen(base + path, timeout=10).read())
-
-
-def state_key(job_id):
-    return f"comfy:job:{job_id}:state"
-
-
-def comfy_saw(probe):
-    """Has the stub ComfyUI actually been handed a workflow carrying this
-    node -- i.e. was real (simulated) GPU time actually spent? Mirrors
-    check-30-sigkill.py's helper of the same name."""
-    return probe in get("/__received__", base=COMFY)["nodes"]
+r = connect_redis()
 
 
 def submit(user, workflow):
     """Returns (job_id, submit_wallclock_time). user=None omits
     X-Forwarded-User entirely -- the ordinary AUTH_MODE=none, no-proxy shape
     that (3) below exercises."""
-    headers = {}
-    if user is not None:
-        headers["X-Forwarded-User"] = user
     t0 = time.time()
-    resp = post("/api/generate", {"workflow": workflow}, headers)
+    resp = GW.post("/api/generate", {"workflow": workflow}, user=user)
     return resp["job_id"], t0
 
 
@@ -178,43 +146,10 @@ def poll_state(job_id, timeout=40):
 
 
 def showback():
-    """The report as it stands right now. A missing/broken endpoint reads as
-    all-zero rather than raising, so callers below can take before/after
-    snapshots unconditionally -- the (0) assertion is what actually catches
-    the endpoint being absent; every later assertion is about the VALUES."""
-    try:
-        data = get(SHOWBACK_PATH)
-        if not isinstance(data, dict):
-            return {}
-    except Exception:  # noqa: BLE001
-        return {}
-    return data
-
-
-def users_of(data):
-    u = data.get("users")
-    return u if isinstance(u, dict) else {}
-
-
-def user_total(data, user):
-    try:
-        return float(users_of(data).get(user, 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def anon_total(data):
-    try:
-        return float(data.get("anonymous_gpu_seconds", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def excluded_total(data):
-    try:
-        return float(data.get("excluded_gpu_seconds", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    """The report as it stands right now -- harness.showback(), pinned to
+    SHOWBACK_PATH the way this file pins the rest of the /api/showback
+    interface."""
+    return _showback(GW, SHOWBACK_PATH)
 
 
 def slow_workflow(probe):
@@ -242,7 +177,7 @@ print("\n== (0) GET /api/showback exists and returns the report shape")
 
 endpoint_ok, endpoint_detail = True, None
 try:
-    raw = urllib.request.urlopen(GW + SHOWBACK_PATH, timeout=10).read()
+    raw = urllib.request.urlopen(GW.base_url + SHOWBACK_PATH, timeout=10).read()
     data0 = json.loads(raw)
     endpoint_ok = isinstance(data0, dict) and isinstance(data0.get("users"), dict) \
         and "anonymous_gpu_seconds" in data0 and "excluded_gpu_seconds" in data0
