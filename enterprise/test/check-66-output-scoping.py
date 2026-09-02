@@ -41,7 +41,9 @@ The workspaces are written to directly rather than through more jobs -- the
 system under test is who may READ a file, not how one gets written, and
 check-60 already owns that half.
 """
-import json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request, uuid
+import json, os, pathlib, struct, subprocess, sys, time, urllib.error, urllib.request, uuid
+
+import websocket
 
 from harness import GW, check, connect_redis, drain as _drain, failures
 
@@ -217,6 +219,61 @@ try:
     users = report.get("users", {}) if isinstance(report, dict) else {}
     check("under AUTH_MODE=none the report is unscoped, as documented",
           status == 200 and ALICE in users and BOB in users, (status, list(users)[:5]))
+
+    print("\n== (d) a job's state, its cancel, and its progress stream are the submitter's too")
+
+    # A job alice queued (through the shared gateway; both gateways read the
+    # same Redis, so the oauth one sees it). The hash names her, and under
+    # oauth that name is what /api/jobs, /cancel and /ws are scoped by: a
+    # stranger who has the id gets 403, or a 4403 close, not her error text
+    # and output URLs — and cannot end her render with a cancel.
+    status, resp = request("POST", "/api/generate", user=ALICE,
+                           body={"workflow": {"3": {"class_type": "KSampler", "inputs": {}}}})
+    alice_job = resp.get("job_id") if status == 200 and isinstance(resp, dict) else None
+    check("fixture: alice queued a job to scope by", bool(alice_job), (status, resp))
+
+    status, body = request("GET", f"/api/jobs/{alice_job}", base=OGW, user=BOB)
+    check("bob is refused alice's job state with 403 under AUTH_MODE=oauth", status == 403, status)
+
+    status, body = request("GET", f"/api/jobs/{alice_job}", base=OGW, user=ALICE)
+    check("alice reads her own job state (200, and it names her)",
+          status == 200 and isinstance(body, dict) and body.get("user") == ALICE, (status, body))
+
+    status, body = request("GET", f"/api/jobs/{alice_job}", base=OGW, user=OPERATOR)
+    check("an operator reads any job state", status == 200, status)
+
+    status, body = request("POST", f"/api/jobs/{alice_job}/cancel", base=OGW, user=BOB)
+    check("bob cannot cancel alice's job (403)", status == 403, status)
+
+    def close_code(user):
+        ws = websocket.WebSocket()
+        ws.connect(f"ws://127.0.0.1:{OGW_PORT}/ws/{alice_job}", timeout=10,
+                   header=[f"X-Forwarded-User: {user}"])
+        try:
+            frame = ws.recv_frame()
+            if frame.opcode == websocket.ABNF.OPCODE_CLOSE and len(frame.data) >= 2:
+                return struct.unpack("!H", frame.data[:2])[0]
+            return f"open (opcode {frame.opcode})"
+        finally:
+            try:
+                ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    check("bob's socket on alice's job is closed with 4403 before any event",
+          close_code(BOB) == 4403, close_code(BOB))
+
+    # Her own socket stays open: the first frame is an event, not a close.
+    own = close_code(ALICE)
+    check("alice's own socket on her job is not closed",
+          isinstance(own, str) and own.startswith("open"), own)
+
+    status, body = request("GET", f"/api/jobs/{alice_job}", base=GW, user=BOB)
+    check("under AUTH_MODE=none job state is unscoped, as documented", status == 200, status)
+
+    status, _ = request("POST", f"/api/jobs/{alice_job}/cancel", base=OGW, user=ALICE)
+    check("alice cancels her own job (200)", status == 200, status)
+    drain(alice_job)
 
 finally:
     ogw.terminate()

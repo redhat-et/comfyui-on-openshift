@@ -141,6 +141,16 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: openshift-keda
+        # Host-network traffic: OpenShift labels a synthetic namespace with
+        # this key so a policy can admit anything arriving from a node's own
+        # address — a router running host-networked (not the ROSA default,
+        # but a supported one), and kubelet probe traffic on a CNI that does
+        # not already exempt it (OVN-Kubernetes, ROSA's, does). The gateway
+        # sits behind oauth-proxy on 8443 and binds 8000 to loopback under
+        # oauth, so this admits nothing the Route does not already.
+        - namespaceSelector:
+            matchLabels:
+              policy-group.network.openshift.io/host-network: ""
       ports:
         # 8443 is the oauth-proxy sidecar (AUTH_MODE=oauth), 8000 the gateway
         # itself (AUTH_MODE=none). Both are listed because which one is live

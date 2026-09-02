@@ -109,6 +109,12 @@ if [[ "$AGENT_DISABLED" == "1" ]]; then
     exit_code=$?
 else
     echo "[start] launching agent"
+    # The liveness probe reads this file's age; created here so the age is
+    # "since the agent was launched" from the first probe onward, rather than
+    # an arithmetic error on a missing file while the agent is still
+    # connecting to Redis. An agent that never gets as far as its first
+    # heartbeat is then caught by the same 120-second rule as a wedged one.
+    : > "${AGENT_LIVENESS_FILE:-/tmp/comfy-agent-alive}"
     python3 "${COMFY_ROOT}/worker_agent.py" &
     agent_pid=$!
 

@@ -42,6 +42,7 @@ itself starts, nothing else.
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -52,6 +53,13 @@ import redis
 import websocket
 
 from worker_ids import heartbeat_keys
+
+# run.sh runs each check under `timeout`, which sends SIGTERM; Python's default
+# for SIGTERM is to die without unwinding, so a check's `finally` (releasing
+# the stub's execution lock, stopping an extra agent) never ran on a timeout.
+# Raising SystemExit instead lets those cleanups run and keeps the exit code
+# non-zero, which is all run.sh reads.
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 
 # ---------------------------------------------------------------------------
 # Environment run.sh exports for every check (enterprise/test/README.md's

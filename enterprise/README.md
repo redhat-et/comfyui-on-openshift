@@ -166,8 +166,10 @@ authenticated username into the job state, so `GET /api/jobs/<id>` answers
 
 Under `oauth` that identity also scopes what a caller can read: `/outputs/...`
 serves only files inside the caller's own workspace (anyone else's is a 403),
+`GET /api/jobs/<id>`, `POST /api/jobs/<id>/cancel` and `/ws/<id>` answer only
+the job's submitter (a stranger holding the id gets a 403, or a 4403 close),
 and `/api/showback` returns only the caller's row and the pool totals unless
-they are in `SHOWBACK_OPERATORS`. Under `none` neither is scoped, because the
+they are in `SHOWBACK_OPERATORS`, who pass everywhere. Under `none` nothing is scoped, because the
 identity is a header the caller wrote. The workspace a user lands in is a
 pure function of their username — an allowlist slug plus twelve hex of its
 `sha256`, computed after NFC-normalising the string so that the composed and

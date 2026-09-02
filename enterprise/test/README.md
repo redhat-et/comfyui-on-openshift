@@ -20,7 +20,7 @@ asserts. `CONTRIBUTING.md` says the same thing; the requirements file says why.
 the parsing edge cases and the lint fixtures), 210 pytest cases under
 `enterprise/test/unit/` against the pure functions in both Python files
 (`python3 -m pytest enterprise/test/unit`, under a second), and then this
-suite — 369 end-to-end assertions across 21 check files, in about a minute.
+suite — 378 end-to-end assertions across 21 check files, in about a minute.
 
 ## What it measures, separately
 
@@ -267,6 +267,14 @@ before a byte of it is read, a POST whose `Content-Type` is not
 said, so a `text/plain` cross-site form post could queue a job — and a
 WebSocket for a job id that names nothing is closed with code 4404 instead of
 being parked on a ping loop holding a Redis connection forever.
+
+**A job is its submitter's, not just its outputs** (`check-66`, part d).
+Under `AUTH_MODE=oauth`, `GET /api/jobs/<id>` and `POST /api/jobs/<id>/cancel`
+answer a stranger with 403 and `/ws/<id>` closes their socket with 4403 before
+the first event — the stream carries the job's error text and output URLs,
+and the cancel would have ended somebody else's render. The submitter and a
+`SHOWBACK_OPERATORS` member get all three; under `none` none of it is scoped,
+as for `/outputs`.
 
 **Three limits hold under pressure, not just in prose**
 (`check-15-gateway-limits.py`). Each is proven against a dedicated gateway

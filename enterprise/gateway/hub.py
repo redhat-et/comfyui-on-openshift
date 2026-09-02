@@ -36,6 +36,7 @@ import os
 import pathlib
 import re
 import unicodedata
+from urllib.parse import quote
 import time
 import uuid
 
@@ -60,6 +61,12 @@ MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "500"))
 # erases every job the instant it creates it and reports nothing wrong.
 if EVENT_STREAM_TTL <= 0:
     raise ValueError(f"EVENT_STREAM_TTL must be a positive number of seconds, got {EVENT_STREAM_TTL}")
+
+# Likewise: the fair-enqueue script reads 0 as "no ceiling" while the reaper's
+# requeue gate reads it as "always full", so a zero would accept every submit
+# and refuse every retry. There is no unbounded mode; refuse the value instead.
+if MAX_QUEUE_DEPTH <= 0:
+    raise ValueError(f"MAX_QUEUE_DEPTH must be a positive number of jobs, got {MAX_QUEUE_DEPTH}")
 
 # The queue carries an ordering record and the workflow itself sits beside it
 # at payload_key(job_id) — see BEGIN SHARED ENVELOPE. This is the backstop on
@@ -2166,30 +2173,67 @@ async def generate(request: Request):
 
 
 @app.get("/api/jobs/{job_id}")
-async def job_state(job_id: str):
+async def job_state(job_id: str, request: Request):
+    """
+    Under AUTH_MODE=oauth only the submitter (or a SHOWBACK_OPERATORS member)
+    may read a job: the hash names its user, and the same rule that keeps
+    /outputs to one workspace keeps a job's status, error text and output
+    URLs to the person who queued it. Under AUTH_MODE=none identity is a
+    header the caller sets on themselves, so nothing is scoped — see
+    output_file() for the argument.
+    """
     state = await client().hgetall(state_key(job_id))
 
     if not state:
         raise HTTPException(404, "unknown or expired job")
 
+    require_job_access(state, caller_identity(request))
+
     return state
 
 
+def require_job_access(state: dict, caller: str) -> None:
+    """
+    403 unless `caller` may act on the job whose state hash is `state`, under
+    the scoping rules job_state() describes. A job with no recorded user
+    (submitted before the identity field existed, or with an empty header)
+    is readable by anyone: refusing it would strand its own submitter, and it
+    names nobody to protect. Operators pass everywhere, as for showback.
+    """
+    if AUTH_MODE != AUTH_MODE_OAUTH:
+        return
+
+    owner = state.get("user", "")
+
+    if not owner or caller == owner or caller in SHOWBACK_OPERATORS:
+        return
+
+    raise HTTPException(403, "not your job")
+
+
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel(job_id: str):
+async def cancel(job_id: str, request: Request):
     """
     Cooperative cancel. Sets a flag the worker checks between events; a job that
     has not been picked up yet never starts. This does not interrupt a sampler
     mid-step — ComfyUI's own /interrupt would, but the workers are not
     reachable from here by design.
+
+    Scoped like job_state(): under AUTH_MODE=oauth a stranger who has a job
+    id cannot end somebody else's render with it.
     """
     conn = client()
 
     # 404 unknown ids rather than HSET-ing them into existence: a fresh hash
     # created here would have no TTL, so cancelling made-up ids would grow
-    # Redis one permanent key per request.
-    if not await conn.exists(state_key(job_id)):
+    # Redis one permanent key per request. The read doubles as the ownership
+    # check's source.
+    state = await conn.hgetall(state_key(job_id))
+
+    if not state:
         raise HTTPException(404, "unknown or expired job")
+
+    require_job_access(state, caller_identity(request))
 
     await conn.hset(state_key(job_id), CANCEL_REQUESTED_FIELD, "1")
 
@@ -2214,6 +2258,8 @@ TERMINAL_TYPES = {"completed", "failed", "cancelled"}
 # Application close codes (the 4000-4999 range the RFC leaves to us), so a
 # browser can tell these apart from a gateway that went away (1006).
 WS_CLOSE_UNKNOWN_JOB = 4404   # no such job, or it expired
+WS_CLOSE_FORBIDDEN = 4403      # somebody else's job, under AUTH_MODE=oauth
+WS_CLOSE_TRY_LATER = 1013      # RFC 6455 "try again later": Redis was unreachable
 WS_CLOSE_LIFETIME = 4408      # held open for EVENT_STREAM_TTL; reconnect if you still care
 
 # How long one XREAD may block before the loop sends a ping. The ping is
@@ -2253,8 +2299,27 @@ async def progress(websocket: WebSocket, job_id: str):
     # blocked on a key that no longer exists. A client that still cares
     # reconnects and replays, exactly as it would after any other close.
     try:
-        if not await conn.exists(state_key(job_id)):
+        # Outside the tail loop's own RedisError retry below, so a Redis blip
+        # here must not fall through to the generic handler that tells the
+        # browser "failed" about a job a worker is running: close with the
+        # standard "try again later" code and let the client reconnect.
+        try:
+            state = await conn.hgetall(state_key(job_id))
+        except redis.RedisError:
+            await websocket.close(code=WS_CLOSE_TRY_LATER, reason="redis unavailable; reconnect")
+            return
+
+        if not state:
             await websocket.close(code=WS_CLOSE_UNKNOWN_JOB, reason="unknown or expired job")
+            return
+
+        # Same rule as job_state(): under AUTH_MODE=oauth the stream — which
+        # carries the job's output URLs and its error text — is the
+        # submitter's, and a stranger holding the id gets a close, not a tail.
+        try:
+            require_job_access(state, envelope_text(websocket.headers.get("x-forwarded-user", "")))
+        except HTTPException:
+            await websocket.close(code=WS_CLOSE_FORBIDDEN, reason="not your job")
             return
 
         deadline = time.monotonic() + EVENT_STREAM_TTL
@@ -2332,7 +2397,9 @@ def output_url(subfolder, filename) -> str | None:
     if not all(is_bare_filename(part) for part in [filename, *components]):
         return None
 
-    return "/".join(["/outputs", *components, filename])
+    # Percent-encoded the way collect_outputs() encodes the terminal event's
+    # URLs, so a '#' or a space in a filename does not truncate the request.
+    return "/".join(["/outputs", *(quote(part, safe="") for part in [*components, filename])])
 
 
 def rewrite_image_urls(event: dict) -> dict:

@@ -146,6 +146,12 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
 EVENT_STREAM_TTL = int(os.environ.get("EVENT_STREAM_TTL", "3600"))
 
+# Refused at import, as hub.py refuses it: the executing claim's EXPIRE with a
+# non-positive TTL deletes the state hash at the instant of the claim, and the
+# reaper then reads an empty hash for a job that is running.
+if EVENT_STREAM_TTL <= 0:
+    raise ValueError(f"EVENT_STREAM_TTL must be a positive number of seconds, got {EVENT_STREAM_TTL}")
+
 COMFY_HOST = os.environ.get("COMFY_HOST", "127.0.0.1")
 COMFY_PORT = int(os.environ.get("COMFY_PORT", "8188"))
 COMFY_ADDR = f"{COMFY_HOST}:{COMFY_PORT}"
@@ -910,6 +916,11 @@ shutting_down = False
 # exits non-zero instead of taking another job. See await_comfy_idle() for
 # why exiting is the only honest option.
 comfy_wedged = False
+
+# Set by interrupt(), cleared by await_comfy_idle(): whether the prompt the
+# idle wait is confirming was one this agent abandoned. It decides what an
+# UNREADABLE /queue means at the deadline — see await_comfy_idle().
+interrupt_sent = False
 
 
 def log(message: str) -> None:
@@ -2027,6 +2038,10 @@ def collect_outputs(prompt_id: str, workspace: str) -> dict:
 
 
 def interrupt() -> None:
+    global interrupt_sent
+
+    interrupt_sent = True
+
     try:
         urllib.request.urlopen(
             urllib.request.Request(f"http://{COMFY_ADDR}/interrupt", data=b"{}"), timeout=10
@@ -2067,19 +2082,38 @@ def await_comfy_idle(job_id: str, prompt_id: str) -> None:
     answer is not one to hand the next job to either, and in the pod that
     case ends the container through start.sh regardless.
     """
-    global comfy_wedged
+    global comfy_wedged, interrupt_sent
 
+    after_interrupt, interrupt_sent = interrupt_sent, False
     deadline = time.time() + INTERRUPT_DRAIN_TIMEOUT
+    readable = False
 
     while time.time() < deadline:
         try:
-            if comfy_idle():
+            idle = comfy_idle()
+            readable = True
+
+            if idle:
                 return
 
         except Exception:  # noqa: BLE001 - unreadable is not idle; see above
             pass
 
         time.sleep(0.5)
+
+    # The one case that is not a wedge: nothing was interrupted, and /queue
+    # never answered — ComfyUI is busy with something other than a prompt
+    # (freeing VRAM after a large model, a custom node pinning the event
+    # loop on unload). A prompt that was never abandoned cannot be the thing
+    # it is stuck on, and exiting here would cost the pool a warm card for a
+    # cold start over an HTTP pause. The liveness probe, which asks the same
+    # server, is the judge of a pause that does not end; the next submit
+    # fails loudly on its own if it has not.
+    if not after_interrupt and not readable:
+        log(f"job {job_id}: ComfyUI's /queue did not answer for "
+            f"{INTERRUPT_DRAIN_TIMEOUT}s after prompt {prompt_id} completed — "
+            f"carrying on; the liveness probe decides whether this is a pause")
+        return
 
     comfy_wedged = True
     log(f"job {job_id}: ComfyUI is still executing prompt {prompt_id} "

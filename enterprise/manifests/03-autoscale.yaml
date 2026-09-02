@@ -135,18 +135,21 @@ spec:
     #
     # Every value here is substituted by enterprise/setup.sh from .env, by KEY
     # rather than by matching the default beside it, for the same reason
-    # maxReplicaCount is. desiredReplicas: "0" is the off position, and
-    # setup.sh removes this whole trigger rather than sending a zero — KEDA's
-    # cron scaler wants a positive number, and a floor of nobody is better
-    # expressed by not having a floor.
-    - type: cron
-      metadata:
-        # An IANA zone name, or UTC. It is the operator's working day this is
-        # describing, so it is the one setting here that is usually wrong on
-        # the default: a floor that warms at 09:00 UTC is a floor that warms at
-        # 04:00 for a team in New York.
-        timezone: UTC
-        start: "0 9 * * 1-5"
-        end: "0 18 * * 1-5"
-        desiredReplicas: "0"
+    # maxReplicaCount is. The trigger is committed COMMENTED OUT, behind the
+    # `#WARM ` prefix: KEDA's cron scaler wants a positive desiredReplicas, so
+    # a file that anyone can `oc apply -f` directly must not carry a zero, and
+    # a floor of nobody is better expressed by not having a floor. setup.sh
+    # strips the prefix when WARM_WORKERS > 0 and substitutes the values;
+    # when it is 0 this whole block is dropped.
+    #
+    # timezone: an IANA zone name, or UTC. It is the operator's working day
+    # this is describing, so it is the one setting here that is usually wrong
+    # on the default: a floor that warms at 09:00 UTC is a floor that warms at
+    # 04:00 for a team in New York.
+    #WARM - type: cron
+    #WARM   metadata:
+    #WARM     timezone: UTC
+    #WARM     start: "0 9 * * 1-5"
+    #WARM     end: "0 18 * * 1-5"
+    #WARM     desiredReplicas: "1"
     # END WARM FLOOR

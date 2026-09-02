@@ -95,17 +95,17 @@ def test_output_url_none_on_non_string_inputs(hub_module):
     assert hub_module.output_url(123, "out.png") is None
 
 
-def test_output_url_percent_encoded_separator_in_a_component_still_builds_a_url(hub_module):
-    """Same documented gap as is_bare_filename() above, one layer up: a
-    subfolder component of the literal string "%2e%2e" is not rejected by
-    output_url() either, because it delegates entirely to is_bare_filename().
-    The URL this produces is /outputs/%2e%2e/out.png -- inert unless
-    something downstream decodes it before re-checking containment; hub.py's
-    own /outputs/{path:path} route receives an already-decoded path from
-    Starlette and re-resolves it against OUTPUT_ROOT in locate_output(), so
-    this is not independently exploitable through the URL alone. Recorded
-    here as what output_url() does, not what locate_output() promises."""
-    assert hub_module.output_url("%2e%2e", "out.png") == "/outputs/%2e%2e/out.png"
+def test_output_url_percent_encodes_each_component(hub_module):
+    """A subfolder component of the literal string "%2e%2e" passes
+    is_bare_filename() (it spells no separator), so output_url() must not hand
+    it to the browser as-is: Starlette decodes the request path once, and an
+    undecoded "%2e%2e" would arrive at locate_output() as ".." -- which
+    resolve() then contains, but only because a second layer caught it. The
+    builder encodes every component the way collect_outputs() encodes the
+    terminal event's URLs, so the literal survives the round trip as the
+    literal, and a space or '#' in a filename does not truncate the request."""
+    assert hub_module.output_url("%2e%2e", "out.png") == "/outputs/%252e%252e/out.png"
+    assert hub_module.output_url("", "a b#1.png") == "/outputs/a%20b%231.png"
 
 
 # ---------------------------------------------------------------------------

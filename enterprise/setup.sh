@@ -483,12 +483,17 @@ ok "workers select ${GPU_NODE_LABEL}"
 render_scaled_object()
 {
     if (( WARM_WORKERS > 0 )); then
+        # The trigger ships commented out behind `#WARM ` (see the manifest);
+        # the first expression strips that prefix, and the rest substitute
+        # into the lines it just uncovered — sed applies its expressions in
+        # order to each line, so the order here is load-bearing.
         sed -E \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s/^([[:space:]]*)#WARM /\1/" \
             -e "s/^([[:space:]]*maxReplicaCount:).*/\1 ${EFFECTIVE_MAX_WORKERS}/" \
-            -e "s/^([[:space:]]*desiredReplicas:).*/\1 \"${WARM_WORKERS}\"/" \
-            -e "s|^([[:space:]]*start:).*|\1 \"${WARM_START}\"|" \
-            -e "s|^([[:space:]]*end:).*|\1 \"${WARM_END}\"|" \
-            -e "s|^([[:space:]]*timezone:).*|\1 ${WARM_TIMEZONE}|" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s/^([[:space:]]*desiredReplicas:).*/\1 \"${WARM_WORKERS}\"/" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s|^([[:space:]]*start:).*|\1 \"${WARM_START}\"|" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s|^([[:space:]]*end:).*|\1 \"${WARM_END}\"|" \
+            -e "/# BEGIN WARM FLOOR/,/# END WARM FLOOR/ s|^([[:space:]]*timezone:).*|\1 ${WARM_TIMEZONE}|" \
             "${MANIFESTS}/03-autoscale.yaml"
     else
         sed -E \

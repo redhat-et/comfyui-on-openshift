@@ -72,14 +72,17 @@ jobs:
 
       - name: kustomize build manifests/base
         run: |
-          # kustomize ships preinstalled on the ubuntu-latest runner image
-          # (actions/runner-images), so no install step here. enterprise/
+          # `kubectl kustomize` rather than a standalone kustomize: kubectl is
+          # on every ubuntu runner image, the kustomize binary is not on
+          # ubuntu-24.04, and scripts/05-deploy.sh applies this same overlay
+          # with `oc apply -k`, i.e. the kubectl-embedded kustomize — so this
+          # also builds it with the implementation that ships. enterprise/
           # manifests has no kustomization.yaml — those are applied directly,
           # not through an overlay — so only manifests/base has a build to
           # validate; the rendered output is fed back through kubeconform so
           # a kustomize-only mistake (e.g. a patch producing something the
           # raw files don't show) is still schema-checked.
-          kustomize build manifests/base | kubeconform -strict -ignore-missing-schemas -summary
+          kubectl kustomize manifests/base | kubeconform -strict -ignore-missing-schemas -summary
 
       - name: make lint
         run: make lint
@@ -101,7 +104,11 @@ jobs:
           # two places that can drift. enterprise/test/unit's own
           # requirements-test.txt adds pytest, pinned separately because it
           # is a test-only dependency neither shipped image needs.
-          python3 -m pip install --quiet \
+          # pyyaml: scripts/unit-tests.sh runs the real lint.sh against its
+          # manifest fixtures, and lint.sh skips every manifest rule without
+          # it — which would fail those fixtures for a reason unrelated to
+          # the change.
+          python3 -m pip install --quiet pyyaml \
             -r enterprise/gateway/requirements.txt \
             -r enterprise/worker/requirements.txt \
             -r enterprise/test/unit/requirements-test.txt

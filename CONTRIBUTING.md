@@ -19,14 +19,13 @@ round trip, `workspace_name()`'s hostile-input and unicode handling, and the
 Dec→Jan/leap-Feb calendar-month math behind quotas and showback, under a
 second), then the shell unit tests (`scripts/unit-tests.sh` — instant, no
 dependencies, pins the parsing edge cases like AWS CLI's tab-separated
-output), then the pytest layer (`enterprise/test/unit/`, the pure functions
-in both Python files, under a second), then the e2e suite.
+output), then the e2e suite.
 
 Install from the requirements file rather than a bare `pip install redis` —
 the `redis<7` pin is load-bearing (redis-py 8 breaks blocking reads; the
 requirements file says why).
 
-40 shell unit assertions, 210 pytest cases, and 369 end-to-end assertions
+40 shell unit assertions, 210 pytest cases, and 378 end-to-end assertions
 across 21 check files, in about a minute. `enterprise/test/README.md`
 explains what each one is defending against and why. Run it before sending a
 change to `hub.py` or `worker_agent.py`.

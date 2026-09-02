@@ -655,7 +655,7 @@ are the same ones CI invokes, so local and CI cannot drift. `nightly.yaml`
 does for the two GPU images what a PR job cannot afford to.
 
 `make test` runs 40 shell unit assertions, 210 pytest cases against the pure
-functions in both Python files, and 369 end-to-end assertions across 21 check
+functions in both Python files, and 378 end-to-end assertions across 21 check
 files — the real gateway and the real worker agent against a real Redis and a
 stub ComfyUI, in about a minute. The count is the least interesting thing
 about it. **An assertion nobody has watched fail is a decoration, and this

@@ -667,7 +667,7 @@ They are the two bins that are **checkable**, and checking is cheaper than
 arguing:
 
 - **The assertions have been mutation-tested, and some of them failed that
-  test.** `make test` runs 40 shell unit assertions, 369 in the end-to-end
+  test.** `make test` runs 40 shell unit assertions, 378 in the end-to-end
   suite across 21 check files, and 210 pytest cases against the pure functions —
   and the count is the least interesting thing about it. Assertions here have
   been caught unable to fail, each found by someone deliberately breaking the

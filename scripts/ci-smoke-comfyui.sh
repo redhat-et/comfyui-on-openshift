@@ -74,8 +74,13 @@ COMFYUI_SMOKE_REF="$(grep '^COMFYUI_REF=' "${REPO_ROOT}/.env.example" | cut -d= 
 
 log "ComfyUI $COMFYUI_SMOKE_REF on CPU"
 
-git clone --quiet --depth 1 --branch "$COMFYUI_SMOKE_REF" \
-    https://github.com/comfyanonymous/ComfyUI.git "${WORK}/ComfyUI"
+# init + fetch + checkout rather than `git clone --branch`, for the reason the
+# Containerfiles give: --branch takes a branch or tag and refuses a commit,
+# and COMFYUI_REF is a commit now. This accepts either.
+git init -q "${WORK}/ComfyUI"
+git -C "${WORK}/ComfyUI" fetch --quiet --depth 1 \
+    https://github.com/comfyanonymous/ComfyUI.git "$COMFYUI_SMOKE_REF"
+git -C "${WORK}/ComfyUI" checkout -q FETCH_HEAD
 
 # Same three version numbers app/Containerfile (and enterprise/worker/
 # Containerfile) install via TORCH_VERSION/TORCHVISION_VERSION/
