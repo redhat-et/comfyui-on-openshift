@@ -49,7 +49,7 @@ naive join would resolve to.
     subfolder is the only field ComfyUI's own save nodes use to nest, so a
     slash inside filename itself is never legitimate.
 """
-import json, os, pathlib, sys, urllib.request
+import json, os, pathlib, stat, sys, urllib.request
 import websocket
 
 GW = "http://127.0.0.1:8100"
@@ -316,6 +316,42 @@ mallory_dirs = [d for d in OUTPUT_ROOT.iterdir()
 stolen = [p for d in mallory_dirs for p in d.rglob("private_0001.png")]
 check("nothing under this submitter's own workspace now holds the victim's file",
       stolen == [], stolen)
+
+# ---------------------------------------------------------------------------
+# (h) a subfolder carrying a '..' component is refused per component -- even
+#     one that resolves back INSIDE OUTPUT_ROOT
+# ---------------------------------------------------------------------------
+print("\n== (h) a subfolder with a '..' component is refused, even one that resolves inside OUTPUT_ROOT")
+
+# The old check resolved the whole reported path and asked "still inside
+# OUTPUT_ROOT?" -- which a subfolder of "../<OUTPUT_ROOT's own name>" passes,
+# since it resolves to OUTPUT_ROOT itself. But the DESTINATION the file was
+# then moved to was built by joining the raw subfolder under the workspace,
+# and ensure_workspace() walked that unnormalised path part by part: it
+# chmod'ed OUTPUT_ROOT itself on the way through the "..", created a sibling
+# of every workspace at the root, and moved the file there -- outside the
+# submitter's workspace, under a URL whose ".." the gateway happily resolves.
+seed_output()
+root_mode_before = stat.S_IMODE(OUTPUT_ROOT.stat().st_mode)
+dotdot_subfolder = f"../{OUTPUT_ROOT.name}"
+set_next_output("out_0001.png", subfolder=dotdot_subfolder)
+job_id, terminal = submit_and_wait("rita")
+check("the job still completes", terminal and terminal["type"] == "completed", terminal)
+images = (terminal or {}).get("data", {}).get("images", [])
+check("no image is reported for a subfolder containing '..' -- refused per "
+      "component, before anything is resolved, moved or created",
+      images == [], images)
+check("no '..' appears in any URL this job reported",
+      all(".." not in (img.get("url") or "") for img in images), images)
+check("OUTPUT_ROOT's own mode was not touched -- ensure_workspace() never "
+      "walked through the '..'",
+      stat.S_IMODE(OUTPUT_ROOT.stat().st_mode) == root_mode_before,
+      (oct(root_mode_before), oct(stat.S_IMODE(OUTPUT_ROOT.stat().st_mode))))
+check("no directory named after OUTPUT_ROOT was created inside it -- the "
+      "'sibling of every workspace' the unnormalised join used to produce",
+      not (OUTPUT_ROOT / OUTPUT_ROOT.name).exists(), OUTPUT_ROOT / OUTPUT_ROOT.name)
+check("and the file is still where it was, not moved out of the workspace tree",
+      (OUTPUT_ROOT / "out_0001.png").exists(), OUTPUT_ROOT / "out_0001.png")
 
 print()
 if failures:

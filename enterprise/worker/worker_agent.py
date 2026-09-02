@@ -1061,10 +1061,26 @@ def set_shared_mode(path: pathlib.Path) -> None:
 
 
 def ensure_workspace(path: pathlib.Path) -> None:
-    """Create every level below OUTPUT_ROOT, each with the explicit mode."""
+    """
+    Create every level below OUTPUT_ROOT, each with the explicit mode.
+
+    Only ever for a path that is already resolved and inside OUTPUT_ROOT, and
+    that is asserted rather than assumed: this walks `path` one component at
+    a time and chmods each one, so a ".." anywhere in it walks UP — the
+    caller that once let one through (output_subfolder(), before the
+    per-component rule below) had this function chmod OUTPUT_ROOT itself and
+    then create a sibling of every workspace at the root. relative_to()
+    raises for a path outside OUTPUT_ROOT; the component check is for a path
+    that stays inside it only because the ".." is cancelled by what follows.
+    """
+    relative = path.relative_to(OUTPUT_ROOT)
+
+    if not all(is_bare_filename(part) for part in relative.parts):
+        raise ValueError(f"refusing to create {path}: not a resolved path under {OUTPUT_ROOT}")
+
     current = OUTPUT_ROOT
 
-    for part in path.relative_to(OUTPUT_ROOT).parts:
+    for part in relative.parts:
         current = current / part
 
         try:
@@ -1175,6 +1191,36 @@ def is_bare_filename(name: str) -> bool:
     return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
 
 
+def is_confined_subfolder(subfolder: str) -> bool:
+    """
+    True iff every component of a reported `subfolder` is a bare path
+    component by the rule above — so no "..", no ".", no empty run, no
+    backslash, no NUL. Empty (no subfolder at all) is the common case and is
+    fine.
+
+    Per component, and BEFORE anything is resolved, because resolving the
+    whole path and asking "still inside OUTPUT_ROOT?" is the wrong question:
+    "../<OUTPUT_ROOT's own name>" resolves to OUTPUT_ROOT and passes it, and
+    the destination the file is then moved to is built by joining the raw
+    string under the workspace — where the ".." walks back out of it.
+    ComfyUI's own save nodes normalise the subfolder they report, so one that
+    fails this is not ComfyUI's shape and is refused, not repaired.
+    """
+    return all(is_bare_filename(part) for part in subfolder.split("/")) if subfolder else True
+
+
+# The shape of a workspace directory name, for telling "a file some node left
+# in the shared root" apart from "a file inside somebody else's workspace".
+# Mirrors what workspace_name() emits: a lowercase slug, "-", twelve hex
+# digits — or the anonymous workspace. A shared-root subfolder a custom node
+# hardcodes ("video/", "upscaled/") does not look like this.
+WORKSPACE_SHAPE = re.compile(r"[a-z0-9][a-z0-9-]*-[0-9a-f]{%d}" % WORKSPACE_DIGEST_CHARS)
+
+
+def looks_like_workspace(name: str) -> bool:
+    return name == ANON_WORKSPACE or WORKSPACE_SHAPE.fullmatch(name) is not None
+
+
 def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str, str]:
     """
     Where this output actually lives, relative to OUTPUT_ROOT, and the bare
@@ -1203,6 +1249,10 @@ def output_subfolder(workspace: str, subfolder: str, filename: str) -> tuple[str
 
     if not is_bare_filename(filename):
         log(f"warning: output filename {filename!r} is not a bare filename — not served")
+        return workspace, ""
+
+    if not is_confined_subfolder(subfolder):
+        log(f"warning: output subfolder {subfolder!r} is not a plain relative path — not served")
         return workspace, ""
 
     try:
