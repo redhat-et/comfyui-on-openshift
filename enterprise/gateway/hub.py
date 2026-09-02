@@ -114,6 +114,28 @@ MAX_JOB_RETRIES = int(os.environ.get("MAX_JOB_RETRIES", "1"))
 OUTPUT_ROOT = pathlib.Path(os.environ.get("OUTPUT_ROOT", "/output")).resolve()
 STATIC_ROOT = pathlib.Path(__file__).parent / "static"
 
+# How the gateway is exposed — enterprise/setup.sh's AUTH_MODE, which the
+# manifests pass through to this container. "oauth" means oauth-proxy is in
+# front: X-Forwarded-User is set by the proxy from a real login, and whatever
+# the client sent under that name was stripped. "none" means the gateway is
+# reached directly and the same header is the client's own claim about
+# itself. Two endpoints take an authorization decision on that header —
+# output_file() and showback() — and they take it ONLY under oauth: under
+# none the identity is client-supplied, so a scope on it would be a control
+# that evaporates in one of the two supported modes, and both docstrings say
+# so. Unset reads as none, the mode in which nothing is scoped, because a
+# gateway that has not been told how it is exposed must not pretend to know.
+AUTH_MODE = os.environ.get("AUTH_MODE", "none").strip().lower()
+AUTH_MODE_OAUTH = "oauth"
+
+# Who may read every submitter's row of /api/showback under AUTH_MODE=oauth: a
+# comma-separated list of identities, spelled exactly as oauth-proxy puts them
+# in X-Forwarded-User. Everyone else sees their own row and the pool totals.
+# Unset means nobody is an operator — the report is still served, it just
+# names no one but the caller. Ignored under AUTH_MODE=none.
+SHOWBACK_OPERATORS = frozenset(
+    name.strip() for name in os.environ.get("SHOWBACK_OPERATORS", "").split(",") if name.strip())
+
 # How long one gather_stats() snapshot is served before the keyspace is
 # scanned again. index.html polls /api/stats every five seconds per open tab
 # and Prometheus scrapes /metrics, neither of them authenticated; without
@@ -740,6 +762,75 @@ def showback_accrue_call(state: str, destination: str,
     )
 
 # END SHARED SHOWBACK
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# BEGIN SHARED WORKSPACE — the submitter's directory name (docs/10-roadmap.md, Q3)
+#
+# worker_agent.py's BEGIN OUTPUT WORKSPACES gives every submitter one
+# directory under OUTPUT_ROOT, named from the envelope's `user`. This is the
+# NAMING half of that, and nothing else — the pure functions and the
+# constants they read. It is MIRRORED VERBATIM between enterprise/gateway/
+# hub.py and enterprise/worker/worker_agent.py for the same reason the
+# envelope and the showback accumulator are: hub.py's output_file() has to
+# compute the same name from the same identity to decide, under
+# AUTH_MODE=oauth, whether a caller is reading their own workspace, and
+# rewrite_image_urls() has to refuse the same filename shapes the worker
+# refuses — a gateway that spelled either rule differently would refuse
+# everyone their own files, or serve what the worker would not name, with
+# nothing failing anywhere to say so. scripts/lint.sh diffs the two copies
+# line for line. The directory mode, the prefix rewrite and everything that
+# touches the volume stay the worker's alone — the gateway mounts it
+# read-only.
+# ---------------------------------------------------------------------------
+
+# Where a job with no authenticated submitter goes. Deliberately not "" (which
+# would put anonymous output loose in the shared root again) and deliberately
+# not derivable from any username: a real workspace is always
+# "<slug>-<12 hex>", and the leading underscore is a character the slug rule
+# cannot emit, so "no user" can never alias onto whoever submits next.
+ANON_WORKSPACE = "_anonymous"
+
+# Everything outside the allowlist collapses to a single "-".
+WORKSPACE_UNSAFE = re.compile(r"[^A-Za-z0-9]+")
+
+# Bounds on the readable half. 40 + 1 + 12 is far below NAME_MAX (255) even
+# before hub.py's own 256-character clamp on the header.
+MAX_WORKSPACE_SLUG_CHARS = 40
+WORKSPACE_DIGEST_CHARS = 12
+
+
+def workspace_name(user: str) -> str:
+    """The submitter's directory name. Total, never raises, never rejects."""
+    if not user:
+        return ANON_WORKSPACE
+
+    slug = WORKSPACE_UNSAFE.sub("-", user).strip("-").lower()[:MAX_WORKSPACE_SLUG_CHARS]
+    digest = hashlib.sha256(user.encode("utf-8", "replace")).hexdigest()[:WORKSPACE_DIGEST_CHARS]
+
+    # .strip("-") again: the truncation above can leave a trailing separator.
+    # "user" when nothing readable survived — the digest still separates two
+    # such names from each other.
+    return f"{slug.strip('-') or 'user'}-{digest}"
+
+
+def is_bare_filename(name: str) -> bool:
+    """
+    True iff `name` is a single path component: no separator, no NUL, and not
+    "." or "..". This is the confinement rule for the REPORTED FILENAME,
+    mirroring what workspace_path() already enforces for the reported
+    workspace — a run of unsafe characters cannot be un-collapsed into a
+    traversal the way a raw "/" or ".." can.
+
+    ComfyUI's own manifest entries never put a separator in `filename`;
+    `subfolder` is the only field a save node uses to nest. So a `filename`
+    that fails this is not ComfyUI's own shape and is refused outright rather
+    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
+    """
+    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
+
+# END SHARED WORKSPACE
 # ---------------------------------------------------------------------------
 
 
@@ -2220,22 +2311,6 @@ async def progress(websocket: WebSocket, job_id: str):
             pass
 
 
-def is_bare_filename(name: str) -> bool:
-    """
-    True iff `name` is a single path component: no separator, no NUL, and not
-    "." or "..". This is the confinement rule for the REPORTED FILENAME,
-    mirroring what workspace_path() already enforces for the reported
-    workspace — a run of unsafe characters cannot be un-collapsed into a
-    traversal the way a raw "/" or ".." can.
-
-    ComfyUI's own manifest entries never put a separator in `filename`;
-    `subfolder` is the only field a save node uses to nest. So a `filename`
-    that fails this is not ComfyUI's own shape and is refused outright rather
-    than sanitized into something else — see FIX 4a, docs/10-roadmap.md.
-    """
-    return name not in ("", ".", "..") and "/" not in name and "\\" not in name and "\0" not in name
-
-
 def output_url(subfolder, filename) -> str | None:
     """The /outputs URL for one reported image, or None if it cannot be named
     safely: the filename and every subfolder component must pass the
@@ -2291,7 +2366,17 @@ def rewrite_image_urls(event: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def locate_output(path: str) -> pathlib.Path:
+def caller_identity(request: Request) -> str:
+    """
+    The X-Forwarded-User on this request, clamped exactly as generate() clamps
+    it before it reaches the envelope — so what output_file() and showback()
+    scope by is the identity the worker named the workspace from and the
+    accrual billed, not a longer string that happens to share a prefix.
+    """
+    return envelope_text(request.headers.get("x-forwarded-user", ""))
+
+
+def locate_output(path: str, workspace: str | None) -> pathlib.Path:
     """
     The file behind /outputs/<path>, or an HTTPException. Blocking, and meant
     to be: resolve() and is_file() each stat the shared volume, which is EFS,
@@ -2301,11 +2386,19 @@ def locate_output(path: str) -> pathlib.Path:
     The resolve()-and-compare is the only thing standing between this
     endpoint and an arbitrary file read: a path like ../../etc/passwd resolves
     outside OUTPUT_ROOT and is rejected. Do not "simplify" it into a join.
+
+    `workspace` is the caller's own directory name when reads are scoped, and
+    the containment is checked on the RESOLVED path rather than on the first
+    URL segment: /outputs/<mine>/../<theirs>/x names mine in its first segment
+    and theirs on disk.
     """
     candidate = (OUTPUT_ROOT / path).resolve()
 
     if not candidate.is_relative_to(OUTPUT_ROOT):
         raise HTTPException(403, "path escapes the output directory")
+
+    if workspace is not None and not candidate.is_relative_to(OUTPUT_ROOT / workspace):
+        raise HTTPException(403, "not one of your outputs")
 
     if not candidate.is_file():
         raise HTTPException(404, "no such output")
@@ -2314,9 +2407,31 @@ def locate_output(path: str) -> pathlib.Path:
 
 
 @app.get("/outputs/{path:path}")
-async def output_file(path: str):
-    """Serve a generated image from the shared volume."""
-    candidate = await run_in_threadpool(locate_output, path)
+async def output_file(path: str, request: Request):
+    """
+    Serve a generated image from the shared volume.
+
+    Under AUTH_MODE=oauth a caller may read only files inside their own
+    workspace — the directory workspace_name() derives from the identity
+    oauth-proxy put in X-Forwarded-User, which is the same directory the
+    worker wrote their outputs into (BEGIN SHARED WORKSPACE). Before this,
+    the workspace name was a pure function of a username /api/showback
+    listed, so any logged-in user could read any other user's images.
+
+    Under AUTH_MODE=none reads are deliberately NOT scoped, and this is the
+    same argument Q3's workspaces make: there is no proxy, the identity is a
+    header the caller sets on themselves, and a scope keyed on it would be
+    authorization derived from an unauthenticated claim — a control that
+    only pretends to exist. A URL is exactly as guessable there as it was
+    before the workspaces existed, and the docs say so rather than the code
+    implying otherwise.
+    """
+    workspace = None
+
+    if AUTH_MODE == AUTH_MODE_OAUTH:
+        workspace = workspace_name(caller_identity(request))
+
+    candidate = await run_in_threadpool(locate_output, path, workspace)
 
     return FileResponse(candidate)
 
@@ -2531,6 +2646,9 @@ async def showback_report(period: str) -> dict:
     return {
         "period": period,
         "users": users,
+        # The submitters' sum with no names attached, so a report scoped to
+        # one caller (showback() below) still says what the pool spent.
+        "users_total_gpu_seconds": round(sum(users.values()), 3),
         "anonymous_gpu_seconds": buckets[SHOWBACK_ANONYMOUS_FIELD],
         "excluded_gpu_seconds": buckets[SHOWBACK_EXCLUDED_FIELD],
         "other_gpu_seconds": buckets[SHOWBACK_OTHER_FIELD],
@@ -2542,13 +2660,25 @@ async def showback_report(period: str) -> dict:
     }
 
 
+def scoped_showback(report: dict, caller: str) -> dict:
+    """The same report with `users` cut down to the caller's own row. The
+    totals — including users_total_gpu_seconds — are left as they are: what
+    the pool spent is not a secret, who spent it is."""
+    users = report["users"]
+
+    return dict(report,
+                users={caller: users[caller]} if caller and caller in users else {},
+                scoped_to=caller or None)
+
+
 @app.get("/api/showback")
-async def showback(period: str | None = None):
+async def showback(request: Request, period: str | None = None):
     """
     Who spent the card this period, in GPU seconds.
 
         {"period": "2026-08",
          "users": {"alice@example.com": 4102.5, ...},
+         "users_total_gpu_seconds": 4102.5,
          "anonymous_gpu_seconds": 0.0,
          "excluded_gpu_seconds": 0.0,
          "other_gpu_seconds": 0.0,
@@ -2575,20 +2705,33 @@ async def showback(period: str | None = None):
     `make park` is safe — the cluster stays and so does the volume. See
     docs/09-engineering-handoff.md section 5.
 
-    Reads are not caller-scoped, deliberately and on the same terms as Q3's
-    output workspaces: under AUTH_MODE=oauth the whole gateway is behind the
-    proxy, and under AUTH_MODE=none the identity this would scope by is a
-    header the caller sets on themselves, so a guarantee that evaporates in
-    one of the two modes is worse than a documented absence. What this exposes
-    beyond /api/jobs/<id> is the LIST of submitters, which is why it is a
-    report an operator reads rather than something linked from the UI.
+    Who may read whose row follows AUTH_MODE, on the same terms as
+    output_file(). Under oauth the identity is the proxy's: a caller named in
+    SHOWBACK_OPERATORS gets the whole report, everyone else gets their own
+    row plus the totals (`scoped_to` says so). What the full report exposes
+    beyond /api/jobs/<id> is the LIST of submitters — and since a workspace
+    name is a pure function of a submitter's identity, that list was the
+    other half of reading someone else's outputs. Under none the report is
+    not scoped at all: the identity this would scope by is a header the
+    caller sets on themselves, and a guarantee that evaporates in one of the
+    two modes is worse than a documented absence.
     """
     period = period or showback_period(time.time())
 
     if not SHOWBACK_PERIOD_PATTERN.match(period):
         raise HTTPException(400, "period must be a UTC calendar month, e.g. 2026-08")
 
-    return await showback_report(period)
+    report = await showback_report(period)
+
+    if AUTH_MODE != AUTH_MODE_OAUTH:
+        return report
+
+    caller = caller_identity(request)
+
+    if caller in SHOWBACK_OPERATORS:
+        return report
+
+    return scoped_showback(report, caller)
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
