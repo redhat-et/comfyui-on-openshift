@@ -1,0 +1,8 @@
+# Review routing. GitHub requests a review from the matching owner on every
+# pull request that touches these paths; it does not block merges by itself
+# (that needs branch protection with "require review from Code Owners").
+#
+# One owner for everything until the project has more than one maintainer;
+# split by path (enterprise/gateway, enterprise/worker, scripts/, docs/) when
+# it does.
+*   @joyful-ii-V-I
