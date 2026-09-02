@@ -98,10 +98,21 @@ jobs:
           # websocket-client: the worker's requirements.txt already declares
           # websocket-client (what the checks use to talk to the gateway),
           # and its own redis<7 pin, kept here as one file to edit instead of
-          # two places that can drift.
+          # two places that can drift. enterprise/test/unit's own
+          # requirements-test.txt adds pytest, pinned separately because it
+          # is a test-only dependency neither shipped image needs.
           python3 -m pip install --quiet \
             -r enterprise/gateway/requirements.txt \
-            -r enterprise/worker/requirements.txt
+            -r enterprise/worker/requirements.txt \
+            -r enterprise/test/unit/requirements-test.txt
+
+      # Fast, in-process, no Redis needed -- runs first so a broken pure
+      # function fails in seconds instead of after the e2e suite's ~minute.
+      # `make test` below runs this same layer again as its first step; kept
+      # as its own step too so a failure here is its own red check instead
+      # of scrolling past inside the e2e job's combined log.
+      - name: unit tests (pytest)
+        run: python3 -m pytest enterprise/test/unit -q
 
       - name: make test
         run: make test
