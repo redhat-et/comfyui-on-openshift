@@ -467,6 +467,18 @@ shape_require()
 }
 
 for containerfile in app/Containerfile enterprise/worker/Containerfile; do
+    # Both images clone their application source from a public git remote at
+    # build time, and a tag is a mutable pointer: upstream can move v0.32.0
+    # under you and the rebuild produces different software with the same
+    # Containerfile, no diff, and — as the torch pin's own comment records from
+    # the time it happened — no crash either. The clone shape fetches an
+    # explicit object, so COMFYUI_REF from .env may still be a tag or a branch;
+    # what is pinned here is the DEFAULT, which is what a bare build gets.
+    shape_require "$containerfile" '^ARG COMFYUI_REF=[0-9a-f]{40}$' \
+        "the ComfyUI clone's default ref must be a commit SHA, not a tag. A tag is a mutable pointer, so a rebuild months later silently ships different application source with an identical Containerfile — the same class of failure the torch pin above it exists to prevent, and it produced no error the last time it happened"
+    shape_require "$containerfile" '^ARG MANAGER_REF=[0-9a-f]{40}$' \
+        "the ComfyUI-Manager clone's default ref must be a commit SHA too, and this is the clone where it matters most: Manager is the component that installs and runs arbitrary Python from the internet, so an unpinned fetch of it is an unpinned fetch of everything it can reach"
+
     shape_require "$containerfile" 'chgrp -R 0' \
         "OpenShift runs the container as an arbitrary high UID with GID 0. Without the chgrp 0 / chmod g=u block ComfyUI cannot write temp/, input/ or user/, and the pod crash-loops on a permission error that reads like a storage problem"
     shape_require "$containerfile" 'chmod -R g=u' \

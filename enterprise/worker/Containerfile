@@ -25,13 +25,24 @@ FROM nvcr.io/nvidia/cuda:12.6.2-base-ubi9
 # falls back to the legacy ModelPatcher. cu128 is the lowest index carrying
 # 2.8; cu124 stops at 2.6.0 and never got a 2.7+ wheel. Full argument in
 # app/Containerfile — bump all four together, in both files.
-ARG COMFYUI_REF=v0.32.0
+# PINNED BY COMMIT, not by tag, and the two clones below fetch by SHA rather
+# than by --branch so that either spelling still works. A git tag is a mutable
+# pointer: upstream can move v0.32.0 at any time, and the whole failure mode
+# this file already documents for torch — a silent change with no crash and no
+# diff — applies to the application source just as well. The tag each SHA
+# corresponds to is on the line above it, and the .env value (COMFYUI_REF,
+# passed through as a build arg) still overrides both, so an operator who wants
+# a different revision names one and gets it.
+#
+# v0.32.0
+ARG COMFYUI_REF=c2bcbecd82ec5ae66594340b395c24ef0217b238
 ARG COMFYUI_REPO=https://github.com/comfyanonymous/ComfyUI.git
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ARG TORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
-ARG MANAGER_REF=4.2.2
+# 4.2.2 (the annotated tag object; it peels to commit bd4ede22)
+ARG MANAGER_REF=da5e88aae61c06e1396724e77dc5fa152732797f
 
 # ComfyUI-Manager lets any user with UI access install arbitrary Python from
 # the internet, which then runs in this pod — on a node with an instance role,
@@ -69,17 +80,28 @@ RUN python3 -m pip install --upgrade pip setuptools wheel \
         torchvision==${TORCHVISION_VERSION} \
         torchaudio==${TORCHAUDIO_VERSION}
 
-RUN git clone --depth 1 --branch ${COMFYUI_REF} ${COMFYUI_REPO} . \
+# init + fetch + checkout rather than `git clone --branch`: --branch takes a
+# ref name and refuses a bare commit SHA, which is what COMFYUI_REF now is by
+# default. A fetch of an explicit object works for a SHA, a tag and a branch
+# alike, so the .env value can still be any of the three. Still --depth 1, so
+# this is the same single-commit download it always was.
+RUN git init -q . \
+    && git remote add origin ${COMFYUI_REPO} \
+    && git fetch --depth 1 origin ${COMFYUI_REF} \
+    && git checkout -q FETCH_HEAD \
     && python3 -m pip install -r requirements.txt
 
 # Pinned to MANAGER_REF, and pointed at Comfy-Org/ (ltdrdata/ moved there
 # upstream; the old URL still redirects today, but don't depend on that
 # lasting). Same rationale as app/Containerfile.
 RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
-        git clone --depth 1 --branch ${MANAGER_REF} \
-            https://github.com/Comfy-Org/ComfyUI-Manager.git \
-            custom_nodes/ComfyUI-Manager && \
-        python3 -m pip install -r custom_nodes/ComfyUI-Manager/requirements.txt; \
+        mkdir -p custom_nodes/ComfyUI-Manager && \
+        cd custom_nodes/ComfyUI-Manager && \
+        git init -q . && \
+        git remote add origin https://github.com/Comfy-Org/ComfyUI-Manager.git && \
+        git fetch --depth 1 origin ${MANAGER_REF} && \
+        git checkout -q FETCH_HEAD && \
+        python3 -m pip install -r requirements.txt; \
     fi
 
 # ---------------------------------------------------------------------------

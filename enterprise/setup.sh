@@ -26,7 +26,12 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 : "${MAX_GPU_WORKERS:=3}"
 : "${SCALE_TO_ZERO:=true}"
 : "${ENABLE_MANAGER:=false}"
-: "${COMFYUI_REF:=v0.32.0}"
+# The commit v0.32.0 points at today, not the tag: a tag is a mutable pointer
+# and upstream can move it, which is the same silent-change failure the
+# Containerfiles' torch pin exists to prevent. COMFYUI_REF in .env still
+# overrides this with any ref you like — the build fetches an explicit object,
+# so a SHA, a tag and a branch all work.
+: "${COMFYUI_REF:=c2bcbecd82ec5ae66594340b395c24ef0217b238}"
 : "${GPU_NODE_LABEL:=nvidia.com/gpu.present=true}"
 : "${QUOTA_GPU_SECONDS:=0}"
 
