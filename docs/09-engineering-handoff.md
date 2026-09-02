@@ -113,7 +113,9 @@ The practical consequence: your on-call surface is a FastAPI process, a Python
 agent, a Redis, and a bill. Everything underneath is somebody else's pager. If
 you have previously operated GPU inference on raw EC2 or bare Kubernetes, that
 row-by-row comparison is the case for this platform, and it is most of why
-this repo is only ~9,700 lines of Python instead of a distributed system.
+this repo is ~9,000 lines of Python and shell outside its tests — about
+5,100 of Python in the two files below, the rest in `scripts/` and
+`setup.sh` — instead of a distributed system.
 
 **Inventory of what is actually yours:**
 
@@ -121,13 +123,13 @@ this repo is only ~9,700 lines of Python instead of a distributed system.
 scripts/            13 numbered pipeline scripts, idempotent, bash 3.2-safe
 manifests/base/     single-user Deployment + Service (kustomize)
 enterprise/         the multi-user configuration
-  gateway/hub.py    2,370 lines — the entire public attack surface
-  worker/worker_agent.py  1,891 lines — the only path in or out of a GPU pod
-  manifests/        Redis, gateway, worker, KEDA, oauth-proxy, Routes
+  gateway/hub.py    2,780 lines — the entire public attack surface
+  worker/worker_agent.py  2,301 lines — the only path in or out of a GPU pod
+  manifests/        Redis, gateway, worker, KEDA, oauth-proxy, Routes, NetworkPolicy
   test/             e2e suite: real Redis, stub ComfyUI, no cluster needed
 app/Containerfile   the single-user ComfyUI image
-docs/               ten documents — 01-08, this file, and the roadmap
-.env                24 variables; the only configuration surface
+docs/               eleven documents — 01-08, this file, the roadmap, scaling
+.env                33 variables; the only configuration surface
 ```
 
 ---
@@ -191,8 +193,11 @@ miserable to reproduce.
 | `BLMOVE` into a per-worker processing list + TTL'd heartbeat | `worker_agent.py`, note 5 | SIGKILL (OOM, node reclaim) strands the job with no terminal event. The gateway's reaper depends on the heartbeat lapsing. |
 | The heartbeat key and the processing list are named from a per-process **incarnation** id — `HOSTNAME` plus a boot nonce — and never from `HOSTNAME` alone | `worker_agent.py`, note 9 / `BEGIN WORKER IDENTITY` / `scripts/lint.sh` | The row above is a claim of the form "the process holding *this* list is still alive", and the reaper tests it by pairing the two keys **by name** — so whatever that name identifies is what the reaper's word "alive" means. `HOSTNAME` identifies the *pod*, and `restartPolicy: Always` restarts a container **inside** its pod: an OOM-killed worker comes back holding the identity it died with, its first heartbeat answers the reaper's liveness question on the dead incarnation's behalf, and the reaper's `continue` skips that incarnation's processing list — not for a while, but for as long as the pod keeps restarting. Every consequence the reaper exists to prevent then happens at once to that job: no terminal event (the browser's bar never moves), its GPU seconds reach neither the submitter's line nor the excluded one, and its processing entry sits with no TTL in a `noeviction` Redis. This is the one row here whose failure is invisible to the *rest* of the suite by construction — `check-30-sigkill.py` proves the reaper works, and proves it with a replacement worker under a **different** name, which is the only case that was ever exercised; `check-32-worker-restart.py` is the same death with the name reused. Note the shape this is deliberately *not*: `WORKER_ID` stays the bare pod name, because that is the string a failure message shows and the one `oc describe pod` takes. Two identities, one displayed and one keyed, rather than one id doing both jobs badly. |
 | The `phase` breadcrumb is written **before** the transition it describes — for `executing`, before the POST is sent and not after it returns — the reaper checks `cancel_requested` **before** requeueing, the retry counter moves only by `HINCRBY`, and `retry` is not in `TERMINAL_TYPES` | `worker_agent.py`, note 6 / `hub.py`, the reaper | Four ways to break one mechanism. A breadcrumb written after the fact leaves a window in which the job is executing and the record says it is not — which is exactly when the reaper replays a workflow that already killed one worker onto the next one. ComfyUI has the workflow from the moment the POST is *written*, so "after `submit_prompt()` returns" is after the fact: the round trip is the window, it is as long as a loaded ComfyUI takes to answer, and `check-35-retry-doors.py` kills a worker inside it. Erring early costs a death inside the POST its retry; erring late costs a poison workflow walking the pool. A cancelled job is at a retryable phase *because* the cancel stopped it early, so a reaper that does not look at the flag requeues precisely the work the user withdrew, resets its status to `queued`, and hands it to a second worker. A counter read-then-written is a lost update between the two gateway replicas' reapers: both read 0, both believe they are the first attempt, one job becomes two on one GPU pool (only one reaper ever holding a given entry bounds failing a job once and does **not** bound requeueing it once). And `retry` joining the terminal set closes every tailing browser on the retry, so the second attempt runs to completion and the user is looking at a failure. |
-| The worker's heartbeat is refreshed by a **thread that runs for the whole process**, not from inside its loops — and a job carries an **owner** the reaper stamps over before it touches a stranded entry, which the worker re-reads before the `/prompt` POST and inside `finish()` | `worker_agent.py`, note 10 / `start_heartbeat()` / `still_ours()`, `hub.py`'s `reap_stranded_job` | Two halves of one failure, and it needs nothing to die. The reaper's entire liveness test is whether one key exists, so a heartbeat that merely LAPSED is a death — and `run_job()`'s prologue blocks in three places outside both loops: `ensure_workspace()` is an `mkdir` on the shared RWX volume and is unbounded, `ws.connect()` and `submit_prompt()` are 30 seconds each. Refresh only from the loops and a slow worker is declared dead at `PHASE_DISPATCHED`, which is retryable *by construction* — that phase means "ComfyUI has not seen it" — so its job is requeued while it is alive and about to submit. Both attempts then run: one workflow handed to ComfyUI twice at GPU prices, a second `started`/`completed` on a stream the browser closed at the first terminal event, and one `job_id` billed twice against the row above's own claim that a job is billed at most once. It is the exact replay the narrow retry exists to prevent, arriving through a door the phase breadcrumb does not cover. The owner is the half that survives being wrong about the first: a keepalive shrinks the window and cannot close it (a refresh that cannot run — kernel stop, Redis unreachable past the TTL — still looks like a death), so a reaped attempt must be able to find out it was reaped and abandon rather than write a second set of outcomes. Absence of an owner is NOT a fence: an unowned job proceeds, because a missing field that suppressed a terminal event would strand exactly the jobs this mechanism exists to stop stranding. `enterprise/test/check-36-live-worker-fencing.py` kills nothing and fails on both halves separately; the fence's residual check-then-act window, and why closing it is a redesign rather than an edit, is written down in `docs/10-roadmap.md` under F4. |
+| The worker's heartbeat is refreshed by a **thread that runs for the whole process**, not from inside its loops — and a job carries an **owner** the reaper stamps over before it touches a stranded entry, which the worker re-reads before the `/prompt` POST and inside `finish()` | `worker_agent.py`, note 10 / `start_heartbeat()` / `still_ours()`, `hub.py`'s `reap_stranded_job` | Two halves of one failure, and it needs nothing to die. The reaper's entire liveness test is whether one key exists, so a heartbeat that merely LAPSED is a death — and `run_job()`'s prologue blocks in three places outside both loops: `ensure_workspace()` is an `mkdir` on the shared RWX volume and is unbounded, `ws.connect()` and `submit_prompt()` are 30 seconds each. Refresh only from the loops and a slow worker is declared dead at `PHASE_DISPATCHED`, which is retryable *by construction* — that phase means "ComfyUI has not seen it" — so its job is requeued while it is alive and about to submit. Both attempts then run: one workflow handed to ComfyUI twice at GPU prices, a second `started`/`completed` on a stream the browser closed at the first terminal event, and one `job_id` billed twice against the row above's own claim that a job is billed at most once. It is the exact replay the narrow retry exists to prevent, arriving through a door the phase breadcrumb does not cover. The owner is the half that survives being wrong about the first: a keepalive shrinks the window and cannot close it (a refresh that cannot run — kernel stop, Redis unreachable past the TTL — still looks like a death), so a reaped attempt must be able to find out it was reaped and abandon rather than write a second set of outcomes. Absence of an owner is NOT a fence: an unowned job proceeds, because a missing field that suppressed a terminal event would strand exactly the jobs this mechanism exists to stop stranding. `enterprise/test/check-36-live-worker-fencing.py` kills nothing and fails on both halves separately. The submit-side half of the fence is no longer check-then-act: the row two below makes the `executing` claim a compare-and-set, which closes the window F4 originally left open and wrote down in `docs/10-roadmap.md`. |
 | A stranded entry is removed from its processing list **only after its reap has returned**, a reap that raised is retried on a later tick, and an entry that can never be reaped is **bounded and set aside**, never dropped | `hub.py`, `BEGIN REAP DURABILITY` / `reap_processing_list()` / `check-37-reap-durability.py` | The reaper is the only code that ever writes a terminal event for a job whose worker died, so a reap that dies halfway is the job's last chance. The loop used to `RPOP`: the entry came off the list *before* the reap ran, so anything that raised in the body — the terminal `XADD`, a Redis that went away between two commands, a bug — destroyed the only record that the job had ever been queued, and the `except Exception: pass` wrapped around it promised a retry that had nothing left to retry. The job then reaches no terminal state at all and the browser sits on a bar that never moves: the same work-vanishing the `noeviction` row below exists to prevent, through a door `noeviction` does not cover, reproducible with one injected transient error. Reading instead of popping costs the exclusion `RPOP` gave for free — two reapers on one tail would both fail the same job, and on a retryable one both would reach the `HINCRBY` claim, where one requeues and the other terminates what it just requeued — so the exclusion is now an explicit per-entry `SET NX` claim held for the whole reap. The trade is at-least-once for at-most-once: a gateway dying between a reap and its `LREM` costs a duplicate terminal event on a stream the browser stopped reading at the first one, where the old shape's equivalent window cost the job. And the bound is not optional in either direction: an entry left until its reap works is retried forever if it never can, with everything behind it stuck, while an entry *dropped* on its first failure is the original bug with extra steps. |
+| The `executing` claim is a Lua **compare-and-set** on the owner field, and a prompt the agent gives up on is **`/interrupt`ed and drained** before the next `BLMOVE` | `worker_agent.py`, `CLAIM_EXECUTING_LUA` / `claim_executing()`, `interrupt()` / `await_comfy_idle()` | Two ways for one worker to run work it should not. The claim used to be a bare `HGET` of the owner followed, separately, by the `HSET` that writes `executing` and then the submit — so a reap landing between the read and the write was read as "still mine", the phase was written over the retry's `queued`, and the workflow went to ComfyUI beside the retry: the replay the row above exists to prevent, one line further down, in a window microseconds wide. `check-36-live-worker-fencing.py` scenario C reaches it only because the agent carries a test-only pause (`TEST_DELAY_BEFORE_CLAIM_S`, never set in a manifest); no stub can widen it from outside, because both operations are against Redis. The other half: ComfyUI executes one prompt at a time, and the agent is the only thing that ever submits to it or can stop it. An agent that raised on `JOB_TIMEOUT` and simply took the next job left the timed-out prompt holding ComfyUI's single execution slot — the next prompt queued behind it inside ComfyUI, received no event, timed out too, and so did every job after, with the liveness probe green because it asks ComfyUI's HTTP server and not its executor. Now the agent sends `/interrupt`, waits up to `INTERRUPT_DRAIN_TIMEOUT` (60 s) for `/queue` to empty, and if it never does exits non-zero and deregisters so the pod restarts rather than accepting work it cannot run (`check-67-job-timeout-interrupt.py`). |
+| The namespace is **default-deny**, the worker's only egress is Redis and DNS, and the worker connects as the `comfy-worker` **ACL user**, never as `default` | `enterprise/manifests/06-network-policy.yaml`, `00-redis.yaml`, `02-worker.yaml` / `scripts/lint.sh` | A worker pod runs whatever custom-node Python is baked into the image, on a node with an instance role, inside your VPC, with the model volume mounted. Before the policy that code could open a connection to anything — the instance metadata service, another namespace's Service, S3, an address of its own choosing; before the ACL user its Redis credential was the admin password, readable from its own environment, and one `FLUSHALL` from a custom node emptied the queue. Now the worker can reach Redis and DNS and nothing else (so `ENABLE_MANAGER` cannot fetch at runtime, which was already the documented stance), and its Redis user starts from `-@all` and is allowed exactly the commands `worker_agent.py` issues against the five `comfy:*` key patterns it names. `make lint` fails a Deployment no NetworkPolicy selects, a worker whose `REDIS_URL` names any user but `comfy-worker`, and an ACL that does not start from `-@all` or has been widened. The suite can see none of it: it runs on a laptop with no policy plugin and a Redis it owns outright. `automountServiceAccountToken: false` on all three Deployments is the same rule for the Kubernetes API — nothing here calls it, so the token had no reader but a compromised pod; the oauth-proxy patch turns it back on for the gateway alone, because the proxy really does call TokenReview. |
+| Under `AUTH_MODE=oauth`, `/outputs` serves a caller **only their own workspace** and `/api/showback` names other submitters **only to `SHOWBACK_OPERATORS`**; under `none` neither is scoped, on purpose | `hub.py`, `output_file()` / `scoped_showback()`; `BEGIN SHARED WORKSPACE` mirrored in both files / `scripts/lint.sh` | `workspace_name()` is a pure, public function of the username — slug plus twelve hex of `sha256` — so once the header comes from a real login, any logged-in user could read any other's images by computing a path, and the showback report was the list of names to compute from. The gateway needs the worker's naming function to make the check, which is why it is now a mirrored block lint diffs, the way the envelope and the accrual already were; a gateway whose copy drifted would refuse alice her own file. Under `none` the header is client-supplied, so a scope keyed on it is a lock with the key written on the door, and the gateway serves everything rather than pretend. The clamped identity — not the raw header — is what lands on the state hash and in showback field names, so the write side and the quota read side name the same field (the near-miss `docs/10-roadmap.md` records). `check-66-output-scoping.py` runs a second gateway in `oauth` mode and pins both modes. |
 | Redis Streams, not pub/sub | `hub.py` | Pub/sub delivers only to subscribers connected at publish time. The POST and the WebSocket open are two round trips — the gap is the common case. |
 | `maxmemory-policy noeviction` + `MAX_QUEUE_DEPTH` | `00-redis.yaml`, `hub.py` | The default evicts queued jobs, which presents as work vanishing at random. |
 | The fair-queueing insert **adds one entry with `LINSERT` and never rewrites the list**, and the entry it adds **carries no workflow** | `hub.py`, `FAIR_ENQUEUE_LUA` / `fair_enqueue_call()` / `scripts/lint.sh` | Two ways to break one script, and it runs on every `/api/generate`. Redis executes one command at a time, so whatever this script does, every other client waits for it — including every worker parked in `BLMOVE`, which is to say the pool stops being handed work. Placing a job fairly means reading every job already queued, so what each entry costs to read is what a submit costs everybody: with 26 KB workflows in the list, one submit against a 499-deep queue measured ~118 ms of exclusive Redis time, and ~1.2 s with 103 KB ones. The workflow therefore lives at `comfy:job:<id>:payload` and the list carries a few hundred bytes of ordering record, which puts both cases at ~2 ms and makes the cost independent of a size the *client* chooses (up to `MAX_BODY_BYTES`). Separately: Redis does not roll back a partial script, so a version that `DEL`s the queue and pushes it back has a window in which any error loses **every queued job at once** — that is the same "work vanishing at random" the row above exists to prevent, arriving by a door `noeviction` does not cover, and it is not hypothetical: an error injected after the `DEL` empties a 10-deep queue. `LINSERT` splices against a pivot and touches nothing else, so there is no such window and `LLEN` is monotonic across a submit (which is also what the KEDA trigger reads). Both halves are invisible to `make test`, which runs a three-deep queue of two-node workflows where every version of this script is instant and correct. |
@@ -314,10 +319,10 @@ a failed assertion — `run.sh` reads both, so a check that keeps printing its
 drops the `sys.exit(1)`, a failures list nothing reads any more) cannot leave
 the suite, or CI, green over its own output. And when you add or change an
 assertion, break the behaviour it is about and watch it fail before you believe
-it: six assertions have shipped here unable to fail, each found only by someone
-deliberately breaking the feature and noticing nothing went red. They are
-listed, with what replaced each one, in the README under *"The assertions that
-could not fail"*.
+it: ten assertions have shipped here unable to fail, and two behaviours had no
+assertion at all, each found only by someone deliberately breaking the feature
+and noticing nothing went red. They are listed, with what replaced each one,
+in `enterprise/test/README.md` under *"The assertions that could not fail"*.
 
 Then, when you want a cluster:
 
@@ -343,13 +348,14 @@ most of the day. The platform gives you three states and one command each:
 
 Parking removes the card. **Only `down` removes the bill** — parked still
 carries $1.06/hour of control plane, base workers and NAT gateway, which is
-$760/month of doing nothing. The reason HCP is the right choice here is
+~$775/month of doing nothing. The reason HCP is the right choice here is
 precisely that a ~15-minute rebuild makes `down` a default rather than a last
 resort; on a 40-minute-rebuild cluster nobody tears down and everybody
 overpays.
 
-By habit: ~$1,490/month running 24/7, ~$800 parking nightly, **~$370 tearing
-down nightly**, ~$85 for a day a week. The crontab lines are in
+By habit, weekdays 9–6 being ~195 of a month's 730 hours: ~$1,490/month
+running 24/7, ~$965 parking nightly, **~$425 tearing down nightly**, ~$114
+for a day a week. The arithmetic and the crontab lines are in
 `docs/02-cost.md`. Two things to check on your first week:
 
 1. `BUDGET_ALERT_EMAIL` is set to *you*, not to the person who left.
@@ -393,8 +399,9 @@ Ordered by likelihood. Full detail in `docs/05-troubleshooting.md`.
 | `ClusterPolicy` never ready | Usually just slow | Under 20 minutes it is not stuck; it compiles a driver and pulls several GB. Past that, check NAT egress to `nvcr.io` and the NFD label. |
 | Pod `CrashLoopBackOff`, `Permission denied` | Arbitrary UID | The fix is in the image, not the manifest. Bottom third of `app/Containerfile`. |
 | Progress bar never moves, job is fine | An invariant from section 3 was broken | Reproduce in `make test` first — it is faster than a cluster and it is where the assertion already exists. |
-| Queue grows, workers idle or absent | KEDA cannot reach Redis, or the pool cannot scale | `oc get scaledobject,hpa`; the scaler dials from `openshift-keda`, so the Redis address must be fully qualified. |
-| Everything works, generation is slow | Model loading over EFS, or the wrong instance type | `docs/05-troubleshooting.md`; also idea 3 in the README. |
+| Queue grows, workers idle or absent | KEDA cannot reach Redis, or the pool cannot scale | `oc get scaledobject,hpa`; the scaler dials from `openshift-keda`, so the Redis address must be fully qualified — and `06-network-policy.yaml`'s `redis-allow-app-only` must keep its `openshift-keda` exception, or the ScaledObject sits in `ScalerFailed`. |
+| A pod is `Ready` and every connection it opens times out | The namespace is default-deny; the pod matches no allow policy, or the router is not where `gateway-ingress` expects | `docs/05-troubleshooting.md`, "The namespace is default-deny". A Route that stops answering right after `setup.sh` is the router-on-host-network case; a second `setup.sh` hanging on `git fetch` is a build pod without `allow-build-egress`. |
+| Everything works, generation is slow | Model loading over EFS, or the wrong instance type | `docs/05-troubleshooting.md`; also I5 in `docs/10-roadmap.md` and `docs/11-scaling.md`. |
 
 Set the alert before you need it: the gateway exports `comfy_queue_depth`,
 `comfy_workers_registered` and `comfy_estimated_wait_seconds`, `setup.sh`
@@ -409,8 +416,12 @@ Everything is in `.env`. The ones that change behaviour rather than naming:
 
 | Variable | Why you would touch it |
 |---|---|
-| `SCALE_TO_ZERO` | `false` pins one warm worker. See section 8 — this is the main UX/cost dial. |
-| `MAX_GPU_WORKERS` | Ceiling for both the pod and node autoscalers. Your burst budget. |
+| `SCALE_TO_ZERO` | All or nothing: `true` scales to zero nodes and pays the cold start, `false` pins exactly one worker and skips KEDA entirely. See section 8. |
+| `WARM_WORKERS`, `WARM_START`, `WARM_END`, `WARM_TIMEZONE` | The middle setting, and the main UX/cost dial for a design team: hold N workers inside a cron window, scale to zero outside it. Off (`0`) by default; ~$190/month per card held weekdays 9–6. Set the timezone before the count — the default window is a UTC working day. |
+| `MAX_GPU_WORKERS` | Ceiling for both the pod and node autoscalers. Your burst budget. The default of 3 (and `GPU_VCPU_REQUEST=32`) cannot serve a warm floor of 6–10; raise both for a team of fifteen or more (`README.md`, "Sizing the pool"). |
+| `SHOWBACK_OPERATORS` | Comma-separated identities, as oauth-proxy reports them, who may read every submitter's row of `/api/showback` under `AUTH_MODE=oauth`. Everyone else gets their own row and the totals. Empty by default; ignored under `none`. |
+| `STATS_CACHE_SECONDS`, `REDIS_MAX_CONNECTIONS` | Gateway environment, not `.env`: `/api/stats` and `/metrics` are served from one snapshot per 5 s instead of a keyspace `SCAN` per call, and the Redis pool is capped at 200. Change them in `01-gateway.yaml` if you must. |
+| `INTERRUPT_DRAIN_TIMEOUT`, `AGENT_LIVENESS_FILE`, `REDIS_SOCKET_TIMEOUT` | Worker environment, not `.env`: how long the agent waits for ComfyUI to drain after an `/interrupt` (60 s) before exiting; the file the liveness probe checks the age of (120 s threshold in `02-worker.yaml`); the socket timeout that keeps a blackholed Redis from parking `BLMOVE` forever. `TEST_DELAY_BEFORE_CLAIM_S` also exists and is for the test suite only — never set it in a manifest. |
 | `STORAGE_MODE` | `rwx` is mandatory for multi-user and is what lets models outlive `make down`. |
 | `COMFYUI_REF` | Pinned on purpose. Bumping it is a deliberate, reviewable act. |
 | `ENABLE_MANAGER` | Leave `false` on a shared cluster. It gives every UI user arbitrary code execution on a node with cloud credentials, and anything it writes disappears when the node is reclaimed anyway. |
@@ -426,44 +437,58 @@ The honest weakness of scale-to-zero is the first job after an idle period:
 
 | What is cold | First-job wait | Removed by |
 |---|---:|---|
-| No node — provision + ~10 GB image pull | 6–13 min | machine pool pinned at 1 during work hours |
-| Node warm, no pod — CUDA init + checkpoint load | 1.5–4 min | a warm worker pod (`SCALE_TO_ZERO=false`) |
+| No node — provision + ~10 GB image pull | 6–13 min | a warm worker, which holds its node |
+| Node warm, no pod — CUDA init + checkpoint load | 1.5–4 min | a warm worker pod (`WARM_WORKERS`, or `SCALE_TO_ZERO=false`) |
 | Warm worker | seconds | — |
 
 For batch and out-of-hours work this costs nothing — nobody is watching. For
 **interactive iteration it lands in the middle of a creative loop**, and that
 is the case you will hear about.
 
-**One warm machine removes it entirely.** `SCALE_TO_ZERO=false` pins a single
-worker; KEDA still scales 1..N above it, so bursts still work. The cost is one
-GPU node for as long as it is up — **~$195/month pinned weekdays 9–6**, which
-is less than one designer waiting fifteen minutes each morning.
+**A warm worker removes it entirely, and there are two ways to get one.**
+`SCALE_TO_ZERO` is all or nothing: `true` scales pods and GPU nodes to zero
+and pays an 8–17 minute cold start on the first job; `false` pins exactly one
+worker permanently and skips KEDA, the ScaledObject and machine-pool
+autoscaling with it. `WARM_WORKERS` (needs `SCALE_TO_ZERO=true`) is the
+middle setting: a KEDA `cron` trigger holds N workers between `WARM_START`
+and `WARM_END` in `WARM_TIMEZONE`, and because KEDA takes the maximum across
+triggers the queue still decides outside the window and a busy afternoon
+still scales past the floor to `MAX_GPU_WORKERS`. 0 = off. The cost is one
+GPU node per held worker for the hours of the window — **~$190/month per
+card weekdays 9–6** at $0.976/hour all-in — which is less than one designer
+waiting fifteen minutes each morning.
 
-And note the shape of the problem: with a warm worker held during working
-hours, **the cold start happens at most once a day, before anyone sits down** —
-not once per creative iteration. That is the configuration to recommend to a
-design team, and it is one variable, not a redesign. Scale-to-zero still covers
-the other fourteen hours and the weekend, which is where the savings actually
-were.
+And note the shape of the problem: with a floor held during working hours,
+**the cold start happens at most once a day, before anyone sits down** — not
+once per creative iteration. That is the configuration to recommend to a
+design team, and it is three lines in `.env`, not a redesign. Scale-to-zero
+still covers the other fourteen hours and the weekend, which is where the
+savings actually were. The gateway's PodDisruptionBudget applies in both
+modes; it moved out of `03-autoscale.yaml` so that `SCALE_TO_ZERO=false` no
+longer quietly loses it.
 
-The next refinement is to schedule the warm window rather than pin it — see
-idea 1 in the README's "Ideas worth doing next", which is two cron lines.
+How many workers to hold, and when holding them stops being cheaper than a
+card each, is the "Sizing the pool" section of the README; `docs/10-roadmap.md`
+records this as I1, landed.
 
 ---
 
 ## 9. What I would do next, if I were staying
 
-The full list is in the README under **Ideas worth doing next**, and
-[`10-roadmap.md`](10-roadmap.md) turns it into a work plan — what each item
-touches, what proves it, what order they can safely land in, and which of them
-need a real cluster. The short version, in the order I would take them —
-shipped and decided-against items kept on the list rather than deleted, the
-way the README's version keeps them, because the reasoning is the useful part:
+The full list is in [`10-roadmap.md`](10-roadmap.md) — "The list, as the
+README carried it" — which turns it into a work plan: what each item touches,
+what proves it, what order they can safely land in, and which of them need a
+real cluster. The short version, in the order I would take them — shipped and
+decided-against items kept on the list rather than deleted, because the
+reasoning is the useful part:
 
-1. **Schedule the warm window** (two cron lines). Removes the morning cold
-   start without paying overnight. Highest payoff per unit of work on the list,
-   and the only one of these five still entirely ahead of you.
-   `10-roadmap.md` carries it as I1.
+1. **Schedule the warm window — landed** (`10-roadmap.md`, I1). It shipped as
+   a KEDA `cron` trigger driven by `WARM_WORKERS`/`WARM_START`/`WARM_END`/
+   `WARM_TIMEZONE` rather than as the two cron lines this list first
+   proposed, because a cron job editing the machine pool was undone by every
+   `setup.sh` re-run; a trigger reading `.env` is reasserted by it. What is
+   still ahead of you is proving it on a cluster: the window opening, the
+   floor holding, and the queue trigger still winning above it.
 2. **Fair queueing — landed** (`10-roadmap.md`, Q1). The problem was that the
    pop is a single-list `BLMOVE` (`worker_agent.py:1787`), so one overnight
    batch of 200 jobs starved every interactive user. What shipped round-robins
@@ -580,12 +605,14 @@ written so you can tell which one you are in.
 Nothing below is settled, and treating it as settled is the opposite mistake
 from reversing bin 2.
 
-- **The scaling work.** Scheduling the warm window rather than pinning it, a
-  low-priority placeholder pod holding a node warm, scaling on estimated wait
-  rather than queue depth, `cooldownPeriod`, `MAX_GPU_WORKERS`.
-  `10-roadmap.md` carries these as I1, I3 and I4 with efforts, risks and a
-  landing order attached. None of them has landed. `cooldownPeriod: 600` is
-  called out in `06` as "a starting point, not a truth".
+- **The scaling work.** A low-priority placeholder pod holding a node warm,
+  scaling on estimated wait rather than queue depth, `cooldownPeriod`,
+  `MAX_GPU_WORKERS`, and the size of the warm floor itself. `10-roadmap.md`
+  carries these as I1, I3 and I4 with efforts, risks and a landing order
+  attached. I1 has landed as `WARM_WORKERS`; I3 and I4 have not, and the
+  numbers behind the README's sizing table are a queueing model, not a
+  measurement. `cooldownPeriod: 600` is called out in `06` as "a starting
+  point, not a truth".
 - **The storage layout.** EFS is required by *this* shape — the gateway serves
   images off the volume the workers write to, and those pods are on different
   nodes by construction — but the shape itself is not required. Writing outputs
@@ -640,14 +667,14 @@ They are the two bins that are **checkable**, and checking is cheaper than
 arguing:
 
 - **The assertions have been mutation-tested, and some of them failed that
-  test.** `make test` runs 289 assertions — 29 shell unit assertions and 260 in
-  the end-to-end suite across 17 check files — and the count is the least
-  interesting thing about it. Assertions here have been caught unable to fail,
-  each found by someone deliberately breaking the feature and noticing that
-  nothing went red; what replaced them is in the README under *"The assertions
-  that could not fail"*, and section 4 above states the standing rule. A suite
-  that has caught itself is a different kind of evidence from a suite with a
-  large number attached.
+  test.** `make test` runs 40 shell unit assertions, 369 in the end-to-end
+  suite across 21 check files, and 210 pytest cases against the pure functions —
+  and the count is the least interesting thing about it. Assertions here have
+  been caught unable to fail, each found by someone deliberately breaking the
+  feature and noticing that nothing went red; what replaced them is in
+  `enterprise/test/README.md` under *"The assertions that could not fail"*,
+  and section 4 above states the standing rule. A suite that has caught itself
+  is a different kind of evidence from a suite with a large number attached.
 - **The one performance claim was measured, not reasoned.**
   `enterprise/test/bench-fair-enqueue.py` is in the repository and you can run
   it yourself: one submit against a 499-deep queue of ~26 KB workflows cost
@@ -661,12 +688,15 @@ arguing:
   `check-37-reap-durability.py`). `07-design-review.md` shows the original code
   beside what replaced it. You can go and read the code a claim is about
   instead of the sentence making it.
-- **Twelve shape rules in `scripts/lint.sh` pin section 3's file-level
-  invariants mechanically** — the block is titled after that section. They are
-  greps, deliberately: no parser and no dependency, because the two they were
-  written for produce a crash-loop or an unauthenticated RCE rather than a test
-  failure. Each carries in its own failure message the reason it exists and the
-  section 3 row it pins.
+- **The shape rules in `scripts/lint.sh` pin section 3's file-level
+  invariants mechanically** — the block is titled after that section. The ten
+  `shape_require` rules are greps, deliberately: no parser and no dependency,
+  because the two they were written for produce a crash-loop or an
+  unauthenticated RCE rather than a test failure. The manifest rules beside
+  them parse the YAML: the NetworkPolicy coverage, the ACL allowlist, the
+  ServiceAccount automount, and a warm floor above `maxReplicaCount` (which
+  KEDA clamps and never reports) are all there. Each carries in its own
+  failure message the reason it exists and the section 3 row it pins.
 
 So the honest instruction to an incoming group is: distrust the previous one
 and check. Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM
@@ -690,11 +720,13 @@ good faith.
 6. `docs/03-storage.md`, `docs/04-exposing.md` — the two decisions that are
    hard to reverse later.
 7. `docs/10-roadmap.md` — where the work goes next, with lanes and gates.
-8. `docs/05-troubleshooting.md`, `docs/08-stuck-volumes.md` — bookmark, do not
+8. `docs/11-scaling.md` — how far this goes, what it costs per person, and
+   which AWS cards it runs on.
+9. `docs/05-troubleshooting.md`, `docs/08-stuck-volumes.md` — bookmark, do not
    read cover to cover.
 
 Then run `make test`, read `hub.py` and `worker_agent.py` top to bottom (they
-are ~4,260 lines together and both open with a numbered list of the things the
+are ~5,100 lines together and both open with a numbered list of the things the
 obvious implementation gets wrong), and you have the whole system.
 
 ---
@@ -710,10 +742,15 @@ obvious implementation gets wrong), and you have the whole system.
   and its custom-node ecosystem are upstream, and this repo's mitigation for
   that entire class is architectural: keep ComfyUI unreachable and
   `ENABLE_MANAGER=false`.
-- **CI**: four jobs on every PR (lint, e2e, real-ComfyUI path contract,
-  arbitrary-UID image test). They delegate to the same `make` targets you run
-  locally, so local and CI cannot drift. If CI is red, the answer is in
-  `make lint` or `make test` on your own machine.
+- **CI**: four jobs on every PR (`lint`, which also validates the manifests
+  against the Kubernetes, OpenShift and KEDA schemas; `e2e`; `comfyui-smoke`,
+  the real-ComfyUI path contract; `image-uid`, the arbitrary-UID image test
+  with a CVE scan that reports but does not block). They delegate to the same
+  `make` targets you run locally, so local and CI cannot drift. If CI is red,
+  the answer is in `make lint` or `make test` on your own machine. `nightly.yaml`
+  builds the two GPU images — `app/Containerfile` and the worker's — once a
+  night, boots each as an arbitrary UID on CPU, and scans them; that scan is
+  the one that gates.
 
 ---
 
@@ -732,8 +769,8 @@ and read the comment block second — the tests were written from the bugs, so
 they will usually tell you before a cluster does.
 
 Which returns this document to where it started. The platform is doing more
-work here than the code is: the reason this repository is ~9,700 lines of
-Python and not a distributed system is that cluster SSO, the driver lifecycle,
+work here than the code is: the reason this repository is ~9,000 lines of
+Python and shell and not a distributed system is that cluster SSO, the driver lifecycle,
 node autoscaling to zero, audit logging, arbitrary-UID isolation and TLS
 rotation are not in it — they are underneath it, and they are somebody else's
 pager. That is the whole argument for where this runs, and it is worth being

@@ -16,6 +16,12 @@ to 5 seconds, which makes every blocking `BLMOVE`/`XREAD` longer than that
 raise instead of waiting, and the blocking paths are most of what this suite
 asserts. `CONTRIBUTING.md` says the same thing; the requirements file says why.
 
+`make test` runs three layers: 40 shell unit assertions (`scripts/unit-tests.sh`,
+the parsing edge cases and the lint fixtures), 210 pytest cases under
+`enterprise/test/unit/` against the pure functions in both Python files
+(`python3 -m pytest enterprise/test/unit`, under a second), and then this
+suite — 369 end-to-end assertions across 21 check files, in about a minute.
+
 ## What it measures, separately
 
 `bench-fair-enqueue.py` is not a check and `run.sh` does not run it — it is a
@@ -150,6 +156,25 @@ the event (`QueueWriteWatcher`, the stub's own arrival log, the job's whole
 event stream via `XRANGE`) and is read only after the system has gone idle: on
 a broken implementation the second run starts *after* the terminal event a
 browser stops at, so counting at the terminal event reads 1 either way.
+
+Scenario C is the claim itself, and it is the one scenario here that needed
+help from the agent to reach. (B) proves the fence works when the requeue lands
+while the worker is parked *before* it. The fence used to be a bare `HGET`
+followed, separately, by the `HSET` that writes `executing` and then the
+submit — so a requeue landing between the read and the write was read as
+"still mine", the phase was written over the retry's `queued`, and the
+workflow went to ComfyUI beside the retry: the exact replay (B) exists to
+prevent, one line further down. That window is microseconds wide, which is
+why (B) cannot reach it and why no stub can widen it: both operations are
+against Redis, and nothing outside the process sits between two of its Redis
+calls. So this scenario runs an agent of its own with
+`TEST_DELAY_BEFORE_CLAIM_S` set — a pause inside the window that exists in
+`worker_agent.py` for this check alone, documented there, and never set in a
+manifest. The agent pauses at the claim, the check deletes its heartbeat key
+until the reaper has genuinely requeued the job, and the agent then reaches
+the claim with the reap already stamped over the owner. The claim has to be a
+compare-and-set that fails there (`CLAIM_EXECUTING_LUA`): ComfyUI is handed
+the workflow once, and the one terminal event is the retry's.
 
 **A reap that fails leaves the job recoverable, and is bounded**
 (`check-37-reap-durability.py`). The reaper is the only code that ever writes a
@@ -318,6 +343,89 @@ inside the submitter's workspace, and one carrying `..` must never arrive at
 all — the job fails first, naming the prefix, with no GPU spent on a workflow
 that was always going to be refused.
 
+**ComfyUI's own reported output is confined too, on both halves of the URL**
+(`check-65-output-filename-confinement.py`). Everything above is about what
+the *caller* supplied. The filename and subfolder come back from ComfyUI, and
+they are not trusted either. Scenarios (a)–(d) reproduce, against the live
+agent's own output, the escape that lived in how the URL's two halves were
+joined — a confined subfolder with the raw filename concatenated onto it —
+and then assert a hostile filename produces no image entry at all, that an
+ordinary filename with parentheses still round-trips, and that a filename
+merely containing a separator is refused. Five more scenarios were added in
+the audit sweep, each fixing something the first four could not see:
+
+- **(e) A preview is not an output.** The stub reports a `type: temp` entry
+  beside a real one; only the `output` entry is served. A preview is
+  ComfyUI's scratch, and serving it would mean serving whatever a node wrote
+  to the temp directory.
+- **(f) Filenames are percent-encoded.** A name with a space, a `#` and a `%`
+  in it is served through a URL that a browser will actually fetch, rather
+  than one that truncates at the fragment.
+- **(g) An output inside another submitter's workspace is refused, not
+  moved.** The old confinement moved anything reported outside the workspace
+  *into* it. Moving a file out of a colleague's directory is not confinement,
+  it is theft with a tidy log line; the job now fails naming the path.
+- **(h) `..` is refused per component, before anything resolves.** A
+  subfolder like `a/../b` resolves inside `OUTPUT_ROOT` and used to pass;
+  the check asserts no image is reported, no `..` appears in any URL, and —
+  the mechanism this is really pinning — `OUTPUT_ROOT`'s own mode is
+  untouched and no directory named after `OUTPUT_ROOT` was created inside
+  it. The unnormalised join used to produce exactly that sibling-of-every-
+  workspace directory, and `ensure_workspace()`'s `chmod` walked through it.
+- **(i) The forwarded `executed` event carries no paths.** The worker used to
+  forward ComfyUI's per-node `executed` event verbatim, `data.output` and
+  all, so the gateway's `rewrite_image_urls()` built browser URLs from raw,
+  unconfined paths a beat before the confined terminal manifest arrived.
+  The forwarded copy now names the node that finished and nothing else; the
+  terminal event is the only place a path leaves the worker. The gateway keeps
+  its own bare-component rule for the raw event (`check-10`) for older
+  workers.
+
+**A job the agent gives up on is interrupted at ComfyUI, and a ComfyUI that
+will not stop costs the pod, not the queue**
+(`check-67-job-timeout-interrupt.py`). ComfyUI executes one prompt at a time
+and binds loopback, so this agent is the only thing that ever submits to it and
+the only thing that can stop it. When a job hit `JOB_TIMEOUT` the agent
+raised, reported the job failed, and took the next one — while ComfyUI was
+still executing the prompt that timed out. The next prompt went into ComfyUI's
+own queue behind it, received no event, and timed out too; and so did every
+job after, with the liveness probe green, because it asks ComfyUI's HTTP
+server and not its executor. One custom node wedged in a C call bricked a pod
+with everything showing healthy. The check runs its own agent with a
+`JOB_TIMEOUT` of seconds. Scenario A submits a prompt that never finishes but
+honours `/interrupt` the way the real sampler does between steps, and asserts
+the job fails naming the deadline, that ComfyUI received exactly one
+`/interrupt` for it, that ComfyUI's queue is empty afterwards, and — the
+assertion that fails on HEAD — that the **next** job completes normally on the
+**same** worker. Scenario B submits a prompt that ignores `/interrupt`: the
+agent must still fail the job, wait its bounded `INTERRUPT_DRAIN_TIMEOUT` for
+the queue to empty, see it not, and then exit non-zero and deregister rather
+than take the next job — in the pod, `start.sh` exits when either child does,
+so the kubelet replaces a ComfyUI that cannot be interrupted with one that
+can. The stub had to become serial for this (`fake_comfy.py`,
+`execution_lock`): with the old concurrent stub the next job simply ran beside
+the wedged one, and no assertion about it could fail. Every never-ending
+prompt the check starts is released in its `finally`, because one left behind
+would hold ComfyUI's slot for every later check.
+
+**The agent keeps a liveness file fresh, idle and mid-job**
+(`check-68-agent-liveness-file.py`). The pod's liveness probe asked ComfyUI
+whether it was up and asked the agent nothing, and the two ways the agent stops
+consuming the queue without dying — a Redis connection blackholed rather than
+refused, so `BLMOVE` parks forever; a heartbeat thread that cannot reach Redis
+and swallows the error by design — are both invisible to it. The pod sits
+`Running`, holding a card, until somebody notices. So the agent touches
+`AGENT_LIVENESS_FILE` once per pass of its poll loop and once per heartbeat
+refresh, from the thread that would be the one wedged, and the manifest's exec
+probe fails the pod when the file is older than 120 s — twice the production
+heartbeat refresh, so one missed refresh is not a restart and two are. What is
+asserted is the mtime *advancing*, while the agent idles and again while it is
+inside a job: existence alone would pass on an agent that touched the file at
+startup and wedged, and a touch that only happened between jobs would have the
+kubelet restart the pod in the middle of every long render. Nothing here runs
+the probe command itself; that lives in the manifest, and this suite reads no
+manifest.
+
 **The queue payload envelope round-trips, and tolerates both vintages.** A
 submitted job carries `schema_version` plus the four fields reserved for later
 roadmap items, each with its default, and the test reads them off the raw Redis
@@ -381,6 +489,118 @@ readiness probe, which would turn one person's ceiling into a gateway-wide
 outage. What it cannot see is the *shape* of that separation — a health
 endpoint that reads the quota is green whenever its reader is under the cap —
 so `scripts/lint.sh` walks `hub.py`'s call graph for it.
+
+## The output path has been attacked, and the attack is in the suite
+
+Every path that ends on the shared volume begins as something a caller chose.
+The submitter's name arrives in a request header, a save node's
+`filename_prefix` arrives inside the workflow, and the output filename comes
+back from ComfyUI. All three are handled as hostile, and ten hostile strings
+are driven through the running system on every `make test`: four usernames (an
+eight-deep traversal, an absolute path, an empty value, 2000 characters), a
+`filename_prefix` carrying `..`, two reported output filenames
+(`../../OUTSIDE/secret.txt`, and a bare `sub/evil.png` that never spells `..`
+at all), a `/outputs/../../etc/passwd` request, and two hostile submitter
+identities pushed through the showback accounting. None of them escapes
+`OUTPUT_ROOT`. The legitimate cases are asserted in the same files —
+`alice.smith@example.com` and a filename with parentheses must still
+round-trip to a real, servable URL — because sanitizing hard enough to break
+the usernames an IdP actually issues is its own failure.
+
+There are two layers, and the second one has already caught what the first one
+missed. Sanitization makes a separator unrepresentable in a workspace name;
+the join is then resolved and re-verified against `OUTPUT_ROOT`, and the
+gateway independently refuses to serve any `/outputs/...` path that resolves
+outside it. `check-65-output-filename-confinement.py` exists because subfolder
+confinement alone was not enough: `output_subfolder()` confined the subfolder
+correctly and `collect_outputs()` then concatenated the raw reported filename
+onto it, so the escape lived in how the URL's two halves were joined rather
+than in what either half returned. That check reproduces the escape against the
+live agent's own output first, and only then asserts the fix — a hostile
+filename produces no image entry at all, rather than one served from a
+rewritten name.
+
+One part of this is reasoned rather than tested, and it is worth saying so:
+resolve-then-verify is what would catch a symlink already planted in the output
+volume, which no string rule can see, and nothing in the suite plants one. The
+order of operations is the argument there (`worker_agent.py`,
+`workspace_path()`), not a green check.
+
+## The assertions that could not fail, and what replaced them
+
+An assertion nobody has watched fail is a decoration, and this suite has
+caught ten of its own being exactly that, plus two behaviours no assertion
+reached at all:
+
+- Three assertions of the form "`comfy:queue` is empty afterwards" were
+  **proven unable to fail** by mutation testing. One agent polls one queue
+  here, so an entry a wrong implementation put back has already been popped
+  again by the time a check looks — `LLEN` reads 0 either way. They were
+  replaced by counting the command Redis actually executed
+  (`enterprise/test/queue_watch.py`).
+- The worker's guard for a server-side socket close was **deleted outright and
+  the whole suite stayed green**: no check reached it, because the one
+  dead-ComfyUI fixture closed in a way that made the client raise instead.
+  That is what `check-75-closed-socket.py` was written for.
+- A re-gate against a live mutation that really did requeue a rejected job
+  found the assertion still passing, because the watcher was armed after the
+  submit rather than before it (`check-20-failure-paths.py`, and the same
+  construction in `check-70-oom-paths.py`).
+- **"At least three progress events"** passed on an agent that filters progress
+  and not terminals: the stub's foreign terminal event arrives *after* all
+  three, so the job ends on somebody else's completion with three progress
+  events already delivered. `check-10-stream.py` now counts foreign events over
+  the job's whole stream and requires the one terminal event to carry this
+  job's own `prompt_id`.
+- **Every estimated-wait assertion — four of them — ran against a one-entry
+  queue**, where index `-1` and index `0` are the same entry — so nothing could
+  tell which end of the queue the gauge reads, and a gauge reading the head
+  reports ~0 on an hour-old backlog. `check-80-estimated-wait.py` now submits
+  a second job behind the manufactured stale one.
+- **A requeue that jumps the queue is invisible to every other check**: the job
+  is still requeued once, still completes, and `comfy:queue` still receives
+  exactly one write. Only its position changes.
+  `check-55-retry-placement.py` builds a two-lane backlog with a real middle
+  and asserts the whole service order afterwards.
+
+The harness itself had the same shape of hole, and it is worth naming beside
+them: `run.sh` folded only a check's exit status, so a check that kept printing
+its `FAIL` lines while its `sys.exit(1)` went missing left the suite — and CI,
+which reads the same status — green over its own output. It now reads each
+check's output for the shared `check()` helper's own line format as well.
+
+So the useful thing to do with this suite is to distrust the authors and check.
+Delete the `prompt_id` filter in `worker_agent.py`, or its SIGTERM handler, or
+the workspace confinement, and run `make test`: something goes red, and which
+assertion goes red tells you what that code was actually holding. It is a
+faster way to find out what the suite is worth than reading it.
+`docs/10-roadmap.md` states the standing rule in the other direction — an
+existing assertion may be replaced only by one that is strictly stronger, in
+the same commit, with both shown in review.
+
+## The fair-enqueue cost was measured, not assumed
+
+Fair queueing means placing a new job relative to the jobs already queued,
+which means reading them, inside one Lua `EVAL`. Redis executes one command at
+a time, so that read is time no other client gets — including every worker
+parked in `BLMOVE`, which is to say the pool stops being handed work for the
+duration. One submitter's insert is therefore a cluster-wide cost, and it was
+measured rather than reasoned about.
+
+| One `/api/generate`, 499-deep queue | ~26 KB workflow | ~103 KB workflow |
+|---|---:|---:|
+| Whole envelope in the list | 117.7 ms | 1235 ms |
+| Ordering record in the list, workflow at `comfy:job:<id>:payload` | 1.6 ms | 2.2 ms |
+
+The second column is the more useful one: what the insert reads per entry is
+now fixed, so the cost has stopped tracking a size the *client* chooses.
+`bench-fair-enqueue.py` (above) imports the real `hub.py` rather than
+reimplementing the call shape, and uses its own key namespace, so the numbers
+are re-measurable against any Redis — the recorded ones are an M-series laptop
+with redis-server 8. This suite structurally cannot see this at all, since it
+runs a queue three jobs deep with a two-node workflow where every version of
+the insert is instant; `make lint` pins the shape the number depends on, and
+`docs/09-engineering-handoff.md` section 3 has the row.
 
 ## The pytest layer (`enterprise/test/unit/`)
 

@@ -1,18 +1,21 @@
 # Roadmap
 
-The improvements listed at the end of `README.md`, turned into a work plan:
-what each one actually touches, what proves it, what order they can safely land
-in, and which of them cannot be finished without spending money on a real
-cluster.
+The ideas the README used to list at its end, turned into a work plan: what
+each one actually touches, what proves it, what order they can safely land in,
+and which of them cannot be finished without spending money on a real cluster.
+The README now keeps only a pointer here; "The list, as the README carried it"
+below is the ledger of those twelve items and where each one went.
 
 All four foundations have landed — F3, F1 and F2 in that order, then F4 after
 the queue lane — and so has the whole queue lane: Q1, Q2, Q3, Q6, Q4 and Q5.
-What is left is the infra and supply lanes — I1, I2, I3, I4, I7, S1 and S2 —
-none of which is implemented, plus I5, which is an unscoped spike, and I6,
-which is decided against. This document exists so that the next person to
-pick up a line item does not have to re-derive its blast radius, and so that
-several of them can be worked in parallel without three people editing
-`hub.py` at once.
+Of the infra and supply lanes, I1 has landed (the scheduled warm floor); I2,
+I3, I4, I7, S1 and S2 have not, I5 is an unscoped spike, and I6 is decided
+against. An audit sweep after the queue lane also landed a set of fixes that
+were on no list — "Landed in the audit sweep" below records them so the
+statuses here stay the whole of what changed. This document exists so that
+the next person to pick up a line item does not have to re-derive its blast
+radius, and so that several of them can be worked in parallel without three
+people editing `hub.py` at once.
 
 The first version of this file was written from the documentation rather than
 from the source, and was wrong in seventeen places. This version was built from
@@ -40,7 +43,7 @@ copied `*.py` into the work directory by glob but invoked checks by hardcoded
 name, and threaded their exit codes by hand. A botched merge there **fails
 open** — the new check is copied, never run, and the suite is green. That is
 why F3 landed before any queue work. It now discovers every `check*.py`, and
-the seventeen check files are named under the convention F3 settled
+every check file since is named under the convention F3 settled
 (`enterprise/test/README.md`); `check4.py` was never written.
 
 **There is a hard verification boundary.** `make test` and `make lint` prove the
@@ -52,12 +55,15 @@ items are cluster-only for a failing assertion — I3, I4 and I7, whose "proven
 by" column reads *cluster day* and nothing else. The other fourteen have a
 laptop half.
 
-**Twenty-three invariants are load-bearing** — `docs/09-engineering-handoff.md`
+**Twenty-six invariants are load-bearing** — `docs/09-engineering-handoff.md`
 §3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth,
 Q3 the seventeenth, Q1 the eighteenth, Q4 the nineteenth and Q5 the twentieth,
-and the cross-wave sweep the last three — the worker's per-process identity,
-F4's keepalive-and-fence, and reap durability. That is what "changes an
-invariant" looks like in practice.)
+the cross-wave sweep three more — the worker's per-process identity, F4's
+keepalive-and-fence, and reap durability — and the audit sweep the last
+three: the compare-and-set claim with the interrupt-and-drain, the
+default-deny namespace with the worker's ACL user, and output and showback
+scoping under `oauth`. That is what "changes an invariant" looks like in
+practice.)
 Touching an invariant is not a useful filter, because nearly every item does.
 The filter that *is* useful: an item is high-risk if it **changes** an
 invariant rather than merely working near one. Four have — F1, Q2, Q3 and F4,
@@ -199,7 +205,7 @@ What landed:
 check is a file and not also an edit in two hardcoded places, and settle the
 naming convention before six items each create their own `check4.py`. Then
 extend `scripts/lint.sh`'s manifest loop from `yaml.safe_load_all` to shape
-assertions. Ten of §3's twenty-three invariants name a manifest, a
+assertions. Ten of §3's invariants name a manifest, a
 Containerfile or a shell script in their "where" column rather than a line of
 Python — a missing toleration, a Service that regained a port, a dropped Route
 annotation, a Containerfile that lost its `chgrp 0` block — and the e2e suite
@@ -263,6 +269,23 @@ are redesigns of the worker/ComfyUI contract, not edits to this file. The same
 gap applies to `finish()` on the terminal side, where the consequence is
 smaller: a second terminal event on a stream, not a second GPU.
 
+**Corrected by the audit sweep: the submit-side window is closed.** The
+paragraph above was right that closing it *inside the POST* is a redesign,
+and wrong that the check-then-act had to stay. The two operations that raced
+were both against Redis — read the owner, then `HSET` the phase — and two
+Redis operations can be one Lua script. `claim_executing()`
+(`CLAIM_EXECUTING_LUA` in `worker_agent.py`) now writes `executing` only if
+the owner field still names this incarnation, atomically, and the worker
+submits only on success; a reap that lands between the old read and the old
+write now lands before or after a single command, and either way the worker
+sees it. `check-36-live-worker-fencing.py` scenario C reaches the window with
+a test-only pause (`TEST_DELAY_BEFORE_CLAIM_S`, never set in a manifest),
+because at microseconds wide nothing external can. What remains is exactly
+what the paragraph said it would be: the POST itself is still to another
+process, so a reap landing between a successful claim and ComfyUI receiving
+the request is not caught — that is the fencing-token or idempotency-key
+redesign, and it is still not this file. The `finish()` side is unchanged.
+
 Two smaller things F4 also does not do. The reaper's requeue still does not
 accrue, so an attempt that held a card for a slow prologue and was then reaped
 has that time billed to nobody — the second attempt's `started_at` overwrites
@@ -286,7 +309,7 @@ was wrong.
 | Q6 | Estimated-wait metric — **landed** | Small | Low | Queue | `enterprise/test/check-80-estimated-wait.py`: `comfy_estimated_wait_seconds` is exposed on `/metrics` in proper gauge form, reads zero or absent only with an empty queue, and reflects a manufactured entry's real `submitted_at` (grows with wall-clock time, not with a constant or queue depth) — the scaler half is I4 |
 | Q4 | Showback report — **landed** | Small | Low | Queue | `enterprise/test/check-90-showback.py`: `/api/showback` reports GPU seconds against the submitting user and tracks real wall-clock duration rather than a constant, two users' totals do not bleed into each other, an anonymous submission lands in its own explicit bucket, a *failed* job is still billed, a job whose worker was SIGKILLed is accounted rather than lost, and the `comfy:showback:*` key count stays below the number of identities that fed it — plus lint shapes for the expiry and the identity cap, which a one-minute suite cannot see |
 | Q5 | GPU-second quota breaker — **landed** | Medium | Medium | Queue | `enterprise/test/check-95-quota-breaker.py`: a submitter already over the ceiling produces ZERO writes to `comfy:queue` — armed before the request, counted, not inferred from `LLEN` afterwards — and is refused with a 429 that names the quota; a submitter under it, one with no accounting at all, and one whose accounting is present but unreadable are each queued exactly once and run to completion; and `/readyz` stays `{"ok": true}` throughout, with the over-quota identity sent on the readyz request itself. Plus the lint shape that keeps the breaker out of the readiness path — the half a green suite cannot see |
-| I1 | Schedule the warm window | Small | Low | Infra | New unit test on a pure helper; behaviour on cluster day |
+| I1 | Schedule the warm window — **landed** | Small | Low | Infra | `enterprise/manifests/03-autoscale.yaml`'s `cron` trigger, driven by `WARM_WORKERS`/`WARM_START`/`WARM_END`/`WARM_TIMEZONE`; `scripts/lint.sh` fails a floor above `maxReplicaCount` (a floor KEDA clamps and never reports), with a fixture in `scripts/lint-fixtures/manifests/`. Behaviour on cluster day |
 | I2 | Split the worker image | Medium | Low | Infra | A new CI job — the existing one builds only the gateway image |
 | I3 | Placeholder pod + PriorityClass | Medium | Medium | Infra | Cluster day: node held warm, real job still preempts |
 | I4 | Scale on wait, not depth | Medium | Medium | Infra | Cluster day; depends on Q6 |
@@ -317,11 +340,13 @@ was wrong.
 - **I4 and I7 are not parallel infra work.** Both are blocked behind queue
   items (I4 on Q6, I7 on Q2's phase data), which the first version of this file
   acknowledged in one column and contradicted in another.
-- **I1 and I3 contradict each other.** Both want to own the GPU pool's
+- **I1 and I3 contradicted each other.** Both wanted to own the GPU pool's
   min-replicas — I1 by cron during working hours, I3 by a placeholder pod
-  holding a node — and any `setup.sh` re-run resets whatever cron did. Pick one
-  mechanism before either branches. This is a design conflict, not a merge
-  conflict.
+  holding a node — and any `setup.sh` re-run reset whatever cron did.
+  Settled. I1 landed as a declarative KEDA trigger reading `.env`, so a
+  `setup.sh` re-run reasserts the floor rather than resetting it; the
+  min-replicas ownership conflict only existed for the cron-job
+  implementation. I3 remains unscheduled.
 
 ### Found while writing the OOM checks
 
@@ -423,7 +448,7 @@ for "no data".
   than that queries data that has not moved yet; 30s or coarser is the honest
   floor, not KEDA's 15s default the Redis trigger uses.
 - **Threshold value is a product decision, not a technical one.** It trades
-  against the 8-15 minute cold start `03-autoscale.yaml` already documents:
+  against the 8–17 minute cold start `03-autoscale.yaml` already documents:
   too low and a worker scales up for a job that would have been picked up in
   seconds anyway; too high and a user waits through avoidable idle-queue time
   before the pool even starts warming. Cluster day is where this gets tuned
@@ -633,25 +658,50 @@ now removes the entry only after the reap returns, retries a reap that raised
 on a later tick, and sets aside an entry that can never be reaped on a capped,
 expiring list. `check-37-reap-durability.py` injects one fault per scenario.
 
-### Found by the cross-wave sweep, not yet done
+### Found by the cross-wave sweep, done by the audit sweep
 
-**The showback hash FIELD is not clamped, so the documented key-space bound is
-too small.** `MAX_ENVELOPE_FIELD_CHARS` bounds the identity on the way into the
-envelope, but the field written into the showback hash is the raw one, so the
-per-period bound is larger than the comment claims.
+**The showback hash FIELD was not clamped, so the documented key-space bound
+was too small.** `MAX_ENVELOPE_FIELD_CHARS` bounded the identity on the way
+into the envelope, but the field written into the showback hash was the raw
+one, so the per-period bound was larger than the comment claimed.
 
-It is genuinely minor — the bound is still a bound, and `SHOWBACK_MAX_USERS`
-caps the field count regardless — but it is worth a note about how it was almost
-fixed. A documentation pass changed one line so the *write* side used the
-clamped identity, and left the quota *read* side using the raw one. That is a
-quota bypass reachable from a client-supplied header: charges land in one bucket
-while the check reads another. It was caught by the gate, reverted, and is
-recorded here because the lesson is more useful than the bug.
+It was genuinely minor — the bound was still a bound, and `SHOWBACK_MAX_USERS`
+caps the field count regardless — but it is worth keeping the note about how
+it was almost fixed. A documentation pass changed one line so the *write* side
+used the clamped identity, and left the quota *read* side using the raw one.
+That is a quota bypass reachable from a client-supplied header: charges land
+in one bucket while the check reads another. It was caught by the gate,
+reverted, and recorded here because the lesson is more useful than the bug.
 
-Do it properly or not at all: clamp both sides together, in one change, with an
-assertion that a long identity is charged and checked under the *same* key, and
-a mutation proving that assertion fails if the two ever diverge. *(Small, and
-strictly a security-adjacent change rather than a tidy-up.)*
+It has since been done the way this entry asked for: the clamped identity —
+not the raw header — is what `generate()` writes to the job's state hash, so
+the accrual and the quota read both derive their field name from the same
+clamped value, and `check-90-showback.py` asserts a 300-character identity
+lands on the hash, and therefore in the report, clamped to
+`MAX_ENVELOPE_FIELD_CHARS`.
+
+### Landed in the audit sweep
+
+A six-pass audit after the queue lane produced a set of fixes that were on no
+list here. None is a roadmap item, because none was a feature; they are
+recorded so that the statuses above are the whole of what changed, and each
+has a check or a lint rule that fails on the tree before it.
+
+| Where | What changed | Proven by |
+|---|---|---|
+| Worker | A prompt the agent gives up on — `JOB_TIMEOUT`, a closed socket, any exception out of the receive loop — is sent ComfyUI's `/interrupt`, and the agent waits up to `INTERRUPT_DRAIN_TIMEOUT` (60 s) for `/queue` to empty before its next `BLMOVE`; a ComfyUI that never drains makes the agent exit non-zero and deregister so the pod restarts | `check-67-job-timeout-interrupt.py`; `fake_comfy.py` made serial for it |
+| Worker | The `executing` claim is a Lua compare-and-set on the owner field (the F4 correction above) | `check-36`, scenario C |
+| Worker | Output confinement, five more ways: previews (`type != output`) are not served; an output reported inside another submitter's workspace is refused rather than moved; subfolder components are validated like filenames; URLs are percent-encoded; the raw `data.output` manifest is stripped from forwarded `executed` events, and the gateway drops a URL from any raw event whose components are not bare names | `check-65`, (e)–(i); `check-10` |
+| Worker | Explicit `REDIS_SOCKET_TIMEOUT` and `REDIS_CONNECT_TIMEOUT`, and an `AGENT_LIVENESS_FILE` touched on every idle pass, every in-job receive pass and every keepalive refresh, which the manifest's combined exec liveness probe checks the age of (120 s) | `check-68-agent-liveness-file.py` |
+| Gateway | Under `AUTH_MODE=oauth`, `/outputs` is scoped to the caller's workspace and `/api/showback` to the caller's row unless they are in `SHOWBACK_OPERATORS`; `AUTH_MODE` is read by `hub.py` for the first time; `workspace_name()` is mirrored as a `SHARED WORKSPACE` block lint diffs | `check-66-output-scoping.py` |
+| Gateway | `/api/stats` and `/metrics` are one cached snapshot per `STATS_CACHE_SECONDS` (5) instead of a keyspace `SCAN` per call; `REDIS_MAX_CONNECTIONS` (200) bounds the pool; a WebSocket for an unknown job closes 4404 and one that has lived `EVENT_STREAM_TTL` closes 4408 | `check-15-gateway-limits.py`, `check-10` |
+| Gateway | `POST /api/generate` requires `Content-Type: application/json` (415), malformed JSON is 400, a body over `MAX_BODY_BYTES` is 413, and the `MAX_QUEUE_DEPTH` check moved inside the fair-enqueue Lua so concurrent submits cannot exceed it | `check-10`, `check-15` |
+| Gateway | A job the reaper requeued remembers which entry it came from, so a second reap of the same processing-list entry removes the entry instead of failing the live retry; the clamped identity lands on the state hash; `EVENT_STREAM_TTL` and `REAPER_INTERVAL` are validated at import; shutdown awaits the reaper and closes the pool; a second lint rule compares `state_key`/`stream_key`/`payload_key`, the TTL default and the cancel field between the two files by AST | `check-37`, scenario C; `check-90`; `scripts/lint.sh` |
+| Manifests | Namespace default-deny with six allow policies (`06-network-policy.yaml`); the worker connects as the least-privilege `comfy-worker` ACL user (`00-redis.yaml`, `setup.sh` patches the existing Secret); `automountServiceAccountToken: false` on Redis, gateway and worker; worker `RollingUpdate` one pod at a time with no surge; PDBs on worker and Redis, and the gateway's moved to `01-gateway.yaml` so it applies under `SCALE_TO_ZERO=false` too; preferred anti-affinity for the gateway pair; read-only root filesystem where feasible | Lint rules for policy coverage, the ACL allowlist, the automount, and the worker's Redis user, each with a fixture |
+| Manifests | **I1 — the scheduled warm floor** (`WARM_WORKERS` and friends) as a KEDA `cron` trigger | The I1 row above |
+| Images | ComfyUI and ComfyUI-Manager pinned to commit SHAs everywhere (`c2bcbecd…` = v0.32.0, `da5e88aa…` = Manager 4.2.2); the worker image installs `app/requirements-extra.txt`; the `chmod g=u` narrowed to the directories the process writes; `start.sh` forwards `"$@"` and honours `AGENT_DISABLED=1` for CI | `nightly.yaml` boots both GPU images as an arbitrary UID on CPU |
+| CI | `permissions: contents: read`, per-job `timeout-minutes`, cancel-in-progress concurrency, SHA-pinned actions, kubeconform against real Kubernetes/OpenShift/KEDA schemas, Trivy after the UID proof and non-blocking on PRs (the nightly scan gates), torch pinned in the CPU smoke to the Containerfile versions | The PR that carried it is the first run |
+| Scripts | `04-storage.sh` treats only `MountTargetConflict` as "already exists"; `99-teardown.sh` clears EFS mount targets before the stack delete and reports failed resources instead of dying silently; `06-status.sh` warns on an unknown instance rate and prices autoscaled pools from live node count; `ASSUME_YES` comes only from `--yes`; `MANAGER_REF` and the `TORCH_*` build args are plumbed through `.env.example` and `05-deploy.sh` | `scripts/unit-tests.sh` (40 assertions) |
 
 ### Deferred, with reasons
 
@@ -701,9 +751,9 @@ alongside; `I6` is not scheduled.
 
 What actually happened, since the plan and the record are worth telling apart:
 F3 → F1 → F2, then Q1 → Q2 → Q3, then Q6 → Q4 → Q5, then F4 — which did not
-exist when this order was drawn — and the sweep fixes beside it. The infra and
-supply items were not started, so I1, S1, I2 and S2 are still ahead of the
-queue lane in the plan and behind it in the history.
+exist when this order was drawn — and the sweep fixes beside it, then the
+audit sweep, which carried I1. S1, I2 and S2 are still ahead of the queue
+lane in the plan and behind it in the history.
 
 ## Three lanes
 
@@ -719,7 +769,8 @@ lint`, hand the merged tree on.
 `enterprise/setup.sh` (591 lines), but they hit mostly disjoint regions and can
 be worked in branches or worktrees. The exceptions must be sequenced: I2 before
 S2 (both rewrite the image build and its call sites), I2 before its CI job, and
-I1 with I3 only after the min-replicas ownership conflict above is settled.
+I3 only on top of I1's trigger rather than beside it — the min-replicas
+ownership conflict above is settled by I1 owning the floor declaratively.
 
 **Prose lane — after each merge.** Every merged change owes three edits: the
 README section it changes, the §3 invariant table in `docs/09` if it adds or
@@ -787,10 +838,67 @@ boundaries explicitly rather than assuming them.
   whether CI is green.
 - **No cluster is left running.**
 
+## The list, as the README carried it
+
+The README's "Ideas worth doing next" was ordered by payoff per unit of work
+and kept struck items in place — shipped ones because a roadmap that never
+visibly moves is a wish list, and decided-against ones because the reasoning
+is the useful part. It now lives here, in the same order, each item mapped to
+its ID above.
+
+1. **Schedule the warm window instead of pinning it** — I1, **landed**, as
+   `WARM_WORKERS`/`WARM_START`/`WARM_END`/`WARM_TIMEZONE` driving a KEDA
+   `cron` trigger rather than as the two cron lines first proposed. The
+   cold-start-free morning without paying for a card overnight; still the
+   single highest-value setting for a design team.
+2. **Shrink the cold start itself** — I2 and I3. The ~10 GB image pull
+   dominates node warm-up. Split the worker image so the CUDA + torch layers
+   are a stable base that rarely changes, and keep a low-priority placeholder
+   pod on the GPU pool so the autoscaler holds one warm node without a real
+   job occupying the card. *(Medium — the placeholder/priority-class pattern
+   is standard cluster-autoscaler practice.)*
+3. **Stage models on the node's local NVMe** — I5, a spike, not yet a work
+   item. `g6` instances have instance store, and an init container copying
+   the active checkpoint from EFS to local disk turns every later load into a
+   local read. It cannot be scoped from this repository: ROSA HCP exposes no
+   MachineSet, and the three plausible routes differ enormously in blast
+   radius, one colliding head-on with the arbitrary-UID posture. Answer that
+   before cluster day.
+4. ~~**Narrow retry**~~, and spot separately — Q2 **shipped**, I7 open. These
+   looked like one item and are not; "Decisions already made" above has both
+   halves.
+5. ~~**NVIDIA time-slicing**~~ — I6, **not doing this**; "Deferred, with
+   reasons" above keeps the argument.
+6. ~~**Per-user output workspaces**~~ — Q3, **shipped**, laptop half; the
+   arbitrary-UID half is on the cluster-day list. Reads are scoped under
+   `AUTH_MODE=oauth` since the audit sweep, and deliberately not under `none`
+   (`docs/06-enterprise-architecture.md`).
+7. ~~**Showback from the data you already collect**~~ — Q4, **shipped**;
+   "Q4 landed" above has the definition, the reaper decision and the
+   teardown caveat.
+8. ~~**Fair queueing**~~ — Q1, **shipped**, with the insert cost measured
+   rather than assumed (`bench-fair-enqueue.py`; §3 of `docs/09`).
+9. **Scale on queue *wait*, not queue depth** — I4, with the gauge half (Q6)
+   **landed**: `comfy_estimated_wait_seconds` is on `/metrics` and the
+   contract a Prometheus-scaler trigger needs is written up above. Pointing
+   KEDA at it still needs a cluster.
+10. **A model lockfile** — S1. `models.lock` next to `COMFYUI_REF`, enforced
+    by the S3 sync job, so an image tag and a model set pin together and a
+    workflow that rendered last quarter still renders. Reject anything that is
+    not `.safetensors` while you are there — `.ckpt` files are Python pickles
+    and loading one executes whatever is inside it. *(Medium; "S1 has no home
+    yet" above says which path to gate.)*
+11. ~~**A cost circuit breaker in the gateway**~~ — Q5, **shipped** as the
+    quota half, deliberately without the AWS Budgets half; "Q5 landed" above.
+12. **Build the images with OpenShift Pipelines** — S2. Bumping `COMFYUI_REF`
+    becomes a pipeline run with a signed output rather than a laptop running
+    `setup.sh`. *(Medium, and the right move once more than one person owns
+    this.)*
+
 ## Not on this list
 
 `docs/06-enterprise-architecture.md` ends with the things that are deliberately
-*not* here — Redis HA, multi-GPU workers, interrupting a running sampler — and
-the reasoning for each. Read it before adding any of them: in several cases the
-omission is the decision. Two items here (Q2 and Q3) do reverse entries on that
-list, and both say why.
+*not* here — Redis HA, multi-GPU workers, a gateway that reaches into ComfyUI —
+and the reasoning for each. Read it before adding any of them: in several
+cases the omission is the decision. Two items here (Q2 and Q3) do reverse
+entries on that list, and both say why.
