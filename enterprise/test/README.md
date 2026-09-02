@@ -227,7 +227,66 @@ match the served-next end. Both ages are read back off the queue itself rather
 than restated from the constant the check chose.
 
 **Path traversal is blocked** on the output endpoint — `/outputs/../../etc/passwd`
-must not resolve.
+must not resolve. And a raw `executed` event cannot smuggle one past it:
+`rewrite_image_urls()` builds the browser's URL from whatever `{filename,
+subfolder}` ComfyUI put on the event, which the worker forwards verbatim, so
+`check-10` writes an `executed` event straight onto a stream with a
+traversal, an absolute subfolder, a separator inside `filename` and an empty
+component, and requires each of those to arrive with no URL at all while
+ordinary shapes still get one.
+
+**The gateway refuses what it should, at the door** (`check-10-stream.py`). A
+body that is not JSON is a 400, a body declared over `MAX_BODY_BYTES` is a 413
+before a byte of it is read, a POST whose `Content-Type` is not
+`application/json` is a 415 — the body was parsed as JSON whatever the header
+said, so a `text/plain` cross-site form post could queue a job — and a
+WebSocket for a job id that names nothing is closed with code 4404 instead of
+being parked on a ping loop holding a Redis connection forever.
+
+**Three limits hold under pressure, not just in prose**
+(`check-15-gateway-limits.py`). Each is proven against a dedicated gateway
+whose limits the check chose, the way `check-95` pins its own quota. A
+WebSocket on a real job is closed by the server (code 4408) once
+`EVENT_STREAM_TTL` has elapsed — the stream it tails expired then, and a
+socket held past that is a connection held on nothing. `MAX_QUEUE_DEPTH`
+holds under a dozen *simultaneous* submits against a ceiling of three, with
+the one live agent frozen so the queue is observable: the depth check used to
+be an `LLEN` two awaits before the insert, and every submit that raced the
+read got in. And six back-to-back `/api/stats` calls cost Redis no more `SCAN`
+commands than one cold call — counted off `MONITOR`, `queue_watch.py`'s
+technique — because the endpoint is polled every five seconds per browser tab,
+unauthenticated, and each call was a full-keyspace scan of a single-threaded
+Redis.
+
+**A requeue whose removal failed is removed, not re-decided**
+(`check-37-reap-durability.py`, scenario C). The entry leaves a dead worker's
+list only after its reap has finished, and for a retryable death "finished"
+means the job is already back on the queue and running on a live worker. If
+the `LREM` that follows raises, the entry is still parked and the next look at
+it used to reap it again: stamp the ownership fence over the second attempt's
+claim, read a phase that is now `executing`, and fail a job that was running
+perfectly well — whose worker then discarded its own result because it no
+longer owned the job. The fault is a Redis ACL rule denying `LREM` for the
+instant the reaper needs it; the requeued job must complete with exactly one
+terminal event and its owner untouched, and the entry must leave the list
+within a few ticks.
+
+**Under `AUTH_MODE=oauth`, outputs are the submitter's own**
+(`check-66-output-scoping.py`). Q3's workspaces said reads were not scoped, on
+the argument that under `AUTH_MODE=none` the identity is a header the caller
+wrote. That argument is right for `none` and wrong for `oauth`, where the
+proxy sets the header from a real login — and where any logged-in user could
+read any other's images, because a workspace name is a pure function of a
+username `/api/showback` listed. The check runs a dedicated `AUTH_MODE=oauth`
+gateway and discovers alice's workspace the way `check-60` does, off the URL
+the worker reports for a real job of hers — so a gateway whose mirrored
+`workspace_name()` disagreed with the worker's would refuse alice her own
+file. bob gets a 403, so does a request with no identity, a
+`/outputs/<alice>/../<bob>/x` is refused on its *resolved* path, and the
+`none` gateway still serves alice's file to bob, pinned because that is that
+mode's documented behaviour. `/api/showback` under `oauth` names other
+submitters only to callers listed in `SHOWBACK_OPERATORS`; everyone else gets
+their own row and the totals.
 
 **Outputs are per-submitter, and a submitter's name cannot escape.** Two users
 submitting the identical workflow land in two different directories, which the
@@ -292,9 +351,13 @@ rather than assumed. Finally it drives nine distinct submitter identities —
 including a path-traversal string and a 300-character one — through the system
 and asserts `comfy:showback:*` holds *fewer keys than that*: the identity is a
 client-supplied header, and one Redis key per submitter is unbounded growth
-against a `noeviction` Redis. What this cannot see is the accumulator's
-expiry, which is measured in months, or its identity cap, which is a thousand;
-`scripts/lint.sh` pins both.
+against a `noeviction` Redis. The 300-character identity also has to land on
+the state hash — and therefore in the report — *clamped* to
+`MAX_ENVELOPE_FIELD_CHARS`: the field count is capped in Redis, but a field
+name is built from whatever `generate()` wrote on the job, and writing the raw
+header there was a second, uncounted way to grow the one Hash the cap bounds.
+What this cannot see is the accumulator's expiry, which is measured in months,
+or its identity cap, which is a thousand; `scripts/lint.sh` pins both.
 
 **An over-quota submission never reaches the queue, and everything else
 still does.** `check-95-quota-breaker.py` (docs/10-roadmap.md, Q5) starts its
