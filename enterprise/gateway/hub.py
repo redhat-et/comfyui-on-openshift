@@ -756,18 +756,18 @@ def showback_accrue_call(state: str, destination: str,
 #      what could not be read (see log() above). The budget alarm remains the
 #      backstop.
 #
-#      "Redis unreachable" reaches this fail-open only when it fails between
-#      generate()'s two reads — this one and the backpressure `LLEN` above it
-#      in the function, which is NOT wrapped the same way and raises
-#      unhandled. For an outage that takes the whole instance down, that LLEN
-#      is what the submitter actually sees (a 500, not a quiet pass-through);
-#      it is deliberately not softened to match, because backpressure exists
-#      to protect Redis from an unbounded queue and "proceed when you cannot
-#      even read the depth" is the one answer that control must not give. The
-#      logged fail-open here is real and reachable — a read that fails on its
-#      own (a single flaky call, a differently-sharded key in a clustered
-#      Redis) — just not the "Redis is entirely down" case the phrase most
-#      readily suggests.
+#      "Redis unreachable" reaches this fail-open on its own terms: the quota
+#      read is the first Redis call generate() makes, so an outage that takes
+#      the whole instance down logs a fail-open here and then raises,
+#      unhandled, on the enqueue script one call later — the submitter sees a
+#      500, not a quiet pass-through, and nothing was written. That script is
+#      NOT softened to match, because backpressure lives inside it
+#      (FAIR_ENQUEUE_LUA) precisely so that "proceed when you cannot even
+#      read the depth" is an answer this endpoint cannot give. The logged
+#      fail-open here is real and reachable — a read that fails on its own
+#      (a single flaky call, a differently-sharded key in a clustered Redis)
+#      — just not the "Redis is entirely down" case the phrase most readily
+#      suggests.
 #
 #   3. IT IS NOT WIRED INTO readyz(), NOT EVEN TRANSITIVELY. That endpoint is
 #      the gateway's readiness probe: a quota check inside it would take the
@@ -1022,6 +1022,20 @@ local new_entry = ARGV[1]
 local new_lane = ARGV[2] or ""
 local workflow = ARGV[3]
 local payload_ttl = tonumber(ARGV[4])
+local max_depth = tonumber(ARGV[5]) or 0
+
+-- Backpressure, INSIDE the script rather than an LLEN in the caller: a depth
+-- read in one round trip and an insert in the next is a window every submit
+-- that arrived in between fits through, so N clients retrying against a full
+-- queue all read "one short of full" and all get in. Here the read and the
+-- insert are one atomic unit, and the refusal happens before the payload is
+-- written so a refused submit leaves nothing behind. 0 disables the ceiling.
+if max_depth > 0 then
+  local depth = redis.call('LLEN', key)
+  if depth >= max_depth then
+    return {-1, depth}
+  end
+end
 
 -- The workflow lands beside the queue BEFORE the entry pointing at it lands on
 -- the queue, so there is no ordering in which a worker pops a pointer whose
@@ -1105,9 +1119,14 @@ else
 end
 
 -- {jobs queued before this one (any lane), jobs that will be served before
--- this one under fair-queueing order}
+-- this one under fair-queueing order} — or {-1, depth} when the queue was
+-- full and nothing was written (QUEUE_FULL below).
 return {n, insert_at - 1}
 """
+
+# What the script's first return value is when it refused the insert. The
+# second value is then the depth it saw, for the 503's text.
+QUEUE_FULL = -1
 
 
 def fair_enqueue_call(envelope: dict) -> tuple[list, list]:
@@ -1124,7 +1143,8 @@ def fair_enqueue_call(envelope: dict) -> tuple[list, list]:
         [json.dumps(queue_record(envelope)),
          envelope["queue_key"],
          json.dumps(envelope["workflow"]),
-         PAYLOAD_TTL],
+         PAYLOAD_TTL,
+         MAX_QUEUE_DEPTH],
     )
 
 
@@ -1506,7 +1526,18 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int) -> 
     # nothing wrong, which is the starvation Q1 exists to prevent, arriving by
     # a new door. It rejoins at the back of its own lane's round.
     keys, args = fair_enqueue_call(envelope)
-    _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+    queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+
+    if queued_before == QUEUE_FULL:
+        # The queue filled between reap_stranded_job()'s early check and
+        # here. Hand the retry back — nothing was written — and fail the job
+        # the way that check would have.
+        await conn.hincrby(state_key(job_id), ATTEMPT_COUNT_FIELD, -1)
+        await fail_orphaned_job(
+            conn, job_id,
+            f"{DEAD_WORKER} before ComfyUI saw the workflow, and the queue was "
+            f"full ({position} jobs) so it could not be requeued. Resubmit. {DESCRIBE_HINT}.")
+        return
 
     await conn.hset(
         state_key(job_id),
@@ -1630,8 +1661,10 @@ async def reap_stranded_job(conn: redis.Redis, raw: str) -> None:
     # Backpressure applies to requeued work exactly as it does to new work:
     # this is the same one physical list, bounded by the same ceiling, and a
     # pool that is dying faster than it drains must not be the one path that
-    # gets to grow the queue past it. Checked before the counter moves, so a
-    # job refused here has not spent its retry.
+    # gets to grow the queue past it. The bound itself is inside
+    # FAIR_ENQUEUE_LUA; this early read is so that a job refused on a full
+    # queue has not spent its retry, and requeue_orphaned_job() hands the
+    # retry back in the rare case the queue fills in between.
     depth = await conn.llen(QUEUE_KEY)
 
     if depth >= MAX_QUEUE_DEPTH:
@@ -1854,13 +1887,6 @@ async def generate(request: Request):
 
     conn = client()
 
-    # Backpressure. Without this a stuck worker pool turns into an unbounded
-    # Redis list, and the first symptom is Redis OOM rather than a slow queue.
-    depth = await conn.llen(QUEUE_KEY)
-
-    if depth >= MAX_QUEUE_DEPTH:
-        raise HTTPException(503, f"queue is full ({depth} jobs). Try again shortly.")
-
     # Who spent the GPU, and — since Q1 — whose fair-queueing lane this job
     # belongs to. oauth-proxy sets X-Forwarded-User for the authenticated user
     # (its pass-user-headers default); recording it answers "whose job is
@@ -1920,7 +1946,16 @@ async def generate(request: Request):
     # unlike a doc comment the field name travels with the value to every
     # place it is read.
     keys, args = fair_enqueue_call(envelope)
-    _queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+    queued_before, position = await fair_enqueue_script()(keys=keys, args=args)
+
+    # Backpressure. Without it a stuck worker pool turns into an unbounded
+    # Redis list, and the first symptom is Redis OOM rather than a slow queue.
+    # Decided INSIDE the script, atomically with the insert — an LLEN here
+    # followed by the enqueue was a window N simultaneous submits all fit
+    # through — and before anything was written, so a refused submit leaves
+    # no payload, no state and no stream behind.
+    if queued_before == QUEUE_FULL:
+        raise HTTPException(503, f"queue is full ({position} jobs). Try again shortly.")
 
     # phase is seeded here rather than left for the worker to create, so the
     # breadcrumb is never absent on a job that exists. The reaper reads a
