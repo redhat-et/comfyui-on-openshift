@@ -1,8 +1,9 @@
 # The briefing
 
-Four slides. Each opens with the questions on the table and answers them:
+Five slides. Each opens with the questions on the table and answers them:
 the current state of ComfyUI teams, the proposed state, what this repository
-does to enable it, and where vLLM Omni fits.
+does to enable it, the one-sentence economics — *residency scales with
+catalog size; the pool scales with concurrency* — and where vLLM Omni fits.
 
 *(GitHub renders this page when you browse the folder — the deck below is
 the deck. For presenting: [`index.html`](index.html) is the live version,
@@ -23,7 +24,11 @@ is the same slides as a click-through PDF.)*
 
 ---
 
-![Slide 4 — Where vLLM Omni fits: the engine is the throughput tier, the pool is the flexibility tier, and the asks](slides/slide-4.png)
+![Slide 4 — The economics in one sentence: residency scales with catalog size, the pool scales with concurrency; the catalog curve and every supporting argument](slides/slide-4.png)
+
+---
+
+![Slide 5 — Where vLLM Omni fits: the engine is the throughput tier, the pool is the flexibility tier, and the asks](slides/slide-5.png)
 
 ---
 
