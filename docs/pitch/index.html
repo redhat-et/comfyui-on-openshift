@@ -353,36 +353,36 @@
     <div class="eyebrow">4 · Seeing it work</div>
     <div class="heard">
       <span class="hl">The questions on the table</span>
-      <p>Can we see it work — before anyone stands up a cluster or files a GPU quota ticket?</p>
+      <p>Can we see it work — the workflow designers actually have, not a mockup of it?</p>
     </div>
-    <h1>The pool, live on a laptop — zero dollars of cloud</h1>
-    <p class="kicker"><span class="mono">make demo-local</span> runs the real architecture on the machine in front of you: real Redis, the real gateway, and N real ComfyUI workers rendering on the laptop's own GPU — Apple silicon included. <b>This screenshot is that pool</b>: one real render, through queue → worker → shared storage.</p>
+    <h1>The designer's loop, live — only the silicon moved</h1>
+    <p class="kicker"><span class="mono">make demo-local</span> runs the real pool on the machine in front of you, zero dollars of cloud — and each worker serves <b>the stock ComfyUI canvas</b>, the exact frontend designers already run. Below, mid-loop: the SDXL template loaded, and the two checkpoints this worker does not have — <b>found, named and sized</b> before anything runs.</p>
     <div class="cols">
-      <div class="col" style="flex:1.3;">
+      <div class="col" style="flex:1.35;">
         <div class="card" style="flex:1; padding:9px; display:flex; min-height:0;">
-          <img src="demo-local-gateway.png" alt="The gateway UI on a laptop: a workflow queued against two real workers, live progress events, and the finished render" style="width:100%; height:100%; object-fit:contain; object-position:top; min-height:0; display:block;">
+          <img src="demo-local-canvas.png" alt="The stock ComfyUI canvas served by a pool worker: the SDXL template graph loaded, and the missing-models panel naming both checkpoints with their sizes" style="width:100%; height:100%; object-fit:contain; object-position:top; min-height:0; display:block;">
         </div>
       </div>
       <div class="col">
         <div class="card good-card">
-          <h3>Everything in it is real</h3>
+          <h3>The desktop loop, verbatim</h3>
           <ul>
-            <li><b>The same code the cluster runs</b> — gateway, queue, worker agent, ComfyUI at the same pinned commit</li>
-            <li>Fair pickup by N workers · replayable progress over WebSockets · outputs served off shared storage</li>
-            <li><span class="mono">--selftest</span> queues one render through the whole pipeline and verifies the PNG — exit 0 or 1</li>
+            <li>Load a template · wire the graph · run — <b>identical to the desktop</b>, same canvas, same nodes</li>
+            <li>Missing models load <b>to the worker, not the laptop</b> — <b>ComfyUI-Manager</b>, server-side, onto the shared volume, pulled once for everyone</li>
+            <li>Run streams progress per node; the render lands on shared storage</li>
           </ul>
+        </div>
+        <div class="card accent-card">
+          <h3>Manager is the hinge</h3>
+          <p style="font-size:13.5px;">The add-on is what lets the desktop habit survive the move to a cloud backend: the designer keeps clicking the same buttons while <b>the models and the GPU live in the datacenter</b>. It ships in the worker image; the gateway stays the multi-user door.</p>
         </div>
         <div class="card">
           <h3>Honestly not shown</h3>
-          <p style="font-size:13.5px;">A laptop has one GPU, so N workers time-share it — <b>this simulates the pods, not the silicon</b>. SSO, KEDA and machine pools scaling to zero need the cluster.</p>
-        </div>
-        <div class="card accent-card">
-          <h3>Why it matters</h3>
-          <p style="font-size:13.5px;">The evaluation ladder runs <b>$0 → $0 → ~$50</b>: <span class="mono">make test</span> proves the architecture, <span class="mono">make demo-local</span> renders through it, and a live-cluster demo day proves the economics.</p>
+          <p style="font-size:13.5px;">One laptop GPU time-shared — <b>pods simulated, silicon not</b>. SSO, KEDA and scale-to-zero need the cluster. The ladder: <b>$0 → $0 → ~$50</b> — <span class="mono">make test</span>, <span class="mono">make demo-local</span>, a live-cluster day.</p>
         </div>
       </div>
     </div>
-    <div class="foot"><span>enterprise/demo-local.sh — first run fetches torch and an SD 1.5 checkpoint; every later run is warm</span><span>4 / 6</span></div>
+    <div class="foot"><span>demo-local-designer-loop.mp4 and demo-local-pool.mp4, beside this deck — both recorded from make demo-local, real renders throughout</span><span>4 / 6</span></div>
   </section>
 
   <!-- ================= SLIDE 5 : THE THESIS ================= -->

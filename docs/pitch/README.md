@@ -25,7 +25,7 @@ is the same slides as a click-through PDF.)*
 
 ---
 
-![Slide 4 — The pool, live on a laptop: make demo-local runs the real gateway, queue and workers on the machine's own GPU, and this render went through them](slides/slide-4.png)
+![Slide 4 — The designer's loop, live: the stock ComfyUI canvas served by a pool worker, missing models found and loaded server-side through ComfyUI-Manager, only the silicon moved](slides/slide-4.png)
 
 ---
 
@@ -37,12 +37,20 @@ is the same slides as a click-through PDF.)*
 
 ---
 
-Slide 4 also exists in motion:
-[`demo-local-pool.mp4`](demo-local-pool.mp4) is twenty seconds of the real
-thing — two browser panes queueing against the two-worker pool on one
-laptop, progress streaming over WebSockets, two different renders landing.
-`make demo-local` reproduces it on any machine with a GPU, Apple silicon
-included.
+Slide 4 also exists in motion, twice — both clips recorded off
+`make demo-local`, real renders throughout, reproducible on any machine
+with a GPU, Apple silicon included:
+
+- [`demo-local-designer-loop.mp4`](demo-local-designer-loop.mp4) — the
+  designer's loop, end to end: the stock ComfyUI canvas a pool worker
+  serves, the SDXL template loaded, two missing checkpoints found, named
+  and sized, **ComfyUI-Manager pulling 12.6 GB to the worker server-side**
+  (time-lapsed), errors clearing, and the graph rendering with per-node
+  progress. The add-on is the hinge of the whole story: the desktop habit
+  survives while the models and the GPU move to the datacenter.
+- [`demo-local-pool.mp4`](demo-local-pool.mp4) — the multi-user half: two
+  browser panes queueing against the two-worker pool at once, progress
+  streaming over WebSockets, two different renders landing.
 
 Every number on these slides is backed in this repository: the cost model in
 [`../02-cost.md`](../02-cost.md), the comparison table on the
