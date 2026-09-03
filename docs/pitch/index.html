@@ -243,7 +243,7 @@
         </div>
       </div>
     </div>
-    <div class="foot"><span>Adopters: comfy.org · Higgsfield figures: Reuters / FT / PR Newswire, Aug 2026 · SaaS pricing: vendor team tiers, 2026</span><span>1 / 5</span></div>
+    <div class="foot"><span>Adopters: comfy.org · Higgsfield figures: Reuters / FT / PR Newswire, Aug 2026 · SaaS pricing: vendor team tiers, 2026</span><span>1 / 6</span></div>
   </section>
 
   <!-- ================= SLIDE 2 : PROPOSED STATE ================= -->
@@ -292,7 +292,7 @@
       <div class="col"><div class="card"><h3>Finance sees</h3><p style="font-size:13.5px;">Per-user showback and monthly quota; three cost states, each one command (running / parked / torn down).</p></div></div>
       <div class="col"><div class="card"><h3>The platform team sees</h3><p style="font-size:13.5px;">One namespace. Driver, nodes, control plane, TLS: the platform's pager — the OpenShift sell, verbatim.</p></div></div>
     </div>
-    <div class="foot"><span>Rates: g6.xlarge (L4 24 GB) at $0.976/h all-in — the repo's own cost model, reconciled in its README</span><span>2 / 5</span></div>
+    <div class="foot"><span>Rates: g6.xlarge (L4 24 GB) at $0.976/h all-in — the repo's own cost model, reconciled in its README</span><span>2 / 6</span></div>
   </section>
 
   <!-- ================= SLIDE 3 : WHAT THE WORK DOES ================= -->
@@ -328,7 +328,7 @@
           <h3>Status <span class="chip green">merged · CI green</span></h3>
           <ul>
             <li>On <b>master</b>, released and tagged; four CI jobs per PR + nightly GPU-image builds, booted as an arbitrary UID and scanned</li>
-            <li>E2E suite runs the <b>real gateway and worker</b> on a laptop — no cluster, no GPU, ~1 min (<span class="mono">make test</span>)</li>
+            <li>E2E suite runs the <b>real gateway and worker</b> on a laptop — no cluster, no GPU, ~1 min (<span class="mono">make test</span>); <span class="mono">make demo-local</span> goes further — the real pool <b>rendering on the laptop's own GPU</b></li>
             <li>Shipped: per-user showback &amp; quota, warm-floor scheduling, dead-worker reaping, per-user workspaces, default-deny policy</li>
             <li>Docs 01–13, incl. scaling to hundreds of users and a first-cluster-day checklist</li>
             <li>Ahead: VRAM-tier routing (L4 → L40S → H100) and pool-aware agent/MCP access — both on the written roadmap</li>
@@ -345,12 +345,49 @@
         </div>
       </div>
     </div>
-    <div class="foot"><span>github.com/redhat-et/comfyui-on-openshift · docs/06 architecture · docs/13 the Omni relationship</span><span>3 / 5</span></div>
+    <div class="foot"><span>github.com/redhat-et/comfyui-on-openshift · docs/06 architecture · docs/13 the Omni relationship</span><span>3 / 6</span></div>
   </section>
 
-  <!-- ================= SLIDE 4 : THE THESIS ================= -->
+  <!-- ================= SLIDE 4 : THE POOL, LIVE ================= -->
+  <section class="slide" id="sL">
+    <div class="eyebrow">4 · Seeing it work</div>
+    <div class="heard">
+      <span class="hl">The questions on the table</span>
+      <p>Can we see it work — before anyone stands up a cluster or files a GPU quota ticket?</p>
+    </div>
+    <h1>The pool, live on a laptop — zero dollars of cloud</h1>
+    <p class="kicker"><span class="mono">make demo-local</span> runs the real architecture on the machine in front of you: real Redis, the real gateway, and N real ComfyUI workers rendering on the laptop's own GPU — Apple silicon included. <b>This screenshot is that pool</b>: one real render, through queue → worker → shared storage.</p>
+    <div class="cols">
+      <div class="col" style="flex:1.3;">
+        <div class="card" style="flex:1; padding:9px; display:flex; min-height:0;">
+          <img src="demo-local-gateway.png" alt="The gateway UI on a laptop: a workflow queued against two real workers, live progress events, and the finished render" style="width:100%; height:100%; object-fit:contain; object-position:top; min-height:0; display:block;">
+        </div>
+      </div>
+      <div class="col">
+        <div class="card good-card">
+          <h3>Everything in it is real</h3>
+          <ul>
+            <li><b>The same code the cluster runs</b> — gateway, queue, worker agent, ComfyUI at the same pinned commit</li>
+            <li>Fair pickup by N workers · replayable progress over WebSockets · outputs served off shared storage</li>
+            <li><span class="mono">--selftest</span> queues one render through the whole pipeline and verifies the PNG — exit 0 or 1</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Honestly not shown</h3>
+          <p style="font-size:13.5px;">A laptop has one GPU, so N workers time-share it — <b>this simulates the pods, not the silicon</b>. SSO, KEDA and machine pools scaling to zero need the cluster.</p>
+        </div>
+        <div class="card accent-card">
+          <h3>Why it matters</h3>
+          <p style="font-size:13.5px;">The evaluation ladder runs <b>$0 → $0 → ~$50</b>: <span class="mono">make test</span> proves the architecture, <span class="mono">make demo-local</span> renders through it, and a live-cluster demo day proves the economics.</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>enterprise/demo-local.sh — first run fetches torch and an SD 1.5 checkpoint; every later run is warm</span><span>4 / 6</span></div>
+  </section>
+
+  <!-- ================= SLIDE 5 : THE THESIS ================= -->
   <section class="slide" id="sT">
-    <div class="eyebrow">4 · The economics, in one sentence</div>
+    <div class="eyebrow">5 · The economics, in one sentence</div>
     <div class="heard">
       <span class="hl">The questions on the table</span>
       <p>Why not simply serve every model behind an engine? What actually drives GPU cost for this workload?</p>
@@ -415,12 +452,12 @@
         </div>
       </div>
     </div>
-    <div class="foot"><span>docs/13-vllm-omni.md — the arithmetic, the catalog curve, and the boundary of the bridge</span><span>4 / 5</span></div>
+    <div class="foot"><span>docs/13-vllm-omni.md — the arithmetic, the catalog curve, and the boundary of the bridge</span><span>5 / 6</span></div>
   </section>
 
-  <!-- ================= SLIDE 4 : ONE PLATFORM, EVERY CORNER ================= -->
+  <!-- ================= SLIDE 6 : ONE PLATFORM, EVERY CORNER ================= -->
   <section class="slide" id="s4">
-    <div class="eyebrow">5 · Where vLLM Omni fits — and the asks</div>
+    <div class="eyebrow">6 · Where vLLM Omni fits — and the asks</div>
     <div class="heard">
       <span class="hl">The questions on the table</span>
       <p>Where does the strategic inference engine fit in this? And does any of it stray into the application layer?</p>
@@ -455,18 +492,18 @@
       <div class="col">
         <div class="card">
           <h3>Zero-cost due diligence, today</h3>
-          <p style="font-size:13.5px;"><span class="mono">make test</span> runs the real gateway and worker on a laptop in about a minute — no cluster, no GPU, no AWS account. The README's comparison table and <span class="mono">docs/13-vllm-omni.md</span> are the homework in written form; a workflow blog post series is the cheapest proof after that.</p>
+          <p style="font-size:13.5px;"><span class="mono">make test</span> runs the real gateway and worker on a laptop in about a minute — no cluster, no GPU, no AWS account — and <span class="mono">make demo-local</span> renders through the same pool on the laptop's own GPU (slide 4). The README's comparison table and <span class="mono">docs/13-vllm-omni.md</span> are the homework in written form; a workflow blog post series is the cheapest proof after that.</p>
         </div>
       </div>
     </div>
-    <div class="foot"><span>docs/13-vllm-omni.md — the full cost arithmetic and the composition rule</span><span>5 / 5</span></div>
+    <div class="foot"><span>docs/13-vllm-omni.md — the full cost arithmetic and the composition rule</span><span>6 / 6</span></div>
   </section>
 
 </div>
 </div>
 
 <div id="nav">
-  <span id="counter">1 / 4</span>
+  <span id="counter">1 / 6</span>
   <button id="prev" aria-label="Previous slide">←</button>
   <button id="next" aria-label="Next slide">→</button>
 </div>

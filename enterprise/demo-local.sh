@@ -10,6 +10,8 @@
 #                                           # through the whole pipeline,
 #                                           # verify it, tear down, exit 0/1
 #   DEMO_WORKERS=3 ./enterprise/demo-local.sh
+#   DEMO_WORKER_ARGS_1="--highvram" ./enterprise/demo-local.sh
+#                                           # extra ComfyUI flags, per worker
 #
 # What this demonstrates, and what it honestly cannot:
 #
@@ -192,11 +194,25 @@ log "${DEMO_WORKERS} ComfyUI worker(s) — sharing this machine's one GPU"
 for i in $(seq 1 "$DEMO_WORKERS"); do
     port=$(( COMFY_BASE_PORT + i - 1 ))
 
+    # Per-worker extra ComfyUI flags: DEMO_WORKER_ARGS_1="--highvram", etc.
+    # There is no per-worker VRAM to carve up on unified-memory Apple
+    # silicon — ComfyUI forces its SHARED vram state there and the vram
+    # flags are inert — but on a CUDA box this same knob runs one worker
+    # --highvram (models stay resident) beside a --lowvram neighbor, the
+    # laptop-scale stand-in for the cluster's VRAM-tier routing; flags like
+    # --force-fp16 bite on every platform. Appended LAST for the same
+    # reason start.sh appends "$@" last: ComfyUI's argparse takes the last
+    # occurrence of a repeated flag, so a per-worker value can also
+    # override any default above it.
+    args_var="DEMO_WORKER_ARGS_${i}"
+    read -r -a extra_args <<< "${!args_var:-}"
+
     ( cd "${DEMO_HOME}/ComfyUI" && exec "$PY" main.py \
         --listen 127.0.0.1 --port "$port" \
         --models-directory "${DEMO_HOME}/models" \
         --output-directory "${DEMO_HOME}/output" \
         --temp-directory "${DEMO_HOME}/tmp" \
+        ${extra_args[@]+"${extra_args[@]}"} \
       ) > "${DEMO_HOME}/comfy-${i}.log" 2>&1 &
     PIDS+=($!)
 
