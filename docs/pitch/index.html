@@ -46,6 +46,20 @@
     font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
     color: var(--accent); margin-bottom: 5px;
   }
+  .heard {
+    border-left: 3.5px solid var(--blue);
+    background: var(--blue-soft);
+    border-radius: 0 9px 9px 0;
+    padding: 8px 14px;
+    margin: 2px 0 10px;
+    max-width: 1080px;
+  }
+  .heard .hl {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--blue); display: block; margin-bottom: 2px;
+  }
+  .heard p { font-size: 14.5px; font-style: italic; color: var(--ink); line-height: 1.4; }
+  .heard p + p { margin-top: 4px; }
   h1 { font-size: 31px; font-weight: 700; letter-spacing: -.015em; line-height: 1.15; margin-bottom: 5px; }
   .kicker { font-size: 15.5px; color: var(--muted); margin-bottom: 16px; max-width: 1080px; }
   .kicker b { color: var(--ink); font-weight: 600; }
@@ -165,8 +179,12 @@
   <!-- ================= SLIDE 1 : TODAY ================= -->
   <section class="slide active" id="s1">
     <div class="eyebrow">1 · The current state</div>
-    <h1>ComfyUI is already the professionals' tool — run as a card per person or a meter per seat</h1>
-    <p class="kicker">The unit of work is a <b>node graph</b>, not a prompt — an inspectable pipeline where a tweak reruns one node, not the whole generation. That is what studios use, and it ships as a <b>single-user desktop app</b>: no auth, arbitrary-Python nodes, one GPU per instance.</p>
+    <div class="heard">
+      <span class="hl">What we've heard</span>
+      <p>“Is this a significant use case? Do we get signals that it's needed?” · “This looks like a content-creation studio, not a general AI playground.” · “It's a good UX for multi-step, pipeline-type workflows.”</p>
+    </div>
+    <h1>Yes — it's the professionals' standard, and a studio is exactly what it is</h1>
+    <p class="kicker">The unit of work is a <b>node graph</b>, not a prompt — an inspectable pipeline where a tweak reruns one node, not the whole generation. A studio workload, a separate persona from any playground — <b>and it should ship as its own module, never merged into one.</b> Today it's a <b>single-user desktop app</b>: no auth, arbitrary-Python nodes, one GPU per instance.</p>
     <div class="cols">
       <div class="col">
         <div class="card accent-card">
@@ -184,6 +202,7 @@
             <div class="v"><em>12 months</em><b>$20M → $700M</b><i>annualized revenue</i></div>
             <div class="v"><em>3 months</em><b>42×</b><i>agentic-usage growth</i></div>
           </div>
+          <p style="font-size:12.5px; color:var(--muted); margin-top:7px;">Not the better product — <b>the proof of demand.</b> The commercial suites lead on go-to-market; ComfyUI leads the open-source side of the same category, and this repo is its go-to-market gap, closed.</p>
         </div>
       </div>
       <div class="col">
@@ -214,7 +233,11 @@
   <!-- ================= SLIDE 2 : PROPOSED STATE ================= -->
   <section class="slide" id="s2">
     <div class="eyebrow">2 · The proposed state</div>
-    <h1>Same ComfyUI, unchanged — the GPUs move to a pooled, scale-to-zero cluster</h1>
+    <div class="heard">
+      <span class="hl">What we've heard</span>
+      <p>“The point was to break up the expensive machine under each creator's desk — move the GPUs to the datacenter, keep the frontend the same, separate it from the backend.”</p>
+    </div>
+    <h1>That sentence, built: same ComfyUI, GPUs in a pooled, scale-to-zero cluster</h1>
     <p class="kicker">Keep the frontend identical — <b>stock ComfyUI at a pinned commit</b>, not a wrapper — and separate it from the backend: cards leave the desks and become one shared machine pool that turns off between jobs. Three pillars:</p>
 
     <div class="cols" style="flex:0 0 auto; margin-bottom:12px;">
@@ -259,7 +282,11 @@
   <!-- ================= SLIDE 3 : WHAT THE WORK DOES ================= -->
   <section class="slide" id="s3">
     <div class="eyebrow">3 · What the work does to enable it</div>
-    <h1>The wiring between stock ComfyUI and the platform — built, tested, merged</h1>
+    <div class="heard">
+      <span class="hl">What we've heard</span>
+      <p>“Explain what is needed and provided beyond how the existing Omni–ComfyUI integration did it.”</p>
+    </div>
+    <h1>The production layer neither stock ComfyUI nor the bridge provides — built, tested, merged</h1>
     <p class="kicker">~9,000 lines of Python and shell in <span class="mono">redhat-et/comfyui-on-openshift</span>: the queue, the isolation, the autoscaling, the accounting, and the failure handling you otherwise meet at 2am.</p>
 
     <div class="card" style="margin-bottom:13px;">
@@ -307,8 +334,12 @@
   <!-- ================= SLIDE 4 : ONE PLATFORM, EVERY CORNER ================= -->
   <section class="slide" id="s4">
     <div class="eyebrow">4 · Where vLLM Omni fits — and the asks</div>
-    <h1>One platform, every corner of the multimodal market</h1>
-    <p class="kicker">Layers, not rivals. A serving engine holds <b>one model resident</b> behind an API — residency scales with catalog size. A design library is many models touched briefly — <b>the pool scales with concurrency</b>. Omni is the throughput tier for the head of the usage curve; the pool is the flexibility tier for the tail, where designers live.</p>
+    <div class="heard">
+      <span class="hl">What we've heard</span>
+      <p>“The strategic inference engine is the product — supported inference means buying it.” · “Customers ask for APIs and performance and have their own UIs; we must not get into the application layer.”</p>
+    </div>
+    <h1>Agreed on both — this design is built on them</h1>
+    <p class="kicker">A serving engine holds <b>one model resident</b> behind an API — residency scales with catalog size; a design library is many models touched briefly — <b>the pool scales with concurrency</b>. And nothing here is an application layer: <b>ComfyUI is upstream's app at a pinned commit; this repo is deployment wiring.</b></p>
 
     <div class="card" style="margin-bottom:12px;">
       <table>
@@ -319,7 +350,7 @@
         <tr><td>A hot model <em>inside</em> those workflows</td><td>Same studios, once showback shows concentration</td><td><span class="chip blue">Omni beside the pool, via the bridge</span></td></tr>
         <tr><td>Omni-modal &amp; robot-policy models</td><td>Robotics / agents programs</td><td><span class="chip red">Omni</span></td></tr>
       </table>
-      <p style="font-size:13px; color:var(--muted); margin-top:7px;"><b>The promotion rule:</b> when <code>GET /api/showback</code> shows one model dominating GPU-seconds at sustained duty, stand up an Omni engine for it beside the pool, reached through the bridge nodes — same cluster, same SSO, same bill. Showback turns "which tier?" into a query, not a strategy debate. Six always-on engines for a ten-person team would run ~$5,000/mo; the pool runs $120–950.</p>
+      <p style="font-size:13px; color:var(--muted); margin-top:7px;"><b>The promotion rule:</b> when <code>GET /api/showback</code> shows one model dominating GPU-seconds at sustained duty, stand up an Omni engine for it beside the pool, reached through the bridge nodes — same cluster, same SSO, same bill. Six always-on engines for a ten-person team would run ~$5,000/mo; the pool runs $120–950.</p>
     </div>
 
     <div class="cols">
@@ -344,44 +375,6 @@
     <div class="foot"><span>docs/13-vllm-omni.md — the full cost arithmetic and the composition rule</span><span>4 / 4</span></div>
   </section>
 
-  <!-- ================= APPENDIX : WHAT WE'VE HEARD ================= -->
-  <section class="slide" id="s5">
-    <div class="eyebrow">Appendix · for the Q&amp;A</div>
-    <h1>What we've heard so far — and the answer to each</h1>
-    <p class="kicker">Questions and cautions raised in early conversations, lightly paraphrased. Each one shaped this deck; none of them is being argued with.</p>
-    <div class="cols" style="flex-wrap: wrap;">
-      <div class="col" style="gap:11px;">
-        <div class="card blue-card">
-          <h3>“Is this a significant use case? Do we get signals that it's needed?”</h3>
-          <p style="font-size:13px;">Slide 1: Amazon Studios through Ubisoft in production, a $500M valuation, the first primarily-AI Super Bowl ad, “ComfyUI artist” as a job title — and a commercial comp that went <b>$20M → $700M ARR in twelve months</b>.</p>
-        </div>
-        <div class="card blue-card">
-          <h3>“This looks like a content-creation studio, not a general AI playground.”</h3>
-          <p style="font-size:13px;"><b>Exactly right — and it should stay that way.</b> A different persona, shipped as an independent module beside a playground, never merged into one. A studio workflow is too complex for direct prompts; the graph <em>is</em> the product.</p>
-        </div>
-        <div class="card blue-card">
-          <h3>“Customers ask for APIs and performance and have their own UIs — we must not get into the application layer of the creation experience.”</h3>
-          <p style="font-size:13px;">Agreed, and this ships <b>no application layer</b>: ComfyUI is upstream's application at a pinned commit; the repo is deployment wiring. API-first customers route to the serving tier (slide 4) — mapping their scenarios to the two tiers is one of the asks.</p>
-        </div>
-      </div>
-      <div class="col" style="gap:11px;">
-        <div class="card blue-card">
-          <h3>“The strategic inference engine is the product — supported inference means buying it.”</h3>
-          <p style="font-size:13px;">Built in, not argued with: the engine is the <b>throughput tier</b> of this design, promoted per model the moment showback shows concentration. Every graph workload on the pool makes the engine <b>more</b> valuable, not less — it is the demand signal and the on-ramp.</p>
-        </div>
-        <div class="card blue-card">
-          <h3>“The idea was to break up the expensive machine under each creator's desk — GPUs to the datacenter, frontend unchanged, backend separated.”</h3>
-          <p style="font-size:13px;">That sentence is the spec this repo implements. Slides 2 and 3 are that sentence <b>built, tested and merged</b> — same frontend, pooled scale-to-zero backend, and the bill it produces.</p>
-        </div>
-        <div class="card blue-card">
-          <h3>“What does this provide beyond the existing Omni–ComfyUI integration?”</h3>
-          <p style="font-size:13px;">The bridge puts Omni <b>on the canvas</b>; this puts the canvas <b>in production</b> — SSO, queue fairness, scale-to-zero, network policy, audit, showback: the deployment list the bridge's own README leaves open, closed once, for both.</p>
-        </div>
-      </div>
-    </div>
-    <div class="foot"><span>Every card answers a real question from a real conversation — that is the point of the appendix</span><span>Appendix</span></div>
-  </section>
-
 </div>
 </div>
 
@@ -398,9 +391,7 @@
   function show(index) {
     current = Math.max(0, Math.min(slides.length - 1, index));
     slides.forEach((slide, i) => slide.classList.toggle("active", i === current));
-    // Four slides plus an appendix — the appendix deliberately does not count.
-    document.getElementById("counter").textContent =
-      current < 4 ? (current + 1) + " / 4" : "Appendix";
+    document.getElementById("counter").textContent = (current + 1) + " / " + slides.length;
   }
   window.show = show;
 
