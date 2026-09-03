@@ -356,11 +356,15 @@
       <p>Can we see it work — the workflow designers actually have, not a mockup of it?</p>
     </div>
     <h1>The designer's loop, live — only the silicon moved</h1>
-    <p class="kicker"><span class="mono">make demo-local</span> runs the real pool on the machine in front of you, zero dollars of cloud — and each worker serves <b>the stock ComfyUI canvas</b>, the exact frontend designers already run. Below, mid-loop: the SDXL template loaded, and the two checkpoints this worker does not have — <b>found, named and sized</b> before anything runs.</p>
+    <p class="kicker"><span class="mono">make demo-local</span> runs the real pool on the machine in front of you, zero dollars of cloud — and each worker serves <b>the stock ComfyUI canvas</b>, the exact frontend designers already run. Below, <b>the loop in one take</b> — the same single buttons as the desktop for the template and for resolving the graph; only where the models and the GPU live has changed.</p>
     <div class="cols">
       <div class="col" style="flex:1.35;">
-        <div class="card" style="flex:1; padding:9px; display:flex; min-height:0;">
-          <img src="demo-local-canvas.png" alt="The stock ComfyUI canvas served by a pool worker: the SDXL template graph loaded, and the missing-models panel naming both checkpoints with their sizes" style="width:100%; height:100%; object-fit:contain; object-position:top; min-height:0; display:block;">
+        <div class="card" style="flex:1; padding:9px; display:flex; flex-direction:column; min-height:0;">
+          <!-- Plays in the live deck; the PNG/PDF exports pin the poster
+               frame (the export script pauses every video), so the printed
+               deck stays deterministic. -->
+          <video src="demo-local-designer-loop.mp4" poster="demo-local-canvas.png" muted autoplay loop playsinline controls style="width:100%; flex:1; min-height:0; object-fit:contain; object-position:top; display:block; background:#000;"></video>
+          <p style="font-size:11.5px; color:var(--faint); margin-top:7px; line-height:1.4;">stock canvas → SDXL template → two models <b style="color:var(--muted);">found · named · sized</b> → <b style="color:var(--muted);">Manager pulls 12.6&nbsp;GB to the worker, server-side</b> (time-lapse) → errors clear → Run → live per-node progress → the render — one scripted take, real renders</p>
         </div>
       </div>
       <div class="col">
@@ -382,7 +386,7 @@
         </div>
       </div>
     </div>
-    <div class="foot"><span>demo-local-designer-loop.mp4 and demo-local-pool.mp4, beside this deck — both recorded from make demo-local, real renders throughout</span><span>4 / 6</span></div>
+    <div class="foot"><span>demo-local-designer-loop.mp4 and demo-local-pool.mp4, beside this deck — the demo drives itself: every click is scripted, so the take reruns identically on any machine with a GPU</span><span>4 / 6</span></div>
   </section>
 
   <!-- ================= SLIDE 5 : THE THESIS ================= -->
