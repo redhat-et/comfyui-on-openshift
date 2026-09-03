@@ -5,8 +5,10 @@
 # ComfyUI from source, not from either Containerfile. Neither ever builds and
 # boots the images that actually ship. This workflow does, once a day, so a
 # Containerfile regression is caught within 24 hours instead of on someone's
-# `make deploy` — one job per image, each building once, proving the
-# arbitrary-UID boot, then scanning.
+# `make deploy` — one job per image, proving the arbitrary-UID boot, then
+# scanning. The worker job additionally builds and boots the image's
+# ENABLE_MANAGER=true variant (a layer-cache increment, not a second full
+# build) and asserts Manager actually loaded.
 name: nightly
 
 on:
@@ -128,6 +130,12 @@ jobs:
   #      pool never sets it.
   # If either regresses, this job fails at the boot-proof step below with a
   # clear curl timeout, not a silent false pass.
+  #
+  # Both ENABLE_MANAGER branches of the Containerfile are built and booted:
+  # the =false pool default first, then a =true variant that reuses its layer
+  # cache and must show Manager's own startup lines, not just a serving
+  # ComfyUI — see the manager steps below for why /system_stats alone is not
+  # proof.
   gpu-worker-image:
     runs-on: ubuntu-latest
     timeout-minutes: 120
@@ -145,7 +153,7 @@ jobs:
           echo "--- disk after reclaim ---"
           df -h /
 
-      - name: build the worker image
+      - name: build the worker image (pool default, no Manager)
         run: |
           docker build -t gpu-worker-uid-test \
             --build-arg ENABLE_MANAGER=false \
@@ -182,6 +190,84 @@ jobs:
             exit 1
           fi
 
+      # The ENABLE_MANAGER=true variant. Every prior nightly built only the
+      # =false path above, which is how a Manager install that could not
+      # import at all (the old custom_nodes checkout) shipped undetected —
+      # the branch of the Containerfile that installs it was never built,
+      # never booted, never watched. This is NOT a second 10 GB build: the
+      # build arg is first consumed at the manager pip layer, so everything
+      # above it — the dnf layer, the ~7 GB torch layer, the ComfyUI clone —
+      # is a docker cache hit from the build above, and the two images share
+      # those layers on disk too. What is new is the manager wheel plus the
+      # handful of small layers after it.
+      - name: build the worker image with Manager enabled
+        run: |
+          echo "--- disk before manager-variant build ---"
+          df -h /
+          docker build -t gpu-worker-manager-test \
+            --build-arg ENABLE_MANAGER=true \
+            -f enterprise/worker/Containerfile enterprise/worker
+
+      - name: boot with Manager enabled and prove it actually loaded
+        run: |
+          # The =false container has served its proof; free its port and its
+          # memory before booting the variant on the same 8188.
+          docker rm -f worker
+
+          # Same boot contract as the step above (AGENT_DISABLED=1,
+          # COMFY_HOST=0.0.0.0, --cpu). The baked ENABLE_MANAGER=true env
+          # makes start.sh pass --enable-manager on its own — passing it
+          # here too would prove the CI command line, not the image.
+          docker run -d --name worker-manager --user 1000670000:0 -p 8188:8188 \
+            -e COMFY_HOST=0.0.0.0 \
+            -e AGENT_DISABLED=1 \
+            gpu-worker-manager-test --cpu
+
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8188/system_stats; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          echo
+
+          if [ -z "$ok" ]; then
+            docker logs worker-manager
+            echo "manager-enabled worker image did not serve /system_stats"
+            exit 1
+          fi
+
+          # /system_stats up is NOT the assertion — ComfyUI boots fine with
+          # Manager silently absent, which is exactly the regression that went
+          # undetected. Manager announces itself with "[ComfyUI-Manager]"
+          # startup lines; their absence, or any "Cannot import" self-disable
+          # naming it, fails the job even though ComfyUI is serving.
+          docker logs worker-manager >boot.log 2>&1
+
+          if grep -i "cannot import" boot.log | grep -qi manager; then
+            cat boot.log
+            echo "Manager failed to import — the image baked it in but ComfyUI disabled it"
+            exit 1
+          fi
+
+          if ! grep -q "ComfyUI-Manager" boot.log; then
+            cat boot.log
+            echo "no ComfyUI-Manager startup lines in the boot log — Manager did not load"
+            exit 1
+          fi
+
+          echo "Manager loaded:"
+          grep "ComfyUI-Manager" boot.log | head -20
+
+      # Scans the =false image: that is the documented default the pool ships
+      # with, and the =true variant differs from it only by the manager wheel.
+      # if: always() so the scan still runs (and this job still reports a
+      # CVE finding) even if a boot proof above failed — one build serves
+      # both signals instead of the previous two-job, two-build split, whose
+      # stated reason ("so a slow scan does not block the UID proof") cost a
+      # full second ~10 GB build to buy.
       - name: scan for known CVEs
         if: always()
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
