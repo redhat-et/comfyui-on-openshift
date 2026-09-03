@@ -340,7 +340,8 @@
           <h3>Relation to <span class="mono">comfyui-vllm-omni</span> (the bridge) <span class="chip blue">complementary</span></h3>
           <p style="margin-bottom:6px; font-size:13.5px;">The bridge is the <b>right integration shape</b>: ComfyUI nodes that delegate a generation call to a vLLM Omni server, composing with everything else on the canvas.</p>
           <p style="margin-bottom:6px; font-size:13.5px;">What it leaves open — by its own README — is deployment: no auth, no failover, no progress streaming, one hand-started server per model. <b>The same list this platform closes.</b></p>
-          <p style="font-size:13.5px;"><b>The bridge puts Omni on the canvas; this puts the canvas in production.</b> Run here, the bridge inherits SSO, network policy and the audit log for free.</p>
+          <p style="margin-bottom:6px; font-size:13.5px;"><b>The bridge puts Omni on the canvas; this puts the canvas in production.</b> Run here, it inherits SSO, network policy and the audit log for free.</p>
+          <p style="font-size:13.5px;">Scope, honestly: <b>the graph never leaves ComfyUI</b> — delegation carries coarse prompt→output steps, image-only today. How far that reaches is an open question the roadmap's engine spike exists to answer.</p>
         </div>
       </div>
     </div>
@@ -366,7 +367,7 @@
         <tr><td>A hot model <em>inside</em> those workflows</td><td>Same studios, once showback shows concentration</td><td><span class="chip blue">Omni beside the pool, via the bridge</span></td></tr>
         <tr><td>Omni-modal &amp; robot-policy models</td><td>Robotics / agents programs</td><td><span class="chip red">Omni</span></td></tr>
       </table>
-      <p style="font-size:13px; color:var(--muted); margin-top:7px;"><b>The promotion rule:</b> when <code>GET /api/showback</code> shows one model dominating GPU-seconds at sustained duty, stand up an Omni engine for it beside the pool, reached through the bridge nodes — same cluster, same SSO, same bill. Six always-on engines would run ~$5,000/mo against the pool's $120–950 — <b>the marginal model costs a machine on a serving tier, and disk on the pool.</b></p>
+      <p style="font-size:13px; color:var(--muted); margin-top:7px;"><b>The promotion rule:</b> when <code>GET /api/showback</code> shows one model dominating GPU-seconds at sustained duty, stand up an Omni engine for it beside the pool, reached through the bridge nodes — same cluster, same SSO, same bill; <b>the marginal model costs a machine on a serving tier, and disk on the pool.</b> The bounded part, stated plainly: promotion carries a <b>coarse prompt→output call</b> — the graph itself never leaves ComfyUI, latent/ControlNet-level control does not fit an API, and the bridge is image-only today. How much of a real hot path fits that shape is an open question; showback answers it with data, per team.</p>
     </div>
 
     <div class="cols">
