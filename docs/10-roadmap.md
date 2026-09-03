@@ -55,19 +55,20 @@ items are cluster-only for a failing assertion — I3, I4 and I7, whose "proven
 by" column reads *cluster day* and nothing else. The other fourteen have a
 laptop half.
 
-**Twenty-six invariants are load-bearing** — `docs/09-engineering-handoff.md`
+**Twenty-seven invariants are load-bearing** — `docs/09-engineering-handoff.md`
 §3. (Fourteen when this was written; F1 added the fifteenth, Q2 the sixteenth,
 Q3 the seventeenth, Q1 the eighteenth, Q4 the nineteenth and Q5 the twentieth,
 the cross-wave sweep three more — the worker's per-process identity, F4's
-keepalive-and-fence, and reap durability — and the audit sweep the last
-three: the compare-and-set claim with the interrupt-and-drain, the
+keepalive-and-fence, and reap durability — the audit sweep three more:
+the compare-and-set claim with the interrupt-and-drain, the
 default-deny namespace with the worker's ACL user, and output and showback
-scoping under `oauth`. That is what "changes an invariant" looks like in
+scoping under `oauth` — and N2 the twenty-seventh, the per-tier queue key
+shape. That is what "changes an invariant" looks like in
 practice.)
 Touching an invariant is not a useful filter, because nearly every item does.
 The filter that *is* useful: an item is high-risk if it **changes** an
-invariant rather than merely working near one. Four have — F1, Q2, Q3 and F4,
-and each of the four added a row to §3.
+invariant rather than merely working near one. Five have — F1, Q2, Q3, F4 and
+now N2 — and each of the five added a row to §3.
 
 ## Decisions already made
 
@@ -919,13 +920,54 @@ step, and whether a video path exists at all. *The single most valuable
 item on this list: the repo itself would embody the composition rule, or
 report honestly where it cannot.*
 
-**N2 — VRAM-tier routing.** Pools per card class (L4 / L40S / H100-class); a
+**N2 — VRAM-tier routing** — **landed**, laptop half; the real tier machine
+pools autoscaling are on the cluster-day list, the same split Q3 used
+(`docs/12-first-cluster-day.md`). Pools per card class; a
 job declares the tier it needs and the queue places it — nobody pays 80 GB
 prices for a 24 GB job, and the tier ladder is how the pool absorbs the
-video-model growth curve (`docs/13`, "Two curves compound"). Touches the
+video-model growth curve (`docs/13`, "Two curves compound"). It touched the
 queue key shape in `hub.py` and `worker_agent.py` (a §3 invariant — the
-queue-lane review gate applies), `setup.sh` machine pools, and `.env`.
-Laptop-provable with fake tiers; real pools are a cluster-day line.
+queue-lane review gate applied: the envelope's field-set and accrual-tail
+assertions were each replaced by strictly stronger ones in the same commit),
+`setup.sh` machine pools, KEDA, and `.env`. Proven with fake tiers by
+`enterprise/test/check-58-tier-routing.py`: routing to matching-tier workers
+only, in both directions; the default-tier path; an unknown tier refused
+loudly with zero queue writes; SIGKILL-reap requeueing onto the tier's own
+list; and per-tier gauges under new suffixed names.
+
+What the obvious implementation would have got wrong, in the
+`docs/07-design-review.md` spirit:
+
+- **A queue per tier, symmetrically named.** `comfy:queue:<tier>` for every
+  tier reads cleaner, and strands the entire existing backlog — plus every
+  entry a not-yet-restarted gateway replica keeps writing mid-rollout — on a
+  bare list nothing polls, at the exact moment the operator flips `GPU_TIERS`
+  on and is watching the new tiers instead. The default tier therefore RIDES
+  the bare `comfy:queue`, its workers are configured identically to an
+  untiered pool's (`WORKER_TIER` unset), and turning tiering on is
+  backlog-safe by construction. The asymmetry is the migration path; §3 now
+  says so before somebody tidies it away.
+- **Routing by a parameter beside the envelope.** A `queue` argument next to
+  the entry lets the submit and the reaper's requeue disagree about where a
+  job belongs; the wrong-card replay would arrive only on the retry path,
+  where nobody is watching. Both call sites derive the queue from the
+  envelope's own `tier` inside `fair_enqueue_call()`.
+- **Labels on the existing gauges.** Growing `tier=` onto
+  `comfy_queue_depth` changes what every existing selector and `sum()`
+  returns; the per-tier series are new suffixed names, the old names keep
+  their pool-wide meanings, and the label set is bounded by construction
+  because tier names come from the operator's `GPU_TIERS`, never from a
+  request — the same cardinality rule that keeps per-user series off
+  `/metrics` entirely.
+- **A second accounting pass for per-tier cost.** Showback's accrual now
+  writes the same seconds into a `t:<tier>` field of the same period Hash it
+  already owns — one more `HINCRBYFLOAT`, no new keys, cap-exempt because
+  the field names are config-bounded — so per-tier rates are a
+  multiplication over `/api/showback`'s `tiers` map, not a second collector.
+- **Fairness across tiers.** Q1's round-robin runs within each tier's list,
+  untouched — the right scope, since lanes only order jobs contending for
+  the same cards; a cross-tier fairness notion would couple queues that
+  share no hardware.
 
 ~~**N3 — The savings report.**~~ **Shipped.** A monthly report assembled
 from data already collected — utilization, waits, cost per render, spend

@@ -80,10 +80,14 @@ spec:
         # is inserted at a fairness-computed position within this ONE list
         # rather than always at the back, so comfy:queue stays the single
         # physical list it always was, popped by the same single BLMOVE in
-        # worker_agent.py's main loop. This trigger is therefore unchanged —
-        # `listName: comfy:queue` still names the entire, only, queue, and its
-        # length still means "total jobs waiting", fair-queued or not.
-        # Nothing here was a candidate for becoming N per-submitter triggers.
+        # worker_agent.py's main loop. This trigger is therefore unchanged by
+        # fairness; nothing here was a candidate for becoming N per-submitter
+        # triggers. (Since N2, "the entire, only, queue" stopped being the
+        # whole sentence: with GPU_TIERS set, comfy:queue is the DEFAULT
+        # tier's list — deliberately the bare pre-N2 key, docs/09 §3 — and
+        # each other tier gets its own list and its own ScaledObject, see
+        # BEGIN TIER SCALEDOBJECT below. What this trigger reads is unchanged
+        # either way: the depth of the list default-tier workers pop.)
         #
         # Nor can this trigger see a length that dips. The insert splices the
         # new entry in with LINSERT against a pivot already on the list, so
@@ -153,3 +157,56 @@ spec:
     #WARM     end: "0 18 * * 1-5"
     #WARM     desiredReplicas: "1"
     # END WARM FLOOR
+
+# BEGIN TIER SCALEDOBJECT — one of these per NON-default tier (N2,
+# docs/10-roadmap.md). Committed commented out behind `#TIER `, the warm
+# floor's convention: applied bare, this file still creates exactly the one
+# ScaledObject above, whose `listName: comfy:queue` is the DEFAULT tier's
+# queue — the bare list — so an untiered pool and a tiered pool's default
+# tier share that trigger unchanged. For each other tier, enterprise/setup.sh
+# extracts JUST this block, strips the prefix, and substitutes the tier name
+# and ceiling; each tier then scales its own Deployment on its own list's
+# depth, independently — an l40s backlog buys l40s nodes and nothing else,
+# which is the entire economics of the feature. The trigger body deliberately
+# mirrors the queue trigger above (same address shape, listLength, activation,
+# auth); what cluster day owes each tier is the same 0 -> 1 -> 0 pass the
+# main trigger's comment already records, once per tier pool.
+#
+# No warm floor per tier, on purpose: WARM_WORKERS warms the DEFAULT tier
+# only. A floor is money spent while nobody is watching, and the big-card
+# tiers exist precisely because their nodes are too expensive to hold idle —
+# an operator who wants one warm anyway can say so in a review, not in a
+# default.
+#TIER ---
+#TIER apiVersion: keda.sh/v1alpha1
+#TIER kind: ScaledObject
+#TIER metadata:
+#TIER   name: comfy-worker-TIER_NAME_PLACEHOLDER
+#TIER spec:
+#TIER   scaleTargetRef:
+#TIER     name: comfy-worker-TIER_NAME_PLACEHOLDER
+#TIER   minReplicaCount: 0
+#TIER   maxReplicaCount: 3
+#TIER   pollingInterval: 15
+#TIER   cooldownPeriod: 600
+#TIER   advanced:
+#TIER     horizontalPodAutoscalerConfig:
+#TIER       behavior:
+#TIER         scaleDown:
+#TIER           stabilizationWindowSeconds: 300
+#TIER           policies:
+#TIER             - type: Pods
+#TIER               value: 1
+#TIER               periodSeconds: 300
+#TIER   triggers:
+#TIER     - type: redis
+#TIER       metadata:
+#TIER         address: redis.NAMESPACE_PLACEHOLDER.svc.cluster.local:6379
+#TIER         listName: comfy:queue:TIER_NAME_PLACEHOLDER
+#TIER         listLength: "1"
+#TIER         activationListLength: "0"
+#TIER         enableTLS: "false"
+#TIER         databaseIndex: "0"
+#TIER       authenticationRef:
+#TIER         name: comfy-redis-auth
+# END TIER SCALEDOBJECT

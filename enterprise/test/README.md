@@ -17,10 +17,10 @@ raise instead of waiting, and the blocking paths are most of what this suite
 asserts. `CONTRIBUTING.md` says the same thing; the requirements file says why.
 
 `make test` runs three layers: 40 shell unit assertions (`scripts/unit-tests.sh`,
-the parsing edge cases and the lint fixtures), 210 pytest cases under
+the parsing edge cases and the lint fixtures), 253 pytest cases under
 `enterprise/test/unit/` against the pure functions in both Python files
 (`python3 -m pytest enterprise/test/unit`, under a second), and then this
-suite — 378 end-to-end assertions across 21 check files, in about a minute.
+suite — 492 end-to-end assertions across 25 check files, in about a minute.
 
 ## What it measures, separately
 
@@ -76,6 +76,25 @@ reaper's worker-death path at all, whatever phase breadcrumb it happens to
 share with a job that *would* be retried.
 
 **Cancel works** on a job in flight.
+
+**A job runs on the card class it declared, and on nothing else**
+(`check-58-tier-routing.py`, docs/10-roadmap.md's N2). With fake tiers
+`l4,l40s` on a dedicated gateway: an unknown tier is a 400 naming the valid
+ones with ZERO queue writes (a typo fails at submit, never as a job parked on
+a list nothing polls); a tier=l40s job lands on `comfy:queue:l40s` and only
+there, and stays queued — unseen by ComfyUI — while only a default-tier
+worker is up, in BOTH directions (an idle l40s worker structurally cannot
+drain the cheap lane either: its `BLMOVE` names a different key); a job that
+declares no tier is a default-tier job on the bare `comfy:queue`, which is
+the pre-N2 list on purpose — that identity is what makes enabling tiers
+backlog-safe, and it is a §3 invariant, not a convenience. The SIGKILL-reap
+scenario re-runs check-30's pre-execution death on a tier: the requeue is
+counted onto the tier's own list and never the bare one — a worker death
+cannot demote a job onto a smaller card — and a second matching-tier worker
+completes it. The per-tier gauges arrive as NEW suffixed metric names; the
+pre-N2 names keep their pool-wide meanings, asserted against the same
+`/metrics` page. Showback's period Hash accrues the same seconds under
+`t:<tier>`, read raw off Redis.
 
 **SIGTERM drains rather than drops.** The test starts a slow job, sends SIGTERM
 to the agent mid-generation, and asserts the job still reaches `completed` and

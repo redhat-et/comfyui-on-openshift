@@ -52,6 +52,75 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 : "${WARM_END:=0 18 * * 1-5}"
 : "${WARM_TIMEZONE:=UTC}"
 
+# N2's VRAM tiers (docs/10-roadmap.md): ordered, comma-separated, smallest
+# card first — "l4,l40s,h100". Empty is tiering off, the pre-N2 pool. The
+# FIRST name is the default tier and rides the existing 'gpu' machine pool,
+# the bare comfy:queue and the comfy-worker Deployment exactly as committed;
+# every LATER name gets its own machine pool (gpu-<tier>), worker Deployment
+# (comfy-worker-<tier>, WORKER_TIER set, comfy/tier nodeSelector) and KEDA
+# ScaledObject (comfy:queue:<tier>), rendered below from the #TIER lines the
+# manifests carry.
+#
+# A bad tier name is fatal here, NOT warn-and-off like QUOTA_GPU_SECONDS
+# above — deliberately different postures for different failure costs: a
+# quota that silently turns off admits some extra spend slowly, while a tier
+# list that silently turned off would 400 every submission that names a tier
+# and reroute nothing gracefully. hub.py refuses the same names at import for
+# the same reason, so deploying one past this check would only crash-loop the
+# gateway anyway; dying here is the same answer, earlier and legible.
+: "${GPU_TIERS:=}"
+
+TIER_NAMES=()
+
+if [[ -n "$GPU_TIERS" ]]; then
+    IFS=',' read -r -a _raw_tiers <<< "$GPU_TIERS"
+
+    for _tier in ${_raw_tiers[@]+"${_raw_tiers[@]}"}; do
+        _tier="$(printf '%s' "$_tier" | tr -d '[:space:]')"
+        [[ -n "$_tier" ]] || continue
+
+        # The same pattern hub.py pins: the name travels into a Redis key, a
+        # metric label, a KEDA listName, a machine pool name and a node label.
+        printf '%s' "$_tier" | grep -qE '^[a-z0-9][a-z0-9-]{0,31}$' \
+            || die "GPU_TIERS name '${_tier}' is invalid — lowercase letters, digits and '-', at most 32 chars"
+
+        for _seen in ${TIER_NAMES[@]+"${TIER_NAMES[@]}"}; do
+            [[ "$_seen" != "$_tier" ]] \
+                || die "GPU_TIERS lists '${_tier}' twice — which queue would it mean?"
+        done
+
+        TIER_NAMES+=("$_tier")
+    done
+fi
+
+DEFAULT_TIER="${TIER_NAMES[0]-}"
+
+# Every tier after the first. bash-3.2-safe (macOS): both expansions guarded,
+# since ${TIER_NAMES[@]:1} on a short array trips set -u there.
+EXTRA_TIERS=()
+if (( ${#TIER_NAMES[@]} > 1 )); then
+    EXTRA_TIERS=("${TIER_NAMES[@]:1}")
+fi
+
+# MAX_GPU_WORKERS_<TIER> (uppercase, '-' -> '_') is each extra tier's own
+# ceiling, defaulting to MAX_GPU_WORKERS. Resolved via this helper everywhere
+# so the two consumers (the ScaledObject render and the machine pool) cannot
+# disagree; validation warns once, below, not in here — warn prints to the
+# same stream a $(...) capture would swallow.
+tier_env_suffix()
+{
+    printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr '-' '_'
+}
+
+tier_max_workers()
+{
+    local var value
+    var="MAX_GPU_WORKERS_$(tier_env_suffix "$1")"
+    value="${!var:-$MAX_GPU_WORKERS}"
+    printf '%s' "$value" | grep -qE '^[0-9]+$' || value="$MAX_GPU_WORKERS"
+    printf '%s' "$value"
+}
+
 # Off unless the operator chose a number, and off rather than fatal if they
 # chose something that is not one: this is a cost breaker, and a breaker that
 # refuses to deploy over its own configuration is a worse outage than the
@@ -104,6 +173,22 @@ if (( WARM_WORKERS > 0 )) && [[ "$SCALE_TO_ZERO" != "true" ]]; then
     warn "that path skips KEDA entirely and pins the pool at one worker."
 fi
 
+# One warning per misconfigured per-tier ceiling, here rather than inside
+# tier_max_workers(), which is called under $(...) where a warn would vanish.
+for _tier in ${EXTRA_TIERS[@]+"${EXTRA_TIERS[@]}"}; do
+    _var="MAX_GPU_WORKERS_$(tier_env_suffix "$_tier")"
+    _value="${!_var:-}"
+    if [[ -n "$_value" ]] && ! printf '%s' "$_value" | grep -qE '^[0-9]+$'; then
+        warn "${_var}=${_value} is not a whole number — tier ${_tier} uses MAX_GPU_WORKERS=${MAX_GPU_WORKERS}"
+    fi
+done
+
+if (( ${#EXTRA_TIERS[@]} > 0 )) && [[ "$SCALE_TO_ZERO" != "true" ]]; then
+    warn "GPU_TIERS with SCALE_TO_ZERO=false pins ONE worker per tier, all"
+    warn "day — a card per tier, priced like it. The big-card tiers exist to"
+    warn "be paid for only while a job needs them; consider SCALE_TO_ZERO=true."
+fi
+
 require_cluster
 require_tools oc
 
@@ -118,6 +203,15 @@ if (( WARM_WORKERS > 0 )); then
     info "warm floor ${WARM_WORKERS} worker(s), ${WARM_START} to ${WARM_END} (${WARM_TIMEZONE})"
 else
     info "warm floor off (WARM_WORKERS=0)"
+fi
+
+if (( ${#TIER_NAMES[@]} > 0 )); then
+    info "tiers      ${DEFAULT_TIER} (default, comfy:queue, pool 'gpu')$(
+        for _tier in ${EXTRA_TIERS[@]+"${EXTRA_TIERS[@]}"}; do
+            printf ' + %s (0..%s)' "$_tier" "$(tier_max_workers "$_tier")"
+        done)"
+else
+    info "tiers      off (GPU_TIERS empty — one queue, one pool)"
 fi
 
 # Any spelling of zero, not the literal "0": hub.py treats <= 0 as off, and a
@@ -448,11 +542,21 @@ log "Applying manifests"
 # because a manifest applied from only one of them would carry the placeholder.
 apply_gateway()
 {
+    # GPU_TIERS is substituted BY KEY (match the name line, rewrite the value
+    # on the next) rather than through a *_PLACEHOLDER literal: hub.py
+    # refuses an invalid tier list at import, so a leftover placeholder would
+    # crash-loop a hand-applied gateway, where the committed "" is simply
+    # tiering off. The split across -e flags is the BSD-sed-portable spelling
+    # of one { n; s; } block.
     sed -e "s#image: comfy-gateway:latest#image: ${GATEWAY_IMAGE}#" \
         -e "s#QUOTA_GPU_SECONDS_PLACEHOLDER#${QUOTA_GPU_SECONDS}#" \
         -e "s#GPU_HOURLY_RATE_PLACEHOLDER#${GPU_HOURLY_RATE}#" \
         -e "s#AUTH_MODE_PLACEHOLDER#${AUTH_MODE}#" \
         -e "s#SHOWBACK_OPERATORS_PLACEHOLDER#${SHOWBACK_OPERATORS}#" \
+        -e "/name: GPU_TIERS/{" \
+        -e "n" \
+        -e "s#value:.*#value: \"${GPU_TIERS}\"#" \
+        -e "}" \
         "${MANIFESTS}/01-gateway.yaml" \
         | oc apply -n "$APP_NAMESPACE" -f -
 }
@@ -481,6 +585,34 @@ sed -e "s#image: comfy-worker:latest#image: ${WORKER_IMAGE}#" \
     "${MANIFESTS}/02-worker.yaml" | oc apply -n "$APP_NAMESPACE" -f -
 
 ok "workers select ${GPU_NODE_LABEL}"
+
+# One worker Deployment per NON-default tier (N2), rendered from the same
+# manifest: the PDB is dropped first (one pool-wide budget — a second PDB
+# matching the same pods blocks evictions outright, see BEGIN POOL PDB in the
+# manifest), the committed `#TIER ` lines are uncovered (WORKER_TIER env, the
+# comfy/tier nodeSelector, the comfy/tier selector label), and the Deployment
+# is renamed comfy-worker-<tier> so KEDA can target it. The default tier
+# needs no render: it IS the Deployment applied above, WORKER_TIER unset,
+# polling the bare queue — the same worker an untiered pool runs.
+render_tier_worker()
+{
+    local tier="$1"
+
+    sed -E \
+        -e "/^# BEGIN POOL PDB/,\$d" \
+        -e "s/^([[:space:]]*)#TIER /\1/" \
+        -e "s/TIER_NAME_PLACEHOLDER/${tier}/" \
+        -e "s/^(  name: comfy-worker)\$/\1-${tier}/" \
+        -e "s#image: comfy-worker:latest#image: ${WORKER_IMAGE}#" \
+        -e "s#GPU_NODE_LABEL_KEY#${GPU_NODE_LABEL%%=*}#" \
+        -e "s#GPU_NODE_LABEL_VALUE#${GPU_NODE_LABEL#*=}#" \
+        "${MANIFESTS}/02-worker.yaml"
+}
+
+for _tier in ${EXTRA_TIERS[@]+"${EXTRA_TIERS[@]}"}; do
+    render_tier_worker "$_tier" | oc apply -n "$APP_NAMESPACE" -f -
+    ok "tier ${_tier}: workers select ${GPU_NODE_LABEL} + comfy/tier=${_tier}, poll comfy:queue:${_tier}"
+done
 
 # Every value is substituted by KEY, not by matching the key plus its default:
 # matching a literal "maxReplicaCount: 3" silently stops substituting the day
@@ -516,6 +648,25 @@ render_scaled_object()
     fi | sed -e "s/NAMESPACE_PLACEHOLDER/${APP_NAMESPACE}/"
 }
 
+# One ScaledObject per NON-default tier, from the #TIER block the manifest
+# commits (see BEGIN TIER SCALEDOBJECT there): extract just that block, strip
+# the prefix, substitute the tier name and its own ceiling. The base
+# ScaledObject above already watches the default tier's list — the bare
+# comfy:queue — so the default tier renders nothing here either.
+render_tier_scaled_object()
+{
+    local tier="$1" max="$2"
+
+    sed -n '/^# BEGIN TIER SCALEDOBJECT/,/^# END TIER SCALEDOBJECT/p' \
+        "${MANIFESTS}/03-autoscale.yaml" \
+        | sed -E \
+            -e "s/^([[:space:]]*)#TIER /\1/" \
+            -e "/^#/d" \
+            -e "s/TIER_NAME_PLACEHOLDER/${tier}/" \
+            -e "s/^([[:space:]]*maxReplicaCount:).*/\1 ${max}/" \
+            -e "s/NAMESPACE_PLACEHOLDER/${APP_NAMESPACE}/"
+}
+
 if [[ "$SCALE_TO_ZERO" == "true" ]]; then
     render_scaled_object | oc apply -n "$APP_NAMESPACE" -f -
     ok "ScaledObject: 0..${EFFECTIVE_MAX_WORKERS} workers on queue depth"
@@ -523,9 +674,24 @@ if [[ "$SCALE_TO_ZERO" == "true" ]]; then
     if (( WARM_WORKERS > 0 )); then
         ok "warm floor: ${WARM_WORKERS} worker(s) held from ${WARM_START} to ${WARM_END} ${WARM_TIMEZONE}"
     fi
+
+    for _tier in ${EXTRA_TIERS[@]+"${EXTRA_TIERS[@]}"}; do
+        _tier_max="$(tier_max_workers "$_tier")"
+        render_tier_scaled_object "$_tier" "$_tier_max" | oc apply -n "$APP_NAMESPACE" -f -
+        ok "tier ${_tier}: ScaledObject 0..${_tier_max} on comfy:queue:${_tier} depth"
+    done
 else
     oc scale deployment/comfy-worker --replicas 1 -n "$APP_NAMESPACE"
     ok "workers pinned at 1"
+
+    # The pinned path pins each tier too — a card per tier, all day, which
+    # the config banner already priced out loud. Skipping the tier
+    # Deployments instead would 400 nothing and route nothing: jobs naming a
+    # tier would queue forever, which is worse than a bill somebody chose.
+    for _tier in ${EXTRA_TIERS[@]+"${EXTRA_TIERS[@]}"}; do
+        oc scale "deployment/comfy-worker-${_tier}" --replicas 1 -n "$APP_NAMESPACE"
+        ok "tier ${_tier}: worker pinned at 1"
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -687,9 +853,94 @@ configure_machinepool_autoscaling()
         || warn "could not enable autoscaling on the GPU pool at all; it stays at a fixed size."
 }
 
+# One machine pool per NON-default tier (N2): gpu-<tier>, on the instance
+# type .env names as GPU_INSTANCE_TYPE_<TIER> (e.g. GPU_INSTANCE_TYPE_L40S=
+# g6e.xlarge), carrying the SAME GPU labels and taint the base pool gets from
+# scripts/02-cluster.sh PLUS comfy/tier=<tier> — pool-declared, because the
+# tier Deployment's nodeSelector names it and the autoscaler's from-zero
+# template only sees declared labels (the long comment in 02-worker.yaml).
+# The default tier deliberately has no pool of its own: it IS the existing
+# 'gpu' pool, which configure_machinepool_autoscaling above already owns.
+#
+# Autoscaled 0..<tier max> from creation: a tier node exists only while a job
+# on that tier's queue needs it, which is the entire economics of the
+# feature. No min-replicas-1 fallback here, unlike the base pool — an idle
+# big-card node is exactly the bill tiering exists to avoid, so if the API
+# refuses 0 the pool is left alone and the operator is told, loudly.
+configure_tier_machinepools()
+{
+    (( ${#EXTRA_TIERS[@]} > 0 )) || return 0
+
+    [[ "$PLATFORM" == "rosa" ]] || {
+        warn "PLATFORM=$PLATFORM — create the tier node pools yourself: one pool"
+        warn "per non-default tier, labelled comfy/tier=<tier> (pool-declared),"
+        warn "tainted nvidia.com/gpu=true:NoSchedule, autoscaled 0..max."
+        return 0
+    }
+
+    command -v rosa >/dev/null 2>&1 || { warn "rosa CLI not found; skipping tier machine pools."; return 0; }
+    command -v jq >/dev/null 2>&1 || { warn "jq not found; skipping tier machine pools."; return 0; }
+    rosa whoami >/dev/null 2>&1 || { warn "rosa not logged in; skipping tier machine pools."; return 0; }
+
+    log "Tier machine pools"
+
+    # The base pool's subnet, so tier nodes land beside it. HCP pools are
+    # per-subnet and setup.sh never knew the subnet id — the pool that
+    # 02-cluster.sh created does.
+    local subnet
+    subnet="$(rosa list machinepools -c "$CLUSTER_NAME" -o json 2>/dev/null \
+        | jq -r '.[] | select(.id=="gpu") | .subnet // empty')"
+
+    local tier pool var instance max
+    for tier in "${EXTRA_TIERS[@]}"; do
+        pool="gpu-${tier}"
+        var="GPU_INSTANCE_TYPE_$(tier_env_suffix "$tier")"
+        instance="${!var:-}"
+        max="$(tier_max_workers "$tier")"
+
+        if [[ -z "$instance" ]]; then
+            warn "no ${var} in .env — machine pool ${pool} not created. The tier's"
+            warn "Deployment and ScaledObject are applied and will wait: jobs on"
+            warn "comfy:queue:${tier} stay queued until this pool exists."
+            continue
+        fi
+
+        if rosa list machinepools -c "$CLUSTER_NAME" -o json 2>/dev/null \
+            | jq -e ".[] | select(.id==\"${pool}\")" >/dev/null 2>&1; then
+            if rosa edit machinepool --cluster "$CLUSTER_NAME" "$pool" \
+                --enable-autoscaling --min-replicas 0 --max-replicas "$max" --yes 2>/dev/null; then
+                ok "tier ${tier}: pool ${pool} autoscales 0..${max}"
+            else
+                warn "could not converge autoscaling on ${pool}; check it by hand."
+            fi
+            continue
+        fi
+
+        if rosa create machinepool \
+            --cluster "$CLUSTER_NAME" \
+            --name "$pool" \
+            --instance-type "$instance" \
+            --enable-autoscaling --min-replicas 0 --max-replicas "$max" \
+            ${subnet:+--subnet "$subnet"} \
+            --labels "node-role.kubernetes.io/gpu=,nvidia.com/gpu.present=true,comfy/tier=${tier}" \
+            --taints "nvidia.com/gpu=true:NoSchedule" \
+            --yes; then
+            ok "tier ${tier}: pool ${pool} created (${instance}, 0..${max})"
+        else
+            warn "could not create machine pool ${pool} (${instance}); jobs on"
+            warn "comfy:queue:${tier} will queue until it exists."
+        fi
+    done
+}
+
 if [[ "$SCALE_TO_ZERO" == "true" ]]; then
     configure_machinepool_autoscaling
 fi
+
+# Tier pools are wired regardless of SCALE_TO_ZERO: the pinned path still
+# needs a node under each tier's pinned worker, and pool autoscaling is what
+# provides one when the pinned pod goes Pending.
+configure_tier_machinepools
 
 # ---------------------------------------------------------------------------
 # Wait and report

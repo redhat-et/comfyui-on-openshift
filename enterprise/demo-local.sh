@@ -207,6 +207,20 @@ export MODELS_ROOT="${DEMO_HOME}/models"
 # gateway.
 export AUTH_MODE=none
 
+# Optional VRAM-tier demo (docs/10-roadmap.md, N2): DEMO_TIERS="small,big"
+# splits the workers across fake tiers, round-robin — worker 1 on the first
+# (default) tier, worker 2 on the second, and so on — and the gateway then
+# routes {"workflow": {...}, "tier": "big"} to matching workers only. Fake
+# tiers, real routing: on this machine every "tier" is the same silicon, so
+# what two browser tabs demonstrate is the queueing — which is exactly the
+# part the cluster merely adds machine pools to. Empty (the default) is off.
+DEMO_TIERS="${DEMO_TIERS:-}"
+DEMO_TIER_LIST=()
+if [[ -n "$DEMO_TIERS" ]]; then
+    IFS=',' read -r -a DEMO_TIER_LIST <<< "$DEMO_TIERS"
+    export GPU_TIERS="$DEMO_TIERS"
+fi
+
 log "Redis on :${REDIS_PORT}"
 # --save "" and an explicit --dir: without them Redis keeps its default
 # save points and its default dir — the CALLER'S cwd — so a run launched
@@ -256,11 +270,25 @@ for i in $(seq 1 "$DEMO_WORKERS"); do
       ) > "${DEMO_HOME}/comfy-${i}.log" 2>&1 &
     PIDS+=($!)
 
-    COMFY_PORT="$port" HOSTNAME="local-worker-${i}" \
+    # The fake tier this worker serves, when DEMO_TIERS is set. The first
+    # (default) tier's workers leave WORKER_TIER UNSET — same as the cluster's
+    # default pool, whose workers poll the bare queue without knowing they are
+    # the default; the agent treats "" as unset, so one assignment covers both.
+    worker_tier=""
+    if (( ${#DEMO_TIER_LIST[@]} > 0 )); then
+        worker_tier="${DEMO_TIER_LIST[$(( (i - 1) % ${#DEMO_TIER_LIST[@]} ))]}"
+        [[ "$worker_tier" == "${DEMO_TIER_LIST[0]}" ]] && worker_tier=""
+    fi
+
+    COMFY_PORT="$port" HOSTNAME="local-worker-${i}" WORKER_TIER="$worker_tier" \
         "$PY" "${REPO_ROOT}/enterprise/worker/worker_agent.py" \
         > "${DEMO_HOME}/agent-${i}.log" 2>&1 &
     PIDS+=($!)
 done
+
+if (( ${#DEMO_TIER_LIST[@]} > 0 )); then
+    info "tiers: ${DEMO_TIERS} — submit {\"workflow\": ..., \"tier\": \"${DEMO_TIER_LIST[${#DEMO_TIER_LIST[@]}-1]}\"} to route past the default"
+fi
 
 for i in $(seq 1 "$DEMO_WORKERS"); do
     port=$(( COMFY_BASE_PORT + i - 1 ))
