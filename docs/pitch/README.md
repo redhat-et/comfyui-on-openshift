@@ -37,9 +37,15 @@ is the same slides as a click-through PDF.)*
 
 ---
 
-Slide 4 also exists in motion, twice — both clips recorded off
-`make demo-local`, real renders throughout, reproducible on any machine
-with a GPU, Apple silicon included:
+Slide 4 also exists in motion. Ten seconds of it, autoplaying — the
+template found, two missing models named and sized, ComfyUI-Manager
+pulling both to the worker — and clicking through lands on the full take:
+
+[![The front half of the designer's loop: template loaded, two missing models found, named and sized, Manager pulling both server-side](demo-local-teaser.gif)](demo-local-designer-loop.mp4)
+
+The full clips, both recorded off `make demo-local`, real renders
+throughout, reproducible on any machine with a GPU, Apple silicon
+included:
 
 - [`demo-local-designer-loop.mp4`](demo-local-designer-loop.mp4) — the
   designer's loop, end to end: the stock ComfyUI canvas a pool worker
