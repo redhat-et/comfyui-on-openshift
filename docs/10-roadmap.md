@@ -816,6 +816,11 @@ not the mkdir) and that the gateway, mounting the same EFS volume read-only as
 a third arbitrary UID, can still serve it. EFS specifically, not gp3: the
 whole point is two pods on two nodes.
 
+The session doubles as N7's $50 challenge: the workload is scripted and the
+resulting bill published, so the same sitting validates the tree, orients
+whoever is receiving it, and turns `docs/02`'s cost model into an artifact
+anyone can rerun.
+
 Last step of the session is `make park` or `make down`, confirmed with
 `make status`.
 
@@ -894,7 +899,8 @@ its ID above.
 12. **Build the images with OpenShift Pipelines** — S2. Bumping `COMFYUI_REF`
     becomes a pipeline run with a signed output rather than a laptop running
     `setup.sh`. *(Medium, and the right move once more than one person owns
-    this.)*
+    this.)* Now scoped into the alignment agreement's Phase 2 (the Konflux
+    line) — receiving-side work.
 
 ## The next horizon
 
@@ -918,7 +924,10 @@ also the experiment that answers the open question in `docs/13`'s
 "boundary" section: what parameter surface actually survives a delegated
 step, and whether a video path exists at all. *The single most valuable
 item on this list: the repo itself would embody the composition rule, or
-report honestly where it cannot.*
+report honestly where it cannot.* Deliberately **not** a transfer
+deliverable — the signed alignment agreement's required list depends on
+nobody who has not signed it — so it stays here as an open invitation,
+best taken jointly with the Omni project.
 
 **N2 — VRAM-tier routing** — **landed**, laptop half; the real tier machine
 pools autoscaling are on the cluster-day list, the same split Q3 used
@@ -1057,10 +1066,12 @@ diffs the output — "renders don't regress," CI for creative pipelines.
 Touches `nightly.yaml` and a new `workflows/` convention; the CPU half is
 laptop-provable, which is the point.
 
-**N7 — The $50 challenge.** A scripted, reproducible ten-person design day —
-synthetic workload in, real bill out, published. Turns `docs/02`'s model into
-an artifact anyone can rerun. Cluster-day by construction; the script half is
-a laptop item.
+~~**N7 — The $50 challenge.**~~ **Merged into the cluster day**, not
+dropped: the re-validation session (`docs/12-first-cluster-day.md`) is now
+specified to run as the scripted, reproducible design-day — synthetic
+workload in, real bill out, published — so one supervised sitting serves
+validation of the current tree, the receiving team's orientation, and the
+publishable cost proof at once. "The cluster day" above carries it.
 
 **N8 — Provenance end to end.** S1's `models.lock` extended with checksum
 verification at load, plus C2PA content credentials stamped onto outputs —
@@ -1072,7 +1083,9 @@ output-write hook; the stamping half is laptop-provable.
 model lockfile make a disconnected install a documented path rather than a
 support question — the segment that cannot use SaaS structurally
 (`docs/14-market.md`). Doc-first; touches `docs/` and image references;
-proven by a disconnected cluster day, eventually.
+proven by a disconnected cluster day, eventually. Scoped into the
+tech-alignment agreement's Phase 2 — this lands on the receiving side; the
+entry stays here because the reasoning does.
 
 **N10 — Agent access to the pool.** Comfy Org ships an MCP server that
 assumes one dedicated instance; the pool needs agent principals — service
@@ -1085,7 +1098,8 @@ shape.
 **N11 — Operator packaging (OLM).** The productization artifact: install,
 upgrade and configure via an operator rather than `setup.sh`. Sequenced
 after S2 (pipelines build) — packaging a laptop-built image is packaging the
-wrong thing. A spike, then a decision.
+wrong thing. A spike, then a decision — and, like N9, scoped into the
+alignment agreement's Phase 2: receiving-side work, reasoning kept here.
 
 **N12 — Hybrid render.** Local card for previews, burst to the pool for
 finals — the split that matches how artists already work. Frontend
@@ -1104,6 +1118,25 @@ download and nothing in the frontend calls a server-side install), so it
 waits on either an upstream hook for missing-model download handlers or a
 custom node shipping a JS extension in the worker image. Do not fork the
 frontend pin for it; the hop is one click and the pin is load-bearing.
+
+**N14 — The recording pipeline joins the repo.** The pitch videos were
+produced by playwright scripts and an ffmpeg timelapse edit that live only
+in a session workspace, and the one rule they must obey — normalize the
+frame rate and pin the H.264 level, because a timelapse's nominal fps once
+produced a Level 6.2 stream that QuickTime refused while browsers played it
+— exists today as a commit message. Check the record/edit scripts in beside
+the videos with the encoding flags baked in, so re-recording after any UI
+change is one command instead of archaeology. Small; touches nothing
+load-bearing.
+
+**N15 — Showback survives the teardown by default.** `docs/09` §5 teaches a
+two-command habit — capture `/api/showback`, then `make down` — and a habit
+is the wrong tool for data that vanishes when it is forgotten. Teach
+`scripts/99-teardown.sh` to attempt the capture itself before deleting the
+cluster (to a local `showback-YYYY-MM.json`, or to the S3 bucket when
+`MODELS_S3_BUCKET` is set), skipping silently when no gateway answers.
+Small; touches the teardown script only; provable by a check that fakes a
+gateway. The savings report (N3) then always has last month to read.
 
 Deliberately *not* re-added: anything the "Deferred, with reasons" and
 "Not on this list" sections already decided against — those decisions stand
