@@ -20,6 +20,22 @@ OpenShift 4.x cluster, plus every piece of failure handling you would otherwise
 meet at 2am — the late subscriber, the worker that dies mid-render, the reap
 that fails halfway, the output filename that spells a path.
 
+The commercial way to buy this capability — Higgsfield, Krea, Runway,
+Midjourney — is credit-metered SaaS: $79–215 per seat per month at the team
+tiers, video billed by the second (a $35/month plan buys about ninety seconds
+of top-tier video), and every prompt, model and output living in the vendor's
+cloud. ComfyUI is the open-source leader of that same category — a
+$500M-valuation project with 60,000+ community nodes, the tool behind the
+first primarily-AI-generated Super Bowl ad, and "ComfyUI artist" now a job
+title. It is already in commercial production: Amazon Studios, Apple,
+Autodesk, Netflix, Nike, Tencent and Ubisoft are among the teams building on
+it, across VFX, advertising, gaming and eCommerce
+([comfy.org](https://www.comfy.org)). What it has never had is the
+enterprise deployment story: this repo is
+that story — the same tool, on your GPUs, in your VPC, behind your SSO,
+metered per user. Open source undercutting the per-seat meter is not a novel
+strategy here; it is the strategy this company is built on.
+
 ## The number
 
 Ten designers, this repo's own rates (`g6.xlarge`, L4 24 GB, $0.976/hour
@@ -56,6 +72,7 @@ your laptop. No cluster, no GPU, no AWS account, about a minute.
 | **A pod or VM per person** | a card each, ~$7,100/mo before anyone remembers to turn one off | none while running; minutes from stopped | whatever you put in front of each one | the per-instance bill, by construction | one blast radius per person, each on a node with credentials | per person, live | you, ten times | yours |
 | **RunPod/Modal-style serverless ComfyUI** | per-second GPU billing with the vendor's markup; cheapest at very low duty | seconds to about a minute on a warm image, longer on a fresh pull | the vendor's account and API keys, not your IdP | per API key, from the vendor's invoice | the vendor's container isolation | your image; rebuild to change | the vendor | no — workflows, models and outputs run in the vendor's cloud |
 | **Hosted ComfyDeploy / ViewComfy / Comfy Cloud** | per-seat or per-second subscription | seconds; the vendor keeps it warm | the vendor's login; team SSO depends on plan | the vendor's dashboard | the vendor's | the vendor's catalog and image pipeline | the vendor | no — your data leaves your VPC |
+| **Credit-metered creative SaaS (Higgsfield, Krea, Runway, Midjourney)** | $79–215/seat/mo at team tiers; video by the second — ~90 s/mo of top-tier video on a $35 plan | none | the vendor's login; SSO on enterprise plans | the per-seat invoice | not applicable — closed platform | no — the vendor's catalog, the vendor's pipeline | the vendor | no — prompts, models and outputs in the vendor's cloud |
 | **A generic Kubernetes Helm chart** | a card per replica, always on; scale-to-zero is yours to build | none while a replica runs | whatever ingress auth you bolt on | none | a reachable ComfyUI Service by default; any NetworkPolicy is yours to write | your image | you: a cluster, a driver, and the app | yours |
 | **KServe / Ray Serve** | a resident GPU per served model; a design library is many models | seconds once resident; scale-to-zero costs the same cold start as here | the platform's | per deployment, not per user | the serving container; arbitrary node Python does not fit a fixed serving API | the model is the unit, not the graph — ComfyUI's per-job DAG does not fit | you, plus the serving stack | yours |
 | **This repo** | ~$120/mo at 0.4 GPU-h/person/day; ~$950/mo with a five-worker warm floor; plus the $1.06/h cluster floor | **8–17 min unless a warm floor is set** (~$190/mo per warm card, weekdays 9–6) | cluster SSO via oauth-proxy; access is a namespace role; every grant in the cluster audit log | `GET /api/showback` per user; `QUOTA_GPU_SECONDS` per month, off by default, fails open | ComfyUI on loopback with no Service and no Route; namespace default-deny; a worker can reach Redis and DNS and nothing else, as a least-privilege Redis user | **baked into the image — a rebuild**, not a click in Manager | you operate one namespace; the driver, nodes, control plane and TLS are somebody else's pager. **The gateway is not the canvas** | yours — ROSA in your AWS account, or any OpenShift you already have |
@@ -63,6 +80,14 @@ your laptop. No cluster, no GPU, no AWS account, about a minute.
 The two places this loses are in its own row: the cold start when nothing is
 warm, and custom nodes needing a rebuild. Both are priced and both have a
 setting; "Where this loses" below is the long form.
+
+One name deliberately absent from the table: **vLLM Omni is a layer here, not
+a rival** — a serving engine for the model a team hammers hardest, running
+beside this pool on the same cluster and reached from the canvas through the
+[`comfyui-vllm-omni`](https://github.com/dougbtv/comfyui-vllm-omni) bridge
+nodes. Where each tier wins, the cost arithmetic of both shapes, and the
+showback-driven rule for promoting a model from the pool to a resident
+engine: **`docs/13-vllm-omni.md`**.
 
 ## Which path are you on?
 
@@ -78,6 +103,7 @@ setting; "Where this loses" below is the long form.
 | Already have an OpenShift cluster | `PLATFORM=openshift` in `.env`, `oc login`, then `make gpu storage deploy` (or `make gpu storage enterprise`) — nothing in those steps is ROSA-specific |
 | Just evaluating the code | `make test`, then `enterprise/test/README.md` for what each assertion is defending |
 | Taking this over from someone | `docs/09-engineering-handoff.md` |
+| Asking how this relates to vLLM Omni | `docs/13-vllm-omni.md` — layers, not rivals: where the serving engine wins, where the pool wins, and the showback-driven rule for moving a model between them |
 | Bringing it up on real hardware for the first time | `docs/12-first-cluster-day.md` — the run CI cannot do, as a checklist: what to measure, where each number goes, what to verify, what to record |
 
 ## What changes for the people using it
@@ -641,6 +667,8 @@ docs/
   09-engineering-handoff.md  taking ownership: invariants, runbook, open items
   10-roadmap.md           the ideas, as a work plan with lanes and gates
   11-scaling.md           how far this goes, and which AWS cards it runs on
+  12-first-cluster-day.md the run CI cannot do, as a checklist
+  13-vllm-omni.md         the serving tier and this tier: costs, the bridge, the promotion rule
 .github/workflows/
   ci.yaml                 four jobs on every PR: lint (+ kubeconform), the e2e suite,
                           real ComfyUI on CPU, the gateway image as an arbitrary UID
