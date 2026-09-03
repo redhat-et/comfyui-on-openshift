@@ -196,10 +196,10 @@
   <section class="slide active" id="s1">
     <div class="eyebrow">1 · The current state</div>
     <div class="heard">
-      <span class="hl">What we've heard</span>
-      <p>“Is this a significant use case? Do we get signals that it's needed?” · “This looks like a content-creation studio, not a general AI playground.” · “It's a good UX for multi-step, pipeline-type workflows.”</p>
+      <span class="hl">The questions on the table</span>
+      <p>Is there real demand for this? And what is it, exactly — a content-creation studio, or another AI playground?</p>
     </div>
-    <h1>Yes — it's the professionals' standard, and a studio is exactly what it is</h1>
+    <h1>The professionals' standard — and a studio, not a playground</h1>
     <p class="kicker">The unit of work is a <b>node graph</b>, not a prompt — an inspectable pipeline where a tweak reruns one node, not the whole generation. A studio workload, a separate persona from any playground — <b>and it should ship as its own module, never merged into one.</b> Today it's a <b>single-user desktop app</b>: no auth, arbitrary-Python nodes, one GPU per instance.</p>
     <div class="cols">
       <div class="col">
@@ -250,10 +250,10 @@
   <section class="slide" id="s2">
     <div class="eyebrow">2 · The proposed state</div>
     <div class="heard">
-      <span class="hl">What we've heard</span>
-      <p>“The point was to break up the expensive machine under each creator's desk — move the GPUs to the datacenter, keep the frontend the same, separate it from the backend.”</p>
+      <span class="hl">The questions on the table</span>
+      <p>Can the expensive machine under each creator's desk be broken up — GPUs to the datacenter, frontend untouched?</p>
     </div>
-    <h1>That sentence, built: same ComfyUI, GPUs in a pooled, scale-to-zero cluster</h1>
+    <h1>Same ComfyUI, unchanged — the GPUs move to a pooled, scale-to-zero cluster</h1>
     <p class="kicker">Keep the frontend identical — <b>stock ComfyUI at a pinned commit</b>, not a wrapper — and separate it from the backend: cards leave the desks and become one shared machine pool that turns off between jobs. Three pillars:</p>
 
     <div class="cols" style="flex:0 0 auto; margin-bottom:12px;">
@@ -299,8 +299,8 @@
   <section class="slide" id="s3">
     <div class="eyebrow">3 · What the work does to enable it</div>
     <div class="heard">
-      <span class="hl">What we've heard</span>
-      <p>“Explain what is needed and provided beyond how the existing Omni–ComfyUI integration did it.”</p>
+      <span class="hl">The questions on the table</span>
+      <p>What does this provide beyond the existing Omni–ComfyUI integration?</p>
     </div>
     <h1>The production layer neither stock ComfyUI nor the bridge provides — built, tested, merged</h1>
     <p class="kicker">~9,000 lines of Python and shell in <span class="mono">redhat-et/comfyui-on-openshift</span>: the queue, the isolation, the autoscaling, the accounting, and the failure handling you otherwise meet at 2am.</p>
@@ -351,10 +351,10 @@
   <section class="slide" id="s4">
     <div class="eyebrow">4 · Where vLLM Omni fits — and the asks</div>
     <div class="heard">
-      <span class="hl">What we've heard</span>
-      <p>“The strategic inference engine is the product — supported inference means buying it.” · “Customers ask for APIs and performance and have their own UIs; we must not get into the application layer.”</p>
+      <span class="hl">The questions on the table</span>
+      <p>Where does the strategic inference engine fit in this? And does any of it stray into the application layer?</p>
     </div>
-    <h1>Agreed on both — this design is built on them</h1>
+    <h1>The engine is the throughput tier here — and the application layer stays untouched</h1>
     <p class="kicker">A serving engine holds <b>one model resident</b> behind an API — residency scales with catalog size; a design library is many models touched briefly — <b>the pool scales with concurrency</b>. And nothing here is an application layer: <b>ComfyUI is upstream's app at a pinned commit; this repo is deployment wiring.</b></p>
 
     <div class="card" style="margin-bottom:12px;">
