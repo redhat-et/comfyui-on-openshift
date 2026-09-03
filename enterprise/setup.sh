@@ -34,6 +34,10 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 : "${COMFYUI_REF:=c2bcbecd82ec5ae66594340b395c24ef0217b238}"
 : "${GPU_NODE_LABEL:=nvidia.com/gpu.present=true}"
 : "${QUOTA_GPU_SECONDS:=0}"
+# The all-in $/GPU-hour that prices the FOCUS chargeback export (N4). The
+# default is docs/02-cost.md's g6.xlarge figure; it prices a report, it
+# spends nothing.
+: "${GPU_HOURLY_RATE:=0.976}"
 # Who may read every submitter's showback row under AUTH_MODE=oauth (comma-
 # separated identities as oauth-proxy reports them). Empty by default: each
 # caller sees their own row and the totals, and nothing that names a colleague.
@@ -56,6 +60,14 @@ MANIFESTS="${ENTERPRISE_DIR}/manifests"
 if ! printf '%s' "$QUOTA_GPU_SECONDS" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
     warn "QUOTA_GPU_SECONDS=${QUOTA_GPU_SECONDS} is not a number — the per-user GPU-second quota will be OFF"
     QUOTA_GPU_SECONDS=0
+fi
+
+# Same posture for the export's rate: hub.py falls back to its own default on
+# anything unparseable, so this warning is a courtesy at deploy time rather
+# than the enforcement.
+if ! printf '%s' "$GPU_HOURLY_RATE" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+    warn "GPU_HOURLY_RATE=${GPU_HOURLY_RATE} is not a number — the FOCUS export will use hub.py's default rate"
+    GPU_HOURLY_RATE=0.976
 fi
 
 KEDA_NAMESPACE="${KEDA_NAMESPACE:-openshift-keda}"
@@ -438,6 +450,7 @@ apply_gateway()
 {
     sed -e "s#image: comfy-gateway:latest#image: ${GATEWAY_IMAGE}#" \
         -e "s#QUOTA_GPU_SECONDS_PLACEHOLDER#${QUOTA_GPU_SECONDS}#" \
+        -e "s#GPU_HOURLY_RATE_PLACEHOLDER#${GPU_HOURLY_RATE}#" \
         -e "s#AUTH_MODE_PLACEHOLDER#${AUTH_MODE}#" \
         -e "s#SHOWBACK_OPERATORS_PLACEHOLDER#${SHOWBACK_OPERATORS}#" \
         "${MANIFESTS}/01-gateway.yaml" \

@@ -140,6 +140,37 @@ provokes. It is off by default. The README's "Sizing the pool" section says
 how many to hold for a given team, and when holding them stops being cheaper
 than a card each.
 
+## The report writes itself
+
+Everything above is a model. The pool also keeps the measured version —
+`GET /api/showback`, one UTC month of held GPU seconds per submitter plus a
+billed-jobs count — and two tools turn that into the documents the cost
+conversation actually consumes:
+
+```bash
+# The monthly business case, as markdown that pastes into Slack: total
+# spend, cost per render, utilization, and the card-per-person
+# counterfactual (headcount × $713/mo, the L4 figure above), from a live
+# gateway or from the teardown-habit capture.
+scripts/savings-report.py --gateway http://localhost:8000
+scripts/savings-report.py --from-json showback-2026-08.json --headcount 10
+
+# The chargeback CSV in the FinOps FOCUS 1.2 column set, priced at
+# GPU_HOURLY_RATE ($0.976/h default — the g6.xlarge all-in rate above).
+curl -s "$GW/api/showback?format=focus" > showback-2026-08-focus.csv
+```
+
+Three honesty rules, so the numbers can be defended in the meeting they are
+for: spend is *held* time at one all-in rate (Q4's definition — checkpoint
+loads and failed jobs included, queue time not); cost per render divides
+billed spend by billed jobs, with time lost to dying workers priced on its
+own line and charged to nobody; and the reporter's default headcount is the
+identities the report names, stated as a floor — pass `--headcount` with the
+real team size, since a seat that rendered nothing this month would still
+have needed a card. FOCUS columns the gateway cannot truthfully fill
+(RegionId, ResourceId, SkuId) ship empty rather than plausible;
+`docs/10-roadmap.md` ("N3 and N4 landed") has the full mapping rationale.
+
 ## Where the money actually goes if you are not careful
 
 - **NAT gateway: ~$32/month plus $0.045/GB processed.** It bills while the

@@ -279,7 +279,12 @@ reports one UTC month's GPU seconds per submitter, from the attribution the
 queue envelope was already carrying, and `QUOTA_GPU_SECONDS` turns that same
 accounting into a per-person ceiling — off by default, and deliberately
 failing open. `docs/10-roadmap.md` (Q4 and Q5) has what the number over-counts
-and why.
+and why. The same report also answers finance in its own two languages:
+`?format=focus` returns it as CSV in the FinOps FOCUS 1.2 column set, priced
+at `GPU_HOURLY_RATE`, and `scripts/savings-report.py` turns it into the
+monthly business case — spend, cost per render, utilization, and the
+card-per-person counterfactual — as markdown that pastes into Slack
+(`docs/02-cost.md`, "The report writes itself").
 
 ## How it fits together
 
