@@ -608,14 +608,29 @@ for containerfile in app/Containerfile enterprise/worker/Containerfile; do
     # what is pinned here is the DEFAULT, which is what a bare build gets.
     shape_require "$containerfile" '^ARG COMFYUI_REF=[0-9a-f]{40}$' \
         "the ComfyUI clone's default ref must be a commit SHA, not a tag. A tag is a mutable pointer, so a rebuild months later silently ships different application source with an identical Containerfile — the same class of failure the torch pin above it exists to prevent, and it produced no error the last time it happened"
-    shape_require "$containerfile" '^ARG MANAGER_REF=[0-9a-f]{40}$' \
-        "the ComfyUI-Manager clone's default ref must be a commit SHA too, and this is the clone where it matters most: Manager is the component that installs and runs arbitrary Python from the internet, so an unpinned fetch of it is an unpinned fetch of everything it can reach"
-
+    # No MANAGER_REF clone shape any more, deliberately: at this COMFYUI_REF a
+    # Manager checkout in custom_nodes cannot import at all (Manager 4.x has no
+    # top-level __init__.py; ComfyUI logs "Cannot import" and boots without it,
+    # which the nightly — ENABLE_MANAGER=false — never sees). The only working
+    # form is the pip module ComfyUI's own manager_requirements.txt pins, which
+    # keeps the Manager version pinned by COMFYUI_REF's SHA.
+    shape_require "$containerfile" 'pip install -r manager_requirements\.txt' \
+        "ComfyUI-Manager must be installed as the pip module ComfyUI's manager_requirements.txt pins, not cloned into custom_nodes — a Manager 4.x checkout there has no top-level __init__.py, so ComfyUI logs 'Cannot import ... ComfyUI-Manager' and boots without it, silently, in an image built to include it"
     shape_require "$containerfile" 'chgrp -R 0' \
         "OpenShift runs the container as an arbitrary high UID with GID 0. Without the chgrp 0 / chmod g=u block ComfyUI cannot write temp/, input/ or user/, and the pod crash-loops on a permission error that reads like a storage problem"
     shape_require "$containerfile" 'chmod -R g=u' \
         "the group-writable half of the same block — group-root ownership alone does not make the paths writable"
 done
+
+# The flag half of the Manager fix: the comfyui_manager module does nothing
+# unless --enable-manager reaches main.py. It lives in the ENTRYPOINT shim for
+# the app image and in start.sh for the worker. (Pattern starts after the
+# dashes — shape_require hands it to grep -E, where a leading -- reads as an
+# option.)
+shape_require app/Containerfile 'enable-manager' \
+    "the app image must pass --enable-manager (via the ENTRYPOINT shim) when built with ENABLE_MANAGER=true — the installed comfyui_manager module is dead weight without the flag"
+shape_require enterprise/worker/start.sh 'enable-manager' \
+    "the worker must pass --enable-manager (start.sh, from the baked ENABLE_MANAGER env) when the image was built with Manager — the installed comfyui_manager module is dead weight without the flag"
 
 shape_require enterprise/worker/start.sh 'COMFY_HOST:-127\.0\.0\.1' \
     "ComfyUI in the GPU pod must default to loopback. The pod has no Service and no Route, so the agent beside it is the only way in; binding 0.0.0.0 publishes unauthenticated arbitrary code execution on a node holding cloud credentials"

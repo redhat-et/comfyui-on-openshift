@@ -78,6 +78,16 @@ echo "[start] launching ComfyUI on ${COMFY_HOST}:${COMFY_PORT}"
 
 cd "$COMFY_ROOT" || exit 1
 
+# --enable-manager only when the image was built with ENABLE_MANAGER=true (the
+# Containerfile bakes the build arg through as ENV). At this ComfyUI ref,
+# Manager is the pip module comfyui_manager and main.py loads it only behind
+# this flag — a Manager baked into the image simply never appears without it.
+# Passed before "$@" so an appended caller flag still wins.
+MANAGER_ARGS=()
+if [[ "${ENABLE_MANAGER:-false}" == "true" ]]; then
+    MANAGER_ARGS=(--enable-manager)
+fi
+
 # --models-directory, NOT --base-directory: --base-directory would relocate
 # custom_nodes lookup to /models/custom_nodes, silently ignoring every node
 # baked into this image, and put checkpoints at /models/models/checkpoints.
@@ -96,6 +106,7 @@ python3 main.py \
     --models-directory /models \
     --output-directory "$OUTPUT_ROOT" \
     --temp-directory /tmp \
+    ${MANAGER_ARGS[@]+"${MANAGER_ARGS[@]}"} \
     "$@" &
 comfy_pid=$!
 

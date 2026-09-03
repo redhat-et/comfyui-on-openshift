@@ -57,8 +57,6 @@ spec:
           value: "${COMFYUI_REF}"
         - name: ENABLE_MANAGER
           value: "${ENABLE_MANAGER}"
-        - name: MANAGER_REF
-          value: "${MANAGER_REF}"
         - name: TORCH_INDEX
           value: "${TORCH_INDEX}"
         - name: TORCH_VERSION
