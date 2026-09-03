@@ -10,7 +10,7 @@ real routing: "l4" and "l40s" here are two names in GPU_TIERS and two Redis
 lists, which is exactly all they are on a cluster too -- the machine pools
 behind them are the cluster-day half (docs/12-first-cluster-day.md).
 
-The fixture: this check runs its own gateway (port 8104) with
+The fixture: this check runs its own gateway (port 8106) with
 GPU_TIERS=l4,l40s against the suite's own QUEUE_KEY namespace, so the
 DEFAULT tier's queue is the same bare comfy:queue every other check uses --
 that identity is the N2 key-shape invariant (docs/09 section 3), not a test
@@ -73,7 +73,14 @@ sys.stdout.reconfigure(line_buffering=True)
 r = connect_redis()
 
 TIER_QUEUE = f"{QUEUE_KEY}:l40s"
-TGW_PORT = 8104
+
+# 8106: this suite hands each own-gateway check its own port so a lingering
+# process from one check can never turn into a confusing bind failure in
+# another — 8101 is check-95's, 8102 check-15's, 8103 check-66's, and
+# check-91 holds 8104 and 8105. This check and check-91 landed in the same
+# window both claiming 8104; sequential execution and clean teardown made
+# that invisible to CI, which is exactly why the map is written down here.
+TGW_PORT = 8106
 TGW = f"http://127.0.0.1:{TGW_PORT}"
 
 # The tiered gateway this check starts below, via the same harness Client the
