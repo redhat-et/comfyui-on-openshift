@@ -104,6 +104,7 @@ engine: **`docs/13-vllm-omni.md`**.
 | Just evaluating the code | `make test`, then `enterprise/test/README.md` for what each assertion is defending |
 | Taking this over from someone | `docs/09-engineering-handoff.md` |
 | Asking how this relates to vLLM Omni | `docs/13-vllm-omni.md` — layers, not rivals: where the serving engine wins, where the pool wins, and the showback-driven rule for moving a model between them |
+| Presenting this to stakeholders | `docs/pitch/index.html` — four slides (current state → proposed state → what the work does → where Omni fits) plus a Q&A appendix; self-contained, open in any browser |
 | Bringing it up on real hardware for the first time | `docs/12-first-cluster-day.md` — the run CI cannot do, as a checklist: what to measure, where each number goes, what to verify, what to record |
 
 ## What changes for the people using it
@@ -669,6 +670,7 @@ docs/
   11-scaling.md           how far this goes, and which AWS cards it runs on
   12-first-cluster-day.md the run CI cannot do, as a checklist
   13-vllm-omni.md         the serving tier and this tier: costs, the bridge, the promotion rule
+  pitch/index.html        the four-slide stakeholder briefing + Q&A appendix — open in any browser
 .github/workflows/
   ci.yaml                 four jobs on every PR: lint (+ kubeconform), the e2e suite,
                           real ComfyUI on CPU, the gateway image as an arbitrary UID

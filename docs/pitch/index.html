@@ -1,0 +1,420 @@
+<title>One Pool, Every Corner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --paper: #fbfaf8;
+    --ink: #1d2129;
+    --muted: #5d6570;
+    --line: #e4e1db;
+    --panel: #f2f0ec;
+    --accent: #b8321f;
+    --accent-soft: #f7e9e6;
+    --good: #2a6e46;
+    --good-soft: #e8f2ec;
+    --blue: #2b5c8a;
+    --blue-soft: #e8eef5;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    background: #23211e;
+    color: var(--ink);
+    font: 16px/1.42 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    overflow: hidden;
+  }
+  #stage-wrap {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #stage {
+    width: 1280px; height: 720px;
+    background: var(--paper);
+    position: relative;
+    box-shadow: 0 8px 40px rgba(0,0,0,.45);
+    transform-origin: center center;
+  }
+  .slide {
+    position: absolute; inset: 0;
+    padding: 40px 54px 54px;
+    display: none;
+    flex-direction: column;
+  }
+  .slide.active { display: flex; }
+
+  .eyebrow {
+    font-size: 12px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 5px;
+  }
+  h1 { font-size: 31px; font-weight: 700; letter-spacing: -.015em; line-height: 1.15; margin-bottom: 5px; }
+  .kicker { font-size: 15.5px; color: var(--muted); margin-bottom: 16px; max-width: 1080px; }
+  .kicker b { color: var(--ink); font-weight: 600; }
+
+  .cols { display: flex; gap: 22px; flex: 1; min-height: 0; }
+  .col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+
+  .card {
+    border: 1px solid var(--line); border-radius: 10px;
+    background: #fff; padding: 12px 15px;
+  }
+  .card h3 {
+    font-size: 12.5px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 7px;
+  }
+  .card p { font-size: 14px; }
+  .card ul { padding-left: 17px; font-size: 14px; }
+  .card li { margin: 4px 0; }
+  .card .big {
+    font-size: 24px; font-weight: 700; letter-spacing: -.01em;
+    font-variant-numeric: tabular-nums;
+  }
+  .card .big small { font-size: 13px; font-weight: 500; color: var(--muted); letter-spacing: 0; }
+  .accent-card { border-left: 4px solid var(--accent); }
+  .good-card { border-left: 4px solid var(--good); }
+  .blue-card { border-left: 4px solid var(--blue); }
+
+  .chip {
+    display: inline-block; font-size: 11.5px; font-weight: 600; letter-spacing: .06em;
+    text-transform: uppercase; padding: 2px 9px; border-radius: 999px; vertical-align: 2px;
+  }
+  .chip.red { color: var(--accent); background: var(--accent-soft); }
+  .chip.green { color: var(--good); background: var(--good-soft); }
+  .chip.blue { color: var(--blue); background: var(--blue-soft); }
+
+  .logochips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .logochips span {
+    border: 1px solid var(--line); background: var(--panel); border-radius: 7px;
+    padding: 4px 10px; font-size: 12.5px; font-weight: 600;
+  }
+
+  .velocity { display: flex; gap: 10px; }
+  .velocity .v {
+    flex: 1; border: 1px solid var(--line); border-radius: 9px; background: var(--panel);
+    padding: 9px 10px; text-align: center;
+  }
+  .velocity .v b { display: block; font-size: 16.5px; letter-spacing: -.01em; font-variant-numeric: tabular-nums; }
+  .velocity .v i { font-style: normal; font-size: 11px; color: var(--muted); }
+  .velocity .v em { display:block; font-style: normal; font-size: 10.5px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
+
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th {
+    text-align: left; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600; padding: 4px 10px 4px 0; border-bottom: 1.5px solid var(--line);
+  }
+  td { padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.hl td { background: var(--good-soft); }
+
+  code, .mono {
+    font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+    font-size: .88em; background: var(--panel); padding: .08em .35em; border-radius: 4px;
+  }
+
+  .foot {
+    position: absolute; left: 54px; right: 54px; bottom: 16px;
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-size: 11px; color: var(--muted);
+  }
+
+  .pipe { display: flex; align-items: stretch; gap: 0; margin: 4px 0 0; }
+  .pipe .node {
+    flex: 1; border: 1.5px solid var(--line); border-radius: 9px; background: #fff;
+    padding: 8px 9px; text-align: center;
+  }
+  .pipe .node b { display: block; font-size: 13px; }
+  .pipe .node span { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; line-height: 1.3; }
+  .pipe .arrow { align-self: center; padding: 0 5px; color: var(--muted); font-size: 16px; flex: 0 0 auto; }
+  .pipe .node.gpu { border-color: var(--accent); background: var(--accent-soft); }
+  .pipe .node.zero { border-color: var(--good); background: var(--good-soft); }
+
+  .loop { display: flex; gap: 0; align-items: stretch; }
+  .loop .step {
+    flex: 1; border: 1.5px solid var(--blue); background: var(--blue-soft);
+    border-radius: 8px; padding: 7px 8px; text-align: center;
+  }
+  .loop .step.hot { border-color: var(--accent); background: var(--accent-soft); }
+  .loop .step b { display: block; font-size: 12px; line-height: 1.25; }
+  .loop .step span { font-size: 10.5px; color: var(--muted); }
+  .loop .arrow { align-self: center; padding: 0 4px; color: var(--muted); font-size: 14px; }
+
+  .pillar { border-top: 4px solid var(--good); }
+  .pillar h3 { color: var(--ink); font-size: 14px; text-transform: none; letter-spacing: 0; }
+  .pillar h3 .n {
+    display: inline-flex; width: 21px; height: 21px; border-radius: 50%;
+    background: var(--good); color: #fff; align-items: center; justify-content: center;
+    font-size: 12.5px; margin-right: 7px; vertical-align: -3px;
+  }
+
+  #nav {
+    position: fixed; right: 18px; bottom: 14px; z-index: 10;
+    display: flex; gap: 8px; align-items: center;
+    color: #b8b2a8; font-size: 13px;
+  }
+  #nav button {
+    background: #3a3733; color: #e8e3da; border: 0; border-radius: 7px;
+    font: 600 14px/1 "IBM Plex Sans", sans-serif; padding: 8px 13px; cursor: pointer;
+  }
+  #nav button:hover { background: #4a4640; }
+  #nav button:focus-visible { outline: 2px solid #e8e3da; outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div id="stage-wrap">
+<div id="stage">
+
+  <!-- ================= SLIDE 1 : TODAY ================= -->
+  <section class="slide active" id="s1">
+    <div class="eyebrow">1 · The current state</div>
+    <h1>ComfyUI is already the professionals' tool — run as a card per person or a meter per seat</h1>
+    <p class="kicker">The unit of work is a <b>node graph</b>, not a prompt — an inspectable pipeline where a tweak reruns one node, not the whole generation. That is what studios use, and it ships as a <b>single-user desktop app</b>: no auth, arbitrary-Python nodes, one GPU per instance.</p>
+    <div class="cols">
+      <div class="col">
+        <div class="card accent-card">
+          <h3>How teams run it today</h3>
+          <ul>
+            <li><b>A capable desktop under each desk</b> — $6–8k/seat, idle most of the day: four of the loop's five steps never touch the GPU. Cloud equivalent: a card each, <b>~$7,100/mo for ten</b></li>
+            <li><b>One shared box</b> — a whole team queues on one unauthenticated process; any custom node runs <em>as the server</em></li>
+            <li><b>Credit-metered SaaS</b> (Higgsfield, Krea, Runway) — $79–215/seat/mo team tiers; video by the second: a $35 plan ≈ <b>90 s of top-tier video</b>; data in the vendor's cloud</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>How fast this market moves — Higgsfield alone</h3>
+          <div class="velocity">
+            <div class="v"><em>7 months</em><b>$1.3B → $5.4B</b><i>valuation</i></div>
+            <div class="v"><em>12 months</em><b>$20M → $700M</b><i>annualized revenue</i></div>
+            <div class="v"><em>3 months</em><b>42×</b><i>agentic-usage growth</i></div>
+          </div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="card good-card">
+          <h3>Already in production on ComfyUI <span style="float:right; font-weight:500; text-transform:none; letter-spacing:0;">source: comfy.org</span></h3>
+          <div class="logochips">
+            <span>Amazon Studios</span><span>Apple</span><span>Autodesk</span><span>Netflix</span><span>Nike</span><span>Tencent</span><span>Ubisoft</span><span>Pixomondo</span><span>HP</span><span>Lucid</span>
+          </div>
+          <p style="font-size:13px; color:var(--muted); margin-top:8px;">VFX &amp; animation · advertising &amp; creative studios · gaming · eCommerce &amp; fashion</p>
+        </div>
+        <div class="card">
+          <h3>The open-source counterweight</h3>
+          <ul>
+            <li>ComfyUI: <b>$30M raise at a $500M valuation</b> (Apr 2026, Craft Ventures); 60,000+ community nodes</li>
+            <li>Behind the first primarily-AI-generated Super Bowl ad; “<b>ComfyUI artist</b>” is a job title now</li>
+            <li>Agents already speak it: Comfy Org ships an <b>official MCP server</b> — Claude Code, Codex &amp; co. drive graphs as tool calls</li>
+          </ul>
+        </div>
+        <div class="card accent-card">
+          <h3>The gap = the project</h3>
+          <p>The category's open-source leader has <b>no enterprise deployment story</b>: no SSO, no isolation, no shared-GPU economics, no per-user accounting.</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>Adopters: comfy.org · Higgsfield figures: Reuters / FT / PR Newswire, Aug 2026 · SaaS pricing: vendor team tiers, 2026</span><span>1 / 4</span></div>
+  </section>
+
+  <!-- ================= SLIDE 2 : PROPOSED STATE ================= -->
+  <section class="slide" id="s2">
+    <div class="eyebrow">2 · The proposed state</div>
+    <h1>Same ComfyUI, unchanged — the GPUs move to a pooled, scale-to-zero cluster</h1>
+    <p class="kicker">Keep the frontend identical — <b>stock ComfyUI at a pinned commit</b>, not a wrapper — and separate it from the backend: cards leave the desks and become one shared machine pool that turns off between jobs. Three pillars:</p>
+
+    <div class="cols" style="flex:0 0 auto; margin-bottom:12px;">
+      <div class="col"><div class="card pillar" style="height:100%;">
+        <h3><span class="n">1</span>GPU cost as low as it goes</h3>
+        <p style="font-size:13.5px;">Pods <b>and nodes</b> scale to zero on queue depth; the queue converts one person's setup time into another's inference. Ten designers: <b>~$7,100/mo → $120–950/mo</b>. <code>showback</code> names whose GPU-seconds they were.</p>
+      </div></div>
+      <div class="col"><div class="card pillar" style="height:100%;">
+        <h3><span class="n">2</span>Shared storage, least friction</h3>
+        <p style="font-size:13.5px;">A checkpoint pulled once is on the volume for everyone — no 7&nbsp;GB re-downloads per laptop. The 40–120&nbsp;GB team library, LoRAs and outputs <b>outlive pods and the cluster itself</b>; crashed node ≠ lost afternoon.</p>
+      </div></div>
+      <div class="col"><div class="card pillar" style="height:100%;">
+        <h3><span class="n">3</span>The desktop experience, datacenter silicon</h3>
+        <p style="font-size:13.5px;">The loop below is <b>identical to the desktop</b> — except the run step lands on pooled L4s today and <b>L40S / A100 / H100 tiers</b> as jobs grow: a job declares what it needs, the queue places it. Nobody pays 80&nbsp;GB prices for a 24&nbsp;GB job.</p>
+      </div></div>
+    </div>
+
+    <div class="card" style="margin-bottom:12px;">
+      <h3>The designer's loop — what changes for the user: almost nothing</h3>
+      <div class="loop">
+        <div class="step"><b>Load a template</b><span>identical</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><b>See missing models</b><span>Manager — identical</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><b>One-click load</b><span>to shared storage, datacenter bandwidth</span></div>
+        <div class="arrow">→</div>
+        <div class="step"><b>Wire &amp; fix the graph</b><span>identical</span></div>
+        <div class="arrow">→</div>
+        <div class="step hot"><b>Run — ~2 min</b><span>the only GPU step</span></div>
+      </div>
+      <p style="font-size:13px; color:var(--muted); margin-top:7px;">Four of five steps never touch a GPU — why ten designers need one pool and a queue, not ten cards. Savings widen with headcount: 33% at five people → 64% at thirty, plus caching that reruns only the node you changed.</p>
+    </div>
+
+    <div class="cols">
+      <div class="col"><div class="card"><h3>Security sees</h3><p style="font-size:13.5px;">ComfyUI on loopback, <b>no Service, no Route</b>; namespace default-deny; cluster SSO; every grant audited.</p></div></div>
+      <div class="col"><div class="card"><h3>Finance sees</h3><p style="font-size:13.5px;">Per-user showback and monthly quota; three cost states, each one command (running / parked / torn down).</p></div></div>
+      <div class="col"><div class="card"><h3>The platform team sees</h3><p style="font-size:13.5px;">One namespace. Driver, nodes, control plane, TLS: the platform's pager — the OpenShift sell, verbatim.</p></div></div>
+    </div>
+    <div class="foot"><span>Rates: g6.xlarge (L4 24 GB) at $0.976/h all-in — the repo's own cost model, reconciled in its README</span><span>2 / 4</span></div>
+  </section>
+
+  <!-- ================= SLIDE 3 : WHAT THE WORK DOES ================= -->
+  <section class="slide" id="s3">
+    <div class="eyebrow">3 · What the work does to enable it</div>
+    <h1>The wiring between stock ComfyUI and the platform — built, tested, merged</h1>
+    <p class="kicker">~9,000 lines of Python and shell in <span class="mono">redhat-et/comfyui-on-openshift</span>: the queue, the isolation, the autoscaling, the accounting, and the failure handling you otherwise meet at 2am.</p>
+
+    <div class="card" style="margin-bottom:13px;">
+      <h3>Architecture — hub and spoke, workers unreachable by design</h3>
+      <div class="pipe">
+        <div class="node"><b>Browser</b><span>stock ComfyUI canvas</span></div>
+        <div class="arrow">→</div>
+        <div class="node"><b>Route + SSO</b><span>oauth-proxy, namespace role</span></div>
+        <div class="arrow">→</div>
+        <div class="node"><b>Gateway</b><span>FastAPI · showback · quota</span></div>
+        <div class="arrow">→</div>
+        <div class="node"><b>Redis</b><span>queue + replayable progress log</span></div>
+        <div class="arrow">→</div>
+        <div class="node gpu"><b>GPU workers 0..N</b><span>ComfyUI on loopback · no Service, no Route</span></div>
+        <div class="arrow">→</div>
+        <div class="node zero"><b>KEDA + machine pool</b><span>pods <i>and nodes</i> to zero; warm floor on a schedule</span></div>
+      </div>
+    </div>
+
+    <div class="cols">
+      <div class="col">
+        <div class="card good-card">
+          <h3>Status <span class="chip green">merged · CI green</span></h3>
+          <ul>
+            <li>On <b>master</b>, released and tagged; four CI jobs per PR + nightly GPU-image builds, booted as an arbitrary UID and scanned</li>
+            <li>E2E suite runs the <b>real gateway and worker</b> on a laptop — no cluster, no GPU, ~1 min (<span class="mono">make test</span>)</li>
+            <li>Shipped: per-user showback &amp; quota, warm-floor scheduling, dead-worker reaping, per-user workspaces, default-deny policy</li>
+            <li>Docs 01–13, incl. scaling to hundreds of users and a first-cluster-day checklist</li>
+            <li>Ahead: VRAM-tier routing (L4 → L40S → H100) and pool-aware agent/MCP access — both on the written roadmap</li>
+          </ul>
+        </div>
+      </div>
+      <div class="col">
+        <div class="card blue-card">
+          <h3>Relation to <span class="mono">comfyui-vllm-omni</span> (the bridge) <span class="chip blue">complementary</span></h3>
+          <p style="margin-bottom:6px; font-size:13.5px;">The bridge is the <b>right integration shape</b>: ComfyUI nodes that delegate a generation call to a vLLM Omni server, composing with everything else on the canvas.</p>
+          <p style="margin-bottom:6px; font-size:13.5px;">What it leaves open — by its own README — is deployment: no auth, no failover, no progress streaming, one hand-started server per model. <b>The same list this platform closes.</b></p>
+          <p style="font-size:13.5px;"><b>The bridge puts Omni on the canvas; this puts the canvas in production.</b> Run here, the bridge inherits SSO, network policy and the audit log for free.</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>github.com/redhat-et/comfyui-on-openshift · docs/06 architecture · docs/13 the Omni relationship</span><span>3 / 4</span></div>
+  </section>
+
+  <!-- ================= SLIDE 4 : ONE PLATFORM, EVERY CORNER ================= -->
+  <section class="slide" id="s4">
+    <div class="eyebrow">4 · Where vLLM Omni fits — and the asks</div>
+    <h1>One platform, every corner of the multimodal market</h1>
+    <p class="kicker">Layers, not rivals. A serving engine holds <b>one model resident</b> behind an API — residency scales with catalog size. A design library is many models touched briefly — <b>the pool scales with concurrency</b>. Omni is the throughput tier for the head of the usage curve; the pool is the flexibility tier for the tail, where designers live.</p>
+
+    <div class="card" style="margin-bottom:12px;">
+      <table>
+        <tr><th>Corner</th><th>Who buys it</th><th>The tier</th></tr>
+        <tr><td><b>Voice: TTS, speech, realtime agents</b> — likely Omni's largest enterprise corner</td><td>Contact centers, IVR, accessibility — the classic Red Hat buyer</td><td><span class="chip red">Omni, resident</span></td></tr>
+        <tr><td>Generation called from application code — endpoint + SLA</td><td>Product teams; API-first customers</td><td><span class="chip red">Omni, resident</span></td></tr>
+        <tr><td><b>Designer image &amp; video workflows</b> — graphs, catalogs, 60k custom nodes</td><td>Studios, agencies, brand teams</td><td><span class="chip green">The pool — this repo</span></td></tr>
+        <tr><td>A hot model <em>inside</em> those workflows</td><td>Same studios, once showback shows concentration</td><td><span class="chip blue">Omni beside the pool, via the bridge</span></td></tr>
+        <tr><td>Omni-modal &amp; robot-policy models</td><td>Robotics / agents programs</td><td><span class="chip red">Omni</span></td></tr>
+      </table>
+      <p style="font-size:13px; color:var(--muted); margin-top:7px;"><b>The promotion rule:</b> when <code>GET /api/showback</code> shows one model dominating GPU-seconds at sustained duty, stand up an Omni engine for it beside the pool, reached through the bridge nodes — same cluster, same SSO, same bill. Showback turns "which tier?" into a query, not a strategy debate. Six always-on engines for a ten-person team would run ~$5,000/mo; the pool runs $120–950.</p>
+    </div>
+
+    <div class="cols">
+      <div class="col">
+        <div class="card accent-card">
+          <h3>The asks</h3>
+          <ul>
+            <li><b>PM read</b> on the persona (30 min): a content-creation <em>studio</em> workload — is this a corner we stand in?</li>
+            <li><b>Customer-scenario session</b>: map the API-first scenarios against the two tiers</li>
+            <li><b>Demo budget</b>: a full live-cluster demo day is ~$25–50 at the repo's own rates</li>
+            <li><b>Name the owner</b> of the "does this have a home" decision</li>
+          </ul>
+        </div>
+      </div>
+      <div class="col">
+        <div class="card">
+          <h3>Zero-cost due diligence, today</h3>
+          <p style="font-size:13.5px;"><span class="mono">make test</span> runs the real gateway and worker on a laptop in about a minute — no cluster, no GPU, no AWS account. The README's comparison table and <span class="mono">docs/13-vllm-omni.md</span> are the homework in written form; a workflow blog post series is the cheapest proof after that.</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>docs/13-vllm-omni.md — the full cost arithmetic and the composition rule</span><span>4 / 4</span></div>
+  </section>
+
+  <!-- ================= APPENDIX : WHAT WE'VE HEARD ================= -->
+  <section class="slide" id="s5">
+    <div class="eyebrow">Appendix · for the Q&amp;A</div>
+    <h1>What we've heard so far — and the answer to each</h1>
+    <p class="kicker">Questions and cautions raised in early conversations, lightly paraphrased. Each one shaped this deck; none of them is being argued with.</p>
+    <div class="cols" style="flex-wrap: wrap;">
+      <div class="col" style="gap:11px;">
+        <div class="card blue-card">
+          <h3>“Is this a significant use case? Do we get signals that it's needed?”</h3>
+          <p style="font-size:13px;">Slide 1: Amazon Studios through Ubisoft in production, a $500M valuation, the first primarily-AI Super Bowl ad, “ComfyUI artist” as a job title — and a commercial comp that went <b>$20M → $700M ARR in twelve months</b>.</p>
+        </div>
+        <div class="card blue-card">
+          <h3>“This looks like a content-creation studio, not a general AI playground.”</h3>
+          <p style="font-size:13px;"><b>Exactly right — and it should stay that way.</b> A different persona, shipped as an independent module beside a playground, never merged into one. A studio workflow is too complex for direct prompts; the graph <em>is</em> the product.</p>
+        </div>
+        <div class="card blue-card">
+          <h3>“Customers ask for APIs and performance and have their own UIs — we must not get into the application layer of the creation experience.”</h3>
+          <p style="font-size:13px;">Agreed, and this ships <b>no application layer</b>: ComfyUI is upstream's application at a pinned commit; the repo is deployment wiring. API-first customers route to the serving tier (slide 4) — mapping their scenarios to the two tiers is one of the asks.</p>
+        </div>
+      </div>
+      <div class="col" style="gap:11px;">
+        <div class="card blue-card">
+          <h3>“The strategic inference engine is the product — supported inference means buying it.”</h3>
+          <p style="font-size:13px;">Built in, not argued with: the engine is the <b>throughput tier</b> of this design, promoted per model the moment showback shows concentration. Every graph workload on the pool makes the engine <b>more</b> valuable, not less — it is the demand signal and the on-ramp.</p>
+        </div>
+        <div class="card blue-card">
+          <h3>“The idea was to break up the expensive machine under each creator's desk — GPUs to the datacenter, frontend unchanged, backend separated.”</h3>
+          <p style="font-size:13px;">That sentence is the spec this repo implements. Slides 2 and 3 are that sentence <b>built, tested and merged</b> — same frontend, pooled scale-to-zero backend, and the bill it produces.</p>
+        </div>
+        <div class="card blue-card">
+          <h3>“What does this provide beyond the existing Omni–ComfyUI integration?”</h3>
+          <p style="font-size:13px;">The bridge puts Omni <b>on the canvas</b>; this puts the canvas <b>in production</b> — SSO, queue fairness, scale-to-zero, network policy, audit, showback: the deployment list the bridge's own README leaves open, closed once, for both.</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>Every card answers a real question from a real conversation — that is the point of the appendix</span><span>Appendix</span></div>
+  </section>
+
+</div>
+</div>
+
+<div id="nav">
+  <span id="counter">1 / 4</span>
+  <button id="prev" aria-label="Previous slide">←</button>
+  <button id="next" aria-label="Next slide">→</button>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll(".slide"));
+  let current = 0;
+
+  function show(index) {
+    current = Math.max(0, Math.min(slides.length - 1, index));
+    slides.forEach((slide, i) => slide.classList.toggle("active", i === current));
+    // Four slides plus an appendix — the appendix deliberately does not count.
+    document.getElementById("counter").textContent =
+      current < 4 ? (current + 1) + " / 4" : "Appendix";
+  }
+  window.show = show;
+
+  function fit() {
+    const scale = Math.min(innerWidth / 1320, innerHeight / 770);
+    document.getElementById("stage").style.transform = "scale(" + Math.min(scale, 1.4) + ")";
+  }
+
+  document.getElementById("next").onclick = () => show(current + 1);
+  document.getElementById("prev").onclick = () => show(current - 1);
+  addEventListener("keydown", (event) => {
+    if (event.key === "ArrowRight" || event.key === " " || event.key === "PageDown") show(current + 1);
+    if (event.key === "ArrowLeft" || event.key === "PageUp") show(current - 1);
+  });
+  addEventListener("resize", fit);
+  fit();
+</script>
