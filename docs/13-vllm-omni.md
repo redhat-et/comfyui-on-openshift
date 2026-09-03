@@ -185,6 +185,30 @@ of the usage distribution; this repo is the flexibility tier for the tail —
 and the tail is where designers live.** A cluster running both is not a
 compromise between two strategies; it is the strategy.
 
+## The boundary of the bridge, stated plainly
+
+One thing the composition rule must not gloss: **Omni never executes the
+graph.** It exposes an API; the bridge works precisely because the graph
+runtime stays ComfyUI, and what promotion carries to an engine is a
+*coarse* step — prompt and parameters in, output back. Three consequences:
+
+- **Fine-grained graph control does not traverse an endpoint.** Latent
+  handoffs between nodes, ControlNet conditioning, LoRA weight mixing,
+  custom samplers — the things that make a graph a graph — have no
+  representation in an OpenAI-style API. A delegable step is one that is
+  already endpoint-shaped.
+- **The bridge is image-only today.** By its own README the image-edit
+  path is experimental and there is no video path; "promote the hot video
+  model to an engine" is an intention, not a demonstrated capability.
+- **Therefore the size of the synergy is an empirical question.** How much
+  of a real team's hot GPU-seconds sits in coarse, endpoint-shaped steps —
+  versus in the fine-grained middle of graphs — is unknown, and it decides
+  how much promotion is worth. Showback measures it per team; the N1 spike
+  (`docs/10-roadmap.md`) is the experiment that answers the capability
+  half. Until both report, the honest claim is the narrow one: the tiers
+  compose *where steps are endpoint-shaped*, and the pool exists precisely
+  because most of a graph is not.
+
 ## The corners of the multimodal market, and who serves each
 
 The same picture from the market side — every corner covered, each by the

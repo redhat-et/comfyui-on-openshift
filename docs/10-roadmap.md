@@ -912,9 +912,12 @@ nodes baked into the worker image — so the two-tier design in
 invariant: the worker today reaches Redis and DNS and nothing else — this
 adds exactly one named Service, and the invariant gate applies), and
 `app/src/custom_nodes/`. Proven by kubeconform and the arbitrary-UID image
-job on a laptop; the real call is a cluster-day line. *The single most
-valuable item on this list: the repo itself would embody the composition
-rule.*
+job on a laptop; the real call is a cluster-day line — and that call is
+also the experiment that answers the open question in `docs/13`'s
+"boundary" section: what parameter surface actually survives a delegated
+step, and whether a video path exists at all. *The single most valuable
+item on this list: the repo itself would embody the composition rule, or
+report honestly where it cannot.*
 
 **N2 — VRAM-tier routing.** Pools per card class (L4 / L40S / H100-class); a
 job declares the tier it needs and the queue places it — nobody pays 80 GB
