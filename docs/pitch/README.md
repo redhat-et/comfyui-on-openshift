@@ -70,5 +70,7 @@ Every number on these slides is backed in this repository: the cost model in
 [`../02-cost.md`](../02-cost.md), the comparison table on the
 [front page](../../README.md), the serving-tier arithmetic in
 [`../13-vllm-omni.md`](../13-vllm-omni.md), and the market case in
-[`../14-market.md`](../14-market.md). The slide images are exported from
-`index.html`; regenerate them after editing it.
+[`../14-market.md`](../14-market.md). The slide images and the PDF are
+exported from `index.html` by [`export.py`](export.py) — rerun it after any
+edit to the deck (it drives the deck's own `#Nx` export mode: slide N, nav
+hidden, videos pinned to their poster frame).

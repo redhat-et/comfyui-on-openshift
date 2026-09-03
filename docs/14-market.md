@@ -12,13 +12,16 @@ Higgsfield, Krea, Runway, Midjourney — at **$79–215/seat/month** on team
 tiers, with video billed by the second (~$0.39/second at the top tier: a
 $35/month plan is about ninety seconds of output). A thirty-seat studio
 pays **$28,000–77,000 a year**, and every prompt, model and output lives in
-the vendor's cloud.
+the vendor's cloud. The category under the meter is compounding ~34% a
+year — roughly $5B in 2023 to a projected $18.6B in 2026 (industry
+trackers, 2026).
 
 That per-seat meter is a price umbrella, and open source undercutting a
 price umbrella on top of a supported platform is not a novel strategy — it
 is the house strategy. ComfyUI is the open-source leader of the category
-($500M valuation, 60,000+ community nodes, in production at Amazon Studios,
-Apple, Autodesk, Netflix, Nike, Tencent, Ubisoft per comfy.org); this repo
+($500M valuation; **4M users, 150k downloads/day, 60,000+ community
+nodes**; in production at Amazon Studios, Apple, Autodesk, Netflix, Nike,
+Tencent, Ubisoft per comfy.org); this repo
 is its missing enterprise deployment story. The pool serves ten designers
 for $120–950/month plus the $775/month cluster floor — under the umbrella
 with room to spare.
@@ -38,17 +41,28 @@ competitor can follow them there structurally.
 One commercial comp, three clocks: Higgsfield went **$1.3B → $5.4B
 valuation in seven months**, **$20M → $700M annualized revenue in twelve**,
 and reported **42× agentic-usage growth in three** (Reuters/FT/PR Newswire,
-Aug 2026). Two readings matter here. First: demand is real and repricing
+Aug 2026). The same announcements carry the enterprise reading: business
+customers went from **under a quarter of revenue in January to the majority
+by August**, 390 of the Fortune 500 use the platform for visual production,
+and the 42× followed the May 2026 launch of its agent product. Nor is this
+one lucky company — Runway raised at a **$5.3B valuation in February 2026**
+on roughly $300M annualized revenue: two five-billion-dollar companies
+minted in the same category inside a year. Two readings matter here. First: demand is real and repricing
 quarterly, so infrastructure decisions should assume the next reset, not
 this one. Second: if agent-initiated generation keeps compounding, the
 "multi-user pool" becomes a **multi-agent pool** — and agents wielding an
 arbitrary-Python tool need the unreachable-worker security model *more*
-than humans do. Same architecture, second market.
+than humans do. Same architecture, second market. The agent rail is
+already laid: **Comfy MCP went official in June 2026** — a hosted Comfy
+Cloud connection plus an open-source local server that drives a
+self-hosted install. What neither ships is multi-tenancy, and this repo is
+the multi-tenancy; that is roadmap N10, currently read as the
+highest-value open item there.
 
 ## Whose incentives align
 
 - **Comfy Org** raised $30M explicitly to build enterprise and cloud
-  muscle; a hardened reference deployment on OpenShift is complementary to
+  muscle (Comfy Cloud is tracking $50M ARR by Q4 2026); a hardened reference deployment on OpenShift is complementary to
   their SaaS, not competitive with it.
 - **NVIDIA** benefits from every GPU Operator showcase that turns idle
   desktop cards into datacenter demand.
@@ -97,5 +111,13 @@ by citation:
 
 - Vendor team-tier pricing pages, 2026; Runway credit schedule.
 - ComfyUI raise: Craft Ventures round, April 2026; adopter list: comfy.org.
-- Higgsfield figures: Reuters, Financial Times, PR Newswire, August 2026.
+- Higgsfield figures (valuation, revenue, agentic growth, customer mix,
+  Fortune 500 count): Reuters, Financial Times, PR Newswire, August 2026.
+- Runway Series E ($315M at $5.3B, ~$300M annualized revenue): press
+  coverage, February 2026.
+- Category size ($5.1B 2023 → $18.6B 2026 projected, ~34% CAGR): AI-video
+  market trackers, 2026.
+- Comfy MCP (official, hosted + open-source local server): comfy.org/mcp,
+  announced June 30, 2026. ComfyUI user/download counts: April 2026 raise
+  announcement.
 - Cost model: `docs/02-cost.md`; serving comparison: `docs/13-vllm-omni.md`.
