@@ -371,18 +371,19 @@
         <div class="card good-card">
           <h3>The desktop loop, verbatim</h3>
           <ul>
-            <li>Load a template · wire the graph · run — <b>identical to the desktop</b>, same canvas, same nodes</li>
-            <li>Missing models load <b>to the worker, not the laptop</b> — <b>ComfyUI-Manager</b>, server-side, onto the shared volume, pulled once for everyone</li>
+            <li>Load a template · wire the graph · run — <b>identical to the desktop</b></li>
+            <li>Missing models load <b>to the pool, not the laptop</b> — one <b>Install-to-pool button</b> on the gateway, pulled once for everyone</li>
             <li>Run streams progress per node; the render lands on shared storage</li>
           </ul>
         </div>
         <div class="card accent-card">
-          <h3>Manager is the hinge</h3>
-          <p style="font-size:13.5px;">The add-on is what lets the desktop habit survive the move to a cloud backend: the designer keeps clicking the same buttons while <b>the models and the GPU live in the datacenter</b>. It ships in the worker image; the gateway stays the multi-user door.</p>
+          <h3>Manager finds it; the gateway fetches it</h3>
+          <p style="font-size:13px; margin-bottom:8px;">Manager names what is missing, in the canvas. The fetch is the gateway's <b>Install to pool</b> button — allowlisted source, <span class="mono">.safetensors</span> verified at byte nine — because the workers have <b>no internet by design</b>.</p>
+          <img src="demo-local-install-button.png" alt="The gateway's Models section: a Hugging Face URL pasted, the Install-to-pool button, and a live progress bar at 40% of a real download" style="width:100%; border:1px solid var(--line); border-radius:7px; display:block;">
         </div>
         <div class="card">
           <h3>Honestly not shown</h3>
-          <p style="font-size:13.5px;">One laptop GPU time-shared — <b>pods simulated, silicon not</b>. SSO, KEDA and scale-to-zero need the cluster. The ladder: <b>$0 → $0 → ~$50</b> — <span class="mono">make test</span>, <span class="mono">make demo-local</span>, a live-cluster day.</p>
+          <p style="font-size:13.5px;">One laptop GPU time-shared — <b>pods simulated, silicon not</b>. SSO, KEDA and scale-to-zero need the cluster; the <b>$0 → $0 → ~$50</b> ladder ends at a live-cluster day.</p>
         </div>
       </div>
     </div>
