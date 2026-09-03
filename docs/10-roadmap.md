@@ -927,16 +927,82 @@ queue key shape in `hub.py` and `worker_agent.py` (a §3 invariant — the
 queue-lane review gate applies), `setup.sh` machine pools, and `.env`.
 Laptop-provable with fake tiers; real pools are a cluster-day line.
 
-**N3 — The savings report.** A monthly report assembled from data already
-collected — utilization, waits, cost per render, spend versus the
-card-per-person counterfactual — so the system generates its own business
-case. Touches a small reporter script and `docs/02`; proven by `make test`
-against seeded showback data. Pairs with **N4**.
+~~**N3 — The savings report.**~~ **Shipped.** A monthly report assembled
+from data already collected — utilization, waits, cost per render, spend
+versus the card-per-person counterfactual — so the system generates its own
+business case. Landed as `scripts/savings-report.py`, proven by
+`enterprise/test/check-92-savings-report.py` against a fabricated
+fully-elapsed month and a live gateway; "N3 and N4 landed" below has the
+decisions. Pairs with **N4**.
 
-**N4 — FOCUS-format chargeback export.** `GET /api/showback` grown a
-`?format=focus` CSV in the FinOps FOCUS column set — the checkbox enterprise
-finance actually asks for. Touches `gather_stats`/showback read paths only;
-proven by a check that validates the column contract.
+~~**N4 — FOCUS-format chargeback export.**~~ **Shipped.** `GET
+/api/showback` grown a `?format=focus` CSV in the FinOps FOCUS column set —
+the checkbox enterprise finance actually asks for. Proven by
+`enterprise/test/check-91-focus-export.py`, which pins the column contract
+verbatim. The item's own sentence "touches showback read paths only" turned
+out one field short — see below.
+
+### N3 and N4 landed — the denominator, the rate, and the honesty rule
+
+The two items are one feature with two audiences — the FOCUS CSV is what
+finance's tooling ingests, the savings report is what a person pastes into
+Slack — and they landed together because they share every decision:
+
+**"Read paths only" was wrong by one field: cost per render needs a
+denominator, and no read path has one.** The showback Hash held seconds per
+identity and nothing else; the per-job state hashes that could be counted
+expire in hours, so a count taken at report time sees only the tail of the
+month. The accrual therefore counts too — `SHOWBACK_JOBS_FIELD` (`jobs`),
+one `HINCRBY` inside the same `SHOWBACK_ACCRUE_LUA` that adds the seconds,
+on the same period Hash, mirrored into both files like everything else in
+the shared block. Submitter-path accruals only: failed and cancelled jobs
+count, because Q4 bills them; the reaper's excluded path counts nothing,
+because it bills nobody. One fixed-name unprefixed field, so a submitter
+calling themselves "jobs" lands on `u:jobs` and the three key-space bounds
+hold untouched. The obvious alternative — a per-user `j:<identity>` family
+for per-person cost-per-render — would have halved the identity cap for a
+figure N3 does not ask for. `/api/showback` reports it as `billed_jobs`,
+zero on periods written before the counter existed, which readers must
+treat as "unknown", not "no jobs" — the reporter prints "unavailable"
+rather than dividing by it.
+
+**The rate is configuration, not measurement.** `GPU_HOURLY_RATE` (default
+0.976 — `docs/02-cost.md`'s g6.xlarge all-in figure) prices the FOCUS
+export and defaults the reporter; it lives in `.env` and is substituted
+into the gateway Deployment like `QUOTA_GPU_SECONDS`, and parsed with the
+same tolerance — a garbled rate costs one wrong-looking CSV and a log
+line, never a crash-looping gateway.
+
+**The FOCUS mapping is honest or empty, never plausible.** Checked against
+FOCUS 1.2: every mandatory column is present; the four cost columns are
+equal because this rate model has no discounts to make them differ; the
+charge period is the UTC month because the Hash has no finer timestamps —
+claiming per-day granularity would be fabrication; `SubAccountId` is the
+submitter, which is the entire point of a chargeback export. And the
+columns the gateway cannot know — `RegionId` (it does not know where it
+runs), `ResourceId` (per-identity aggregates, no per-node attribution
+survives the month), `SkuId` (one blended rate is not a priced SKU) — ship
+present-but-empty, which is what FOCUS specifies for a value the provider
+does not have. The `excluded` bucket exports as a row with an empty
+`SubAccountId` whose description says nobody is billed for it: dropping it
+would make the CSV's sum disagree with the JSON's totals, and folding it
+into a submitter would undo Q4's reaper decision. The CSV is serialized
+*after* `scoped_showback()`, so under `oauth` it withholds exactly what
+the JSON withholds — the full export is the submitter list.
+
+**The reporter states its own limits instead of smoothing them.** Its
+utilization is the duty cycle the counterfactual's dedicated cards would
+have run at (held hours over headcount × elapsed hours — `docs/02`'s
+idle-tax framing), not pool busyness; its default headcount is the
+identities the report names, printed as a floor with `--headcount` to
+override; the counterfactual is prorated by elapsed period fraction so a
+mid-month run is not compared against a whole month of cards; and "waits"
+are `/api/stats`' point-in-time numbers, present only with `--gateway`,
+because nothing durable records historical queue time. It reads either a
+live gateway or the exact JSON the teardown-capture habit above already
+saves — the month-end shape, since on the nightly-`make down` habit the
+cluster the report is about is usually gone. Stdlib only, for the same
+laptop that runs that habit.
 
 **N5 — Grafana dashboard shipped.** A dashboard JSON beside the
 ServiceMonitor: queue depth, `comfy_estimated_wait_seconds`, worker count,

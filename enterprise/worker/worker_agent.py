@@ -731,6 +731,20 @@ SHOWBACK_EXCLUDED_FIELD = "excluded"
 # users, no longer told apart.
 SHOWBACK_OTHER_FIELD = "other"
 
+# How many jobs the submitter-path accruals have billed into this period —
+# the denominator under "cost per render" (docs/10-roadmap.md, N3), written
+# where the seconds are written because nowhere else survives the month: the
+# per-job state hashes expire in hours, so a count derived from them at
+# report time would only ever see the tail of the period. Failed and
+# cancelled jobs count, because Q4 bills them ("a job that failed after
+# twenty minutes is billed twenty minutes"); reaper-excluded time does not,
+# because nobody was billed for it. One unprefixed fixed-name field on the
+# SAME Hash — a submitter calling themselves "jobs" lands on "u:jobs" and
+# cannot collide, and all three key-space bounds above hold untouched. Not a
+# per-identity family of count fields: that would halve the identity cap for
+# a per-user figure N3 does not need.
+SHOWBACK_JOBS_FIELD = "jobs"
+
 # On the job's own state hash. hub.py's generate() writes the submitter here
 # at submit and writes NOTHING when there was no header — so "absent" is what
 # anonymous looks like, and the accrual below reads it rather than inventing a
@@ -806,6 +820,7 @@ local started_field = ARGV[9]
 local seconds_field = ARGV[10]
 local user_field = ARGV[11]
 local to_submitter = ARGV[12]
+local jobs_field = ARGV[13]
 
 -- The claim. HGET and HDEL in one script is what makes billing idempotent:
 -- a worker finishing a job whose heartbeat lapsed a moment earlier and the
@@ -857,6 +872,13 @@ end
 
 redis.call('HINCRBYFLOAT', bucket, field, seconds)
 
+-- The denominator beside the seconds, counted only on the submitter path:
+-- the excluded path bills nobody, so it counts nothing. See
+-- SHOWBACK_JOBS_FIELD above for why the count lives on this Hash at all.
+if destination == to_submitter then
+  redis.call('HINCRBY', bucket, jobs_field, 1)
+end
+
 -- NX, and on every write rather than only the first. See point 2 of the
 -- block comment above: this is what keeps a `noeviction` Redis from
 -- accumulating a Hash per month forever.
@@ -901,7 +923,7 @@ def showback_accrue_call(state: str, destination: str,
          SHOWBACK_USER_PREFIX, SHOWBACK_ANONYMOUS_FIELD,
          SHOWBACK_EXCLUDED_FIELD, SHOWBACK_OTHER_FIELD, destination,
          STARTED_AT_FIELD, GPU_SECONDS_FIELD, SHOWBACK_USER_FIELD,
-         SHOWBACK_TO_SUBMITTER],
+         SHOWBACK_TO_SUBMITTER, SHOWBACK_JOBS_FIELD],
     )
 
 # END SHARED SHOWBACK

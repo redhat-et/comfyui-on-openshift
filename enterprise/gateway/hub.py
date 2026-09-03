@@ -30,7 +30,9 @@ from __future__ import annotations
 import asyncio
 import calendar
 import contextlib
+import csv
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -596,6 +598,20 @@ SHOWBACK_EXCLUDED_FIELD = "excluded"
 # users, no longer told apart.
 SHOWBACK_OTHER_FIELD = "other"
 
+# How many jobs the submitter-path accruals have billed into this period —
+# the denominator under "cost per render" (docs/10-roadmap.md, N3), written
+# where the seconds are written because nowhere else survives the month: the
+# per-job state hashes expire in hours, so a count derived from them at
+# report time would only ever see the tail of the period. Failed and
+# cancelled jobs count, because Q4 bills them ("a job that failed after
+# twenty minutes is billed twenty minutes"); reaper-excluded time does not,
+# because nobody was billed for it. One unprefixed fixed-name field on the
+# SAME Hash — a submitter calling themselves "jobs" lands on "u:jobs" and
+# cannot collide, and all three key-space bounds above hold untouched. Not a
+# per-identity family of count fields: that would halve the identity cap for
+# a per-user figure N3 does not need.
+SHOWBACK_JOBS_FIELD = "jobs"
+
 # On the job's own state hash. hub.py's generate() writes the submitter here
 # at submit and writes NOTHING when there was no header — so "absent" is what
 # anonymous looks like, and the accrual below reads it rather than inventing a
@@ -671,6 +687,7 @@ local started_field = ARGV[9]
 local seconds_field = ARGV[10]
 local user_field = ARGV[11]
 local to_submitter = ARGV[12]
+local jobs_field = ARGV[13]
 
 -- The claim. HGET and HDEL in one script is what makes billing idempotent:
 -- a worker finishing a job whose heartbeat lapsed a moment earlier and the
@@ -722,6 +739,13 @@ end
 
 redis.call('HINCRBYFLOAT', bucket, field, seconds)
 
+-- The denominator beside the seconds, counted only on the submitter path:
+-- the excluded path bills nobody, so it counts nothing. See
+-- SHOWBACK_JOBS_FIELD above for why the count lives on this Hash at all.
+if destination == to_submitter then
+  redis.call('HINCRBY', bucket, jobs_field, 1)
+end
+
 -- NX, and on every write rather than only the first. See point 2 of the
 -- block comment above: this is what keeps a `noeviction` Redis from
 -- accumulating a Hash per month forever.
@@ -766,7 +790,7 @@ def showback_accrue_call(state: str, destination: str,
          SHOWBACK_USER_PREFIX, SHOWBACK_ANONYMOUS_FIELD,
          SHOWBACK_EXCLUDED_FIELD, SHOWBACK_OTHER_FIELD, destination,
          STARTED_AT_FIELD, GPU_SECONDS_FIELD, SHOWBACK_USER_FIELD,
-         SHOWBACK_TO_SUBMITTER],
+         SHOWBACK_TO_SUBMITTER, SHOWBACK_JOBS_FIELD],
     )
 
 # END SHARED SHOWBACK
@@ -2694,8 +2718,19 @@ async def showback_report(period: str) -> dict:
     buckets = {SHOWBACK_ANONYMOUS_FIELD: 0.0,
                SHOWBACK_EXCLUDED_FIELD: 0.0,
                SHOWBACK_OTHER_FIELD: 0.0}
+    billed_jobs = 0
 
     for field, value in (totals or {}).items():
+        if field == SHOWBACK_JOBS_FIELD:
+            # Written by HINCRBY, so an integer — but read through float()
+            # like every other field here, for the same reason: a report is
+            # read by a person who wants a number today.
+            try:
+                billed_jobs = int(float(value))
+            except (TypeError, ValueError):
+                pass
+            continue
+
         try:
             # Rounded because HINCRBYFLOAT accumulates binary float error over
             # thousands of jobs and a report showing 41.30000000000001 seconds
@@ -2728,6 +2763,12 @@ async def showback_report(period: str) -> dict:
         "anonymous_gpu_seconds": buckets[SHOWBACK_ANONYMOUS_FIELD],
         "excluded_gpu_seconds": buckets[SHOWBACK_EXCLUDED_FIELD],
         "other_gpu_seconds": buckets[SHOWBACK_OTHER_FIELD],
+        # How many jobs the submitter-path totals above are made of — the
+        # denominator under "cost per render" (SHOWBACK_JOBS_FIELD). Zero on
+        # a period written before the counter existed, which readers must
+        # treat as "unknown", not as "no jobs": the seconds beside it say
+        # which it was.
+        "billed_jobs": billed_jobs,
         # True once the identity cap has sent at least one submitter's seconds
         # into the shared overflow field. Reported rather than hidden: a
         # truncated report that does not say so is a wrong report.
@@ -2747,8 +2788,195 @@ def scoped_showback(report: dict, caller: str) -> dict:
                 scoped_to=caller or None)
 
 
+# ---------------------------------------------------------------------------
+# FOCUS export — the same report, in the FinOps FOCUS 1.2 column set
+# (docs/10-roadmap.md, N4)
+#
+# `?format=focus` serializes the report above as CSV in the column layout the
+# FinOps Foundation's FOCUS specification defines — the shape enterprise
+# cost tooling ingests without an adapter. It is a second SERIALIZATION of
+# the same accounting, not a second accounting: every number here is a field
+# of the same period Hash, the scoping is scoped_showback()'s, and a
+# consumer summing BilledCost sees the same pool spend the JSON's totals
+# show.
+#
+# The mapping is honest or empty, never plausible. This gateway aggregates
+# per identity per UTC month, knows its own rate model (GPU_HOURLY_RATE,
+# docs/02-cost.md) and nothing about AWS: so the columns it CAN fill are
+# filled — SubAccountId is the submitter, the charge period is the month,
+# the four cost columns are all seconds x rate because this rate model has
+# no discounts to make them differ — and the columns it cannot know are
+# present but EMPTY, which is what FOCUS specifies for a value the provider
+# does not have. Specifically:
+#
+#   RegionId / RegionName    the gateway does not know what region it runs
+#                            in, and guessing one from the rate would be
+#                            circular.
+#   ResourceId / ResourceName  the monthly Hash holds per-identity
+#                            aggregates; no per-node or per-pod attribution
+#                            survives the month. FOCUS explicitly allows
+#                            rows not associated with a resource.
+#   SkuId                    the rate is one blended $/GPU-hour, not a
+#                            priced SKU; naming g6.xlarge here would claim
+#                            the whole pool ran on it.
+#
+# The `excluded` bucket (Q4's reaper decision — GPU time held by workers
+# that died mid-job, deliberately billed to no submitter) exports as a row
+# with an EMPTY SubAccountId and a ChargeDescription that says so: dropping
+# it would make the CSV disagree with the JSON report's totals, and folding
+# it into a submitter would undo the decision.
+# ---------------------------------------------------------------------------
+
+# The pool's all-in $/GPU-hour, from the environment (.env.example, wired
+# into the Deployment by enterprise/setup.sh). The default is docs/02's
+# g6.xlarge figure — $0.805 to AWS plus $0.171 to Red Hat for its four
+# vCPUs. Parsed tolerantly like QUOTA_GPU_SECONDS above and unlike
+# MAX_QUEUE_DEPTH's int(): a garbled rate must cost one wrong-looking CSV,
+# not a crash-looping gateway.
+GPU_HOURLY_RATE_DEFAULT = 0.976
+GPU_HOURLY_RATE_RAW = os.environ.get("GPU_HOURLY_RATE",
+                                     str(GPU_HOURLY_RATE_DEFAULT))
+
+try:
+    GPU_HOURLY_RATE = float(GPU_HOURLY_RATE_RAW)
+except (TypeError, ValueError):
+    log(f"GPU_HOURLY_RATE={GPU_HOURLY_RATE_RAW!r} is not a number — the "
+        f"FOCUS export will price GPU time at the default "
+        f"${GPU_HOURLY_RATE_DEFAULT}/hour (docs/02-cost.md, g6.xlarge "
+        f"all-in)")
+    GPU_HOURLY_RATE = GPU_HOURLY_RATE_DEFAULT
+
+# FOCUS 1.2 columns, alphabetical. Every mandatory column is present; the
+# non-mandatory ones included are those this system has true values for
+# (SubAccountId/Name — the submitter, which is the entire point of a
+# chargeback export — and ChargeDescription). check-91-focus-export.py pins
+# this list verbatim, so the contract is written out twice on purpose.
+FOCUS_COLUMNS = [
+    "BilledCost", "BillingAccountId", "BillingAccountName",
+    "BillingCurrency", "BillingPeriodEnd", "BillingPeriodStart",
+    "ChargeCategory", "ChargeClass", "ChargeDescription",
+    "ChargePeriodEnd", "ChargePeriodStart",
+    "ConsumedQuantity", "ConsumedUnit",
+    "ContractedCost", "ContractedUnitPrice",
+    "EffectiveCost", "ListCost", "ListUnitPrice",
+    "PricingQuantity", "PricingUnit",
+    "ProviderName", "PublisherName",
+    "RegionId", "RegionName", "ResourceId", "ResourceName",
+    "ServiceCategory", "ServiceName", "SkuId",
+    "SubAccountId", "SubAccountName",
+]
+
+# "AI and Machine Learning" is one of ServiceCategory's allowed values in
+# the FOCUS spec, not a phrase invented here.
+FOCUS_FIXED = {
+    "BillingAccountId": "comfyui-gpu-pool",
+    "BillingAccountName": "ComfyUI GPU pool",
+    "BillingCurrency": "USD",
+    "ChargeCategory": "Usage",
+    # Null in FOCUS terms: the only non-null value 1.2 allows is
+    # "Correction", and nothing here corrects a prior row.
+    "ChargeClass": "",
+    "ConsumedUnit": "GPU-seconds",
+    "PricingUnit": "GPU-hours",
+    "ProviderName": "comfyui-on-openshift",
+    "PublisherName": "comfyui-on-openshift",
+    "RegionId": "",
+    "RegionName": "",
+    "ResourceId": "",
+    "ResourceName": "",
+    "ServiceCategory": "AI and Machine Learning",
+    "ServiceName": "ComfyUI GPU pool",
+    "SkuId": "",
+}
+
+
+def focus_period_bounds(period: str) -> tuple[str, str]:
+    """A period's [start, end) as ISO 8601 Z strings — end-EXCLUSIVE, the
+    first instant of the next month, which is FOCUS's date-time semantics
+    (and calendar arithmetic's: a closed end would need to know the month's
+    last second)."""
+    year, month = int(period[:4]), int(period[5:7])
+    next_year = year + (1 if month == 12 else 0)
+    next_month = 1 if month == 12 else month + 1
+
+    return (f"{year:04d}-{month:02d}-01T00:00:00Z",
+            f"{next_year:04d}-{next_month:02d}-01T00:00:00Z")
+
+
+def focus_row(period: str, rate: float, seconds: float,
+              sub_account: str, description: str) -> dict:
+    """One charge line. The four cost columns are equal on purpose — this
+    rate model has no commitment discounts and no negotiated pricing, and
+    FOCUS's answer for that case is four equal values, not blanks."""
+    start, end = focus_period_bounds(period)
+    cost = f"{seconds / 3600.0 * rate:.6f}"
+
+    row = dict(FOCUS_FIXED,
+               BilledCost=cost, ContractedCost=cost, EffectiveCost=cost,
+               ListCost=cost,
+               ContractedUnitPrice=f"{rate:.6f}", ListUnitPrice=f"{rate:.6f}",
+               BillingPeriodStart=start, BillingPeriodEnd=end,
+               ChargePeriodStart=start, ChargePeriodEnd=end,
+               ConsumedQuantity=f"{seconds:.3f}",
+               PricingQuantity=f"{seconds / 3600.0:.6f}",
+               ChargeDescription=description,
+               SubAccountId=sub_account, SubAccountName=sub_account)
+
+    return row
+
+
+def focus_rows(report: dict, period: str, rate: float) -> list[dict]:
+    """The (possibly scoped) JSON report as FOCUS charge lines: one per
+    submitter, one per non-zero bucket. Zero-value buckets are omitted —
+    a $0.00 line for a bucket that recorded nothing is noise — but a
+    submitter row is emitted whatever it holds, because it exists only if
+    something accrued into it."""
+    rows = [
+        focus_row(period, rate, seconds, user,
+                  f"GPU seconds a worker held a card for jobs submitted by "
+                  f"{user}, UTC month {period} (held time — GET "
+                  f"/api/showback for the definition)")
+        for user, seconds in sorted(report.get("users", {}).items())
+    ]
+
+    for bucket, sub_account, description in (
+        ("anonymous_gpu_seconds", SHOWBACK_ANONYMOUS_FIELD,
+         f"GPU seconds held for jobs submitted with no identity (no "
+         f"X-Forwarded-User header), UTC month {period}"),
+        ("other_gpu_seconds", SHOWBACK_OTHER_FIELD,
+         f"GPU seconds held for submitters past the identity cap, "
+         f"aggregated, UTC month {period} — the JSON report's `truncated` "
+         f"flag names this condition"),
+        ("excluded_gpu_seconds", "",
+         f"GPU seconds held by workers that died mid-job, UTC month "
+         f"{period} — real pool spend deliberately billed to nobody "
+         f"(excluded_gpu_seconds; the gateway can only bound when the "
+         f"worker died, so a submitter is never charged for it)"),
+    ):
+        seconds = report.get(bucket, 0.0)
+
+        if seconds > 0:
+            rows.append(focus_row(period, rate, seconds, sub_account,
+                                  description))
+
+    return rows
+
+
+def focus_csv(rows: list[dict]) -> str:
+    """CSV via the csv module, never string concatenation: the submitter
+    identity is a client-supplied header, and a comma or a double quote in
+    it must arrive quoted, not shear the row into extra columns."""
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=FOCUS_COLUMNS, lineterminator="\r\n")
+    writer.writeheader()
+    writer.writerows(rows)
+
+    return out.getvalue()
+
+
 @app.get("/api/showback")
-async def showback(request: Request, period: str | None = None):
+async def showback(request: Request, period: str | None = None,
+                   format: str | None = None):
     """
     Who spent the card this period, in GPU seconds.
 
@@ -2758,8 +2986,15 @@ async def showback(request: Request, period: str | None = None):
          "anonymous_gpu_seconds": 0.0,
          "excluded_gpu_seconds": 0.0,
          "other_gpu_seconds": 0.0,
+         "billed_jobs": 41,
          "truncated": false,
          "periods_available": ["2026-06", "2026-07", "2026-08"]}
+
+    `?format=focus` returns the same report as CSV in the FinOps FOCUS 1.2
+    column set — see the FOCUS block above for the mapping and what it
+    refuses to fake. Anything else that is not `json` is a 400 rather than
+    a silent fall-through: a typo'd format discovered by the spreadsheet
+    that fails to import is discovered in the least useful place.
 
     `period` is a UTC calendar month, defaulting to the current one. A GPU
     second is one second for which a worker held the card on that job — see
@@ -2797,17 +3032,28 @@ async def showback(request: Request, period: str | None = None):
     if not SHOWBACK_PERIOD_PATTERN.match(period):
         raise HTTPException(400, "period must be a UTC calendar month, e.g. 2026-08")
 
+    if format not in (None, "json", "focus"):
+        raise HTTPException(400, "unknown format — 'json' (the default) or 'focus'")
+
     report = await showback_report(period)
 
-    if AUTH_MODE != AUTH_MODE_OAUTH:
-        return report
+    # Scope BEFORE serializing, so the CSV is exactly the JSON view the same
+    # caller would get: the full export is the list of submitters, which is
+    # what scoped_showback() exists to withhold.
+    if AUTH_MODE == AUTH_MODE_OAUTH:
+        caller = caller_identity(request)
 
-    caller = caller_identity(request)
+        if caller not in SHOWBACK_OPERATORS:
+            report = scoped_showback(report, caller)
 
-    if caller in SHOWBACK_OPERATORS:
-        return report
+    if format == "focus":
+        return PlainTextResponse(
+            focus_csv(focus_rows(report, period, GPU_HOURLY_RATE)),
+            media_type="text/csv",
+            headers={"Content-Disposition":
+                     f'attachment; filename="showback-{period}-focus.csv"'})
 
-    return scoped_showback(report, caller)
+    return report
 
 
 @app.get("/metrics", response_class=PlainTextResponse)

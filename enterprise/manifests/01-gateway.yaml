@@ -114,6 +114,12 @@ spec:
             # which is also the default: see BEGIN QUOTA BREAKER in hub.py.
             - name: QUOTA_GPU_SECONDS
               value: "QUOTA_GPU_SECONDS_PLACEHOLDER"
+            # N4's all-in $/GPU-hour for the FOCUS chargeback export, same
+            # substitution shape. Unsubstituted or garbled, hub.py falls
+            # back to its own default (docs/02's g6.xlarge rate) with a log
+            # line rather than refusing to start.
+            - name: GPU_HOURLY_RATE
+              value: "GPU_HOURLY_RATE_PLACEHOLDER"
             # hub.py scopes /outputs and /api/showback to the caller only when
             # it knows a proxy is in front of it; under "none" the identity
             # header is client-supplied and scoping would be theatre.
