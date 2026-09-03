@@ -104,6 +104,7 @@ engine: **`docs/13-vllm-omni.md`**.
 | Just evaluating the code | `make test`, then `enterprise/test/README.md` for what each assertion is defending |
 | Taking this over from someone | `docs/09-engineering-handoff.md` |
 | Asking how this relates to vLLM Omni | `docs/13-vllm-omni.md` — layers, not rivals: where the serving engine wins, where the pool wins, and the showback-driven rule for moving a model between them |
+| Making the market case | `docs/14-market.md` — the price umbrella, the compliance-captive beachhead, market velocity, aligned incentives, and what could kill this |
 | Presenting this to stakeholders | `docs/pitch/index.html` — four slides, each opening with what stakeholders actually asked and answering it: current state → proposed state → what the work does → where Omni fits. Self-contained; open in any browser |
 | Bringing it up on real hardware for the first time | `docs/12-first-cluster-day.md` — the run CI cannot do, as a checklist: what to measure, where each number goes, what to verify, what to record |
 
@@ -670,6 +671,7 @@ docs/
   11-scaling.md           how far this goes, and which AWS cards it runs on
   12-first-cluster-day.md the run CI cannot do, as a checklist
   13-vllm-omni.md         the serving tier and this tier: costs, the bridge, the promotion rule
+  14-market.md            the category, its price umbrella, the captive segment, the risks
   pitch/index.html        the four-slide stakeholder briefing — open in any browser
 .github/workflows/
   ci.yaml                 four jobs on every PR: lint (+ kubeconform), the e2e suite,

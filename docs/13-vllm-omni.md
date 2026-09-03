@@ -102,6 +102,35 @@ five steps never touch a GPU, which is why the pool wins below ~40% duty and
 why a serving engine — built for sustained request streams — is mismatched
 to this traffic in the first place.
 
+### The catalog curve
+
+![Monthly GPU cost for a ten-person team as the model library grows: residency climbs a staircase per model, the pool stays flat](images/catalog-curve.svg)
+
+The table above holds the catalog at six models; the picture shows what
+happens when it grows — which is what model catalogs do, because every new
+template drags in a checkpoint. Residency is a staircase: each model added
+is another resident engine, **+$713/month on an L4 and +$1,483/month on the
+L40S a video model wants**. The pool line does not move: its cost follows
+concurrency, and ten people generate the same 4–24 GPU-hours a day whether
+their templates touch three models or thirty. Credit-metered SaaS is flat
+against models but linear in seats, and capped by credits either way.
+
+The whole argument in one line: **on a serving tier the marginal model
+costs a machine; on the pool it costs disk** — $2–30/month for another
+100 GB, depending on storage class (`docs/03-storage.md`).
+
+### Two curves compound
+
+Residency cost is N(t) × P(t), and both factors climb. N: catalogs only
+grow. P: video models are moving from five-second clips toward multi-shot,
+multi-minute generations, and the card each one wants moves with them —
+L4 ($0.98/hour) → L40S ($2.03/hour) → H100-class ($7–12/hour per card,
+on-demand). A six-model library that residency serves for ~$5,000/month on
+today's cards passes $25,000/month when three of those models want H100s.
+The pool decouples both curves: the catalog lives on storage, the silicon
+is shared, and a bigger card is a bigger *tier* in the same pool
+(`docs/11-scaling.md`), not a bigger per-model bill.
+
 ## Where Omni genuinely wins
 
 Stated plainly, because a comparison that never concedes anything is
