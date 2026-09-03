@@ -196,6 +196,9 @@ export REDIS_URL="redis://127.0.0.1:${REDIS_PORT}/0"
 export REDIS_PASSWORD="demo-local"
 export QUEUE_KEY="comfy:queue"
 export OUTPUT_ROOT="${DEMO_HOME}/output"
+# The gateway's one-button model install writes here — the same directory
+# every worker reads, so the demo shows the pull-once-for-everyone story.
+export MODELS_ROOT="${DEMO_HOME}/models"
 
 # common.sh exported the cluster default, AUTH_MODE=oauth — a promise that
 # oauth-proxy sits in front stripping X-Forwarded-User. Nothing sits in front
@@ -205,8 +208,13 @@ export OUTPUT_ROOT="${DEMO_HOME}/output"
 export AUTH_MODE=none
 
 log "Redis on :${REDIS_PORT}"
+# --save "" and an explicit --dir: without them Redis keeps its default
+# save points and its default dir — the CALLER'S cwd — so a run launched
+# from the repo root leaves a dump.rdb there, and the NEXT Redis launched
+# from the same directory (this demo's, or the e2e suite's) silently loads
+# the previous run's keyspace as its own. Observed, not hypothetical.
 redis-server --port "$REDIS_PORT" --requirepass demo-local \
-    --appendonly no --daemonize yes >/dev/null
+    --appendonly no --save "" --dir "$DEMO_HOME" --daemonize yes >/dev/null
 for _ in $(seq 1 20); do
     redis-cli -p "$REDIS_PORT" -a demo-local --no-auth-warning ping 2>/dev/null \
         | grep -q PONG && break

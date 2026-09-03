@@ -68,6 +68,31 @@
   <div class="bar"><i id="progress"></i></div>
   <div id="log">Idle.</div>
   <div id="images"></div>
+
+  <h1 style="margin-top:2rem;">Models</h1>
+  <p class="sub">
+    A workflow named a checkpoint the pool doesn't have? Paste its download
+    URL (ComfyUI's missing-models panel has a <em>Copy&nbsp;URL</em> button) and
+    install it <strong>to the pool</strong> &mdash; pulled once onto shared
+    storage, visible to every worker. Sources are allowlisted and only
+    <code>.safetensors</code> is accepted.
+  </p>
+
+  <div class="row">
+    <input id="model-url" type="url" placeholder="https://huggingface.co/&hellip;/model.safetensors"
+           style="flex:1; min-width:16rem; padding:.5rem .75rem; border:1px solid var(--line);
+                  border-radius:7px; background:var(--panel); color:var(--fg); font:inherit;">
+    <select id="model-folder"
+            style="padding:.5rem .5rem; border:1px solid var(--line); border-radius:7px;
+                   background:var(--panel); color:var(--fg); font:inherit;">
+      <option>checkpoints</option><option>loras</option><option>vae</option>
+      <option>controlnet</option><option>clip</option><option>clip_vision</option>
+      <option>diffusion_models</option><option>text_encoders</option>
+      <option>upscale_models</option><option>embeddings</option>
+    </select>
+    <button id="model-install">Install to pool</button>
+  </div>
+  <div id="model-installs"></div>
 </main>
 
 <script>
@@ -233,6 +258,80 @@ function done() {
   $("cancel").disabled = true;
   if (socket) socket.close();
 }
+
+// --- Models: the one-button install to the pool -----------------------------
+
+function fmtGB(n) { return n > 0 ? (n / 1024 ** 3).toFixed(2) + " GB" : "?"; }
+
+function renderInstalls(installs) {
+  const host = $("model-installs");
+  host.textContent = "";
+  for (const m of installs) {
+    const row = document.createElement("div");
+    const pct = m.total > 0 ? Math.floor((m.bytes / m.total) * 100) : 0;
+    const label = document.createElement("div");
+    label.className = "stat";
+    label.textContent =
+      m.folder + "/" + m.filename + " — " +
+      (m.status === "downloading" ? `downloading ${fmtGB(m.bytes)} of ${fmtGB(m.total)} (${pct}%)`
+       : m.status === "done" ? `installed (${fmtGB(m.bytes)})`
+       : m.status === "stalled" ? "stalled — retry to resume"
+       : "failed: " + m.error);
+    if (m.status === "done") label.classList.add("ok");
+    if (m.status === "error") label.classList.add("bad");
+    row.appendChild(label);
+    if (m.status === "downloading") {
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      const fill = document.createElement("i");
+      fill.style.width = (m.total > 0 ? pct : 2) + "%";
+      bar.appendChild(fill);
+      row.appendChild(bar);
+    }
+    host.appendChild(row);
+  }
+  // Poll fast only while something is actually moving.
+  const active = installs.some((m) => m.status === "downloading");
+  clearTimeout(renderInstalls.timer);
+  renderInstalls.timer = setTimeout(refreshInstalls, active ? 2000 : 15000);
+}
+
+async function refreshInstalls() {
+  try {
+    const r = await fetch("/api/models/installs");
+    renderInstalls((await r.json()).installs);
+  } catch {
+    clearTimeout(renderInstalls.timer);
+    renderInstalls.timer = setTimeout(refreshInstalls, 15000);
+  }
+}
+refreshInstalls();
+
+$("model-install").onclick = async () => {
+  const url = $("model-url").value.trim();
+  if (!url) return;
+  $("model-install").disabled = true;
+  try {
+    const r = await fetch("/api/models/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, folder: $("model-folder").value }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      say("Model install refused: " + (body.detail || r.status), "bad");
+    } else if (body.already_present) {
+      say("Already on the pool: " + body.folder + "/" + body.filename, "ok");
+    } else {
+      say("Installing " + body.folder + "/" + body.filename + " to the pool.");
+      $("model-url").value = "";
+    }
+  } catch (e) {
+    say("Model install failed to start: " + e, "bad");
+  }
+  $("model-install").disabled = false;
+  refreshInstalls();
+};
 </script>
 </body>
 </html>

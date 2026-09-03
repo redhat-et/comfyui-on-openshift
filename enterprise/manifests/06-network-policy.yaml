@@ -79,7 +79,10 @@ spec:
 # execution on a GPU node, and because nothing it installs survives the pool
 # scaling to zero anyway. This makes the stance true instead of advisory. If
 # you genuinely need runtime downloads, the answer in that document is a job
-# that validates the source and the format, not an egress hole here.
+# that validates the source and the format, not an egress hole here — and
+# that job exists: hub.py's BEGIN MODEL INSTALLS section is the gateway's
+# one-button model install, downloading from an allowlisted host onto the
+# shared models volume through 01-gateway.yaml's writable /models mount.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

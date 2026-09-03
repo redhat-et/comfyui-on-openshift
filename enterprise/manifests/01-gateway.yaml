@@ -102,6 +102,8 @@ spec:
                   key: password
             - name: OUTPUT_ROOT
               value: /output
+            - name: MODELS_ROOT
+              value: /models
             - name: QUEUE_KEY
               value: comfy:queue
 
@@ -166,6 +168,16 @@ spec:
               mountPath: /output
               readOnly: true
 
+            # Writable, unlike /output, and that asymmetry is the design:
+            # the workers have no internet (06-network-policy.yaml), so the
+            # one-button model install lives HERE — hub.py's BEGIN MODEL
+            # INSTALLS validates the source and the format and streams onto
+            # this volume, once, for every worker to see. This is the "job
+            # that validates the source and the format" the network policy's
+            # comment promises instead of a worker egress hole.
+            - name: models
+              mountPath: /models
+
           # Liveness does not touch Redis on purpose. If Redis blips, readiness
           # should drop (stop sending traffic) but the pods should not all be
           # restarted on top of it.
@@ -187,6 +199,9 @@ spec:
         - name: output
           persistentVolumeClaim:
             claimName: comfyui-output
+        - name: models
+          persistentVolumeClaim:
+            claimName: comfyui-models
 ---
 apiVersion: v1
 kind: Service

@@ -44,7 +44,14 @@ redis-cli -p 6399 -a "$PASS" --no-auth-warning shutdown nosave 2>/dev/null
 sleep 1
 
 echo "--- redis"
-redis-server --port 6399 --requirepass "$PASS" --appendonly no --daemonize yes
+# --save "" and an explicit --dir, for the same reason demo-local.sh passes
+# them: Redis's default save points fire during a suite this write-heavy,
+# its default dir is the CALLER'S cwd (the repo root, under `make test`),
+# and the dump.rdb left there is silently loaded as the starting keyspace
+# by the next Redis launched from that directory — the demo's, or this
+# suite's own next run. Observed as another run's keys in the demo gateway.
+redis-server --port 6399 --requirepass "$PASS" --appendonly no \
+    --save "" --dir "$WORK" --daemonize yes
 for _ in $(seq 1 20); do
   redis-cli -p 6399 -a "$PASS" --no-auth-warning ping 2>/dev/null | grep -q PONG && break
   sleep 0.5
