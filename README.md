@@ -62,7 +62,10 @@ make enterprise                 # or: the queue, SSO and the pool that scales to
 
 Zero-cost evaluation, before any of that: **`make test`** runs the real
 gateway and the real worker agent against a real Redis and a stub ComfyUI on
-your laptop. No cluster, no GPU, no AWS account, about a minute.
+your laptop. No cluster, no GPU, no AWS account, about a minute. And when a
+stub is not convincing enough, **`make demo-local`** runs the real pool —
+gateway, queue, N real workers rendering — on this machine's own GPU, Apple
+Silicon included.
 
 ## Against the alternatives
 
@@ -102,6 +105,7 @@ engine: **`docs/13-vllm-omni.md`**.
 | A team sharing a GPU pool, with SSO and scale-to-zero | `make enterprise`; `enterprise/README.md` to run it, `docs/06-enterprise-architecture.md` for why it is shaped that way |
 | Already have an OpenShift cluster | `PLATFORM=openshift` in `.env`, `oc login`, then `make gpu storage deploy` (or `make gpu storage enterprise`) — nothing in those steps is ROSA-specific |
 | Just evaluating the code | `make test`, then `enterprise/test/README.md` for what each assertion is defending |
+| "Can we see it work?" — no cluster, no AWS | `make demo-local` — the real gateway, queue and N real workers rendering on this machine's own GPU, Apple Silicon included; `--selftest` proves the whole pipeline with one render |
 | Taking this over from someone | `docs/09-engineering-handoff.md` |
 | Asking how this relates to vLLM Omni | `docs/13-vllm-omni.md` — layers, not rivals: where the serving engine wins, where the pool wins, and the showback-driven rule for moving a model between them |
 | Making the market case | `docs/14-market.md` — the price umbrella, the compliance-captive beachhead, market velocity, aligned incentives, and what could kill this |

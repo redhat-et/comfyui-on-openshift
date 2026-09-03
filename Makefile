@@ -11,7 +11,7 @@ export
 
 .PHONY: help tools preflight account cluster gpu storage deploy logs forward \
         status park down destroy login up enterprise enterprise-down unstick \
-        test lint push-models
+        test lint push-models demo-local
 
 help:
 	@echo ""
@@ -36,6 +36,8 @@ help:
 	@echo ""
 	@echo "  Develop"
 	@echo "    make test        unit + e2e suites: real Redis, stub ComfyUI — no cluster, ~1 min"
+	@echo "    make demo-local  the real pool on this machine's own GPU: gateway, queue,"
+	@echo "                     N real workers rendering — no cluster, no AWS  (DEMO_WORKERS=2)"
 	@echo "    make lint        everything CI checks: shellcheck, syntax, py, manifests"
 	@echo ""
 	@echo "  Use it"
@@ -103,6 +105,9 @@ test:
 
 lint:
 	@scripts/lint.sh
+
+demo-local:
+	@enterprise/demo-local.sh
 
 push-models:
 	@scripts/10-push-models.sh $(SRC)
