@@ -73,6 +73,127 @@ if EVENT_STREAM_TTL <= 0:
 if MAX_QUEUE_DEPTH <= 0:
     raise ValueError(f"MAX_QUEUE_DEPTH must be a positive number of jobs, got {MAX_QUEUE_DEPTH}")
 
+# ---------------------------------------------------------------------------
+# BEGIN VRAM TIERS (docs/10-roadmap.md, N2)
+#
+# Pools per card class. GPU_TIERS is an ordered, comma-separated list of tier
+# names, SMALLEST CARD FIRST — "l4,l40s,h100" — and the order is load-bearing:
+# the first name is the DEFAULT TIER, the one a submission that names no tier
+# lands on, because the whole point of tiering is that nobody pays 80 GB
+# prices for a 24 GB job unless they asked to. Empty (the default) is tiering
+# OFF: one queue, exactly the pre-N2 pool.
+#
+# THE QUEUE KEY SHAPE (a §3 invariant — docs/09-engineering-handoff.md): each
+# tier's queue is one Redis list, and the DEFAULT tier's list is the bare
+# QUEUE_KEY (comfy:queue) rather than a suffixed comfy:queue:<name>. That
+# asymmetry is not cosmetic, it is the migration path: the moment an operator
+# sets GPU_TIERS on a pool with jobs already queued, every one of those jobs
+# is sitting on the bare list — as is every job an older gateway enqueues
+# mid-rollout — and the default tier's workers (WORKER_TIER unset, the same
+# worker configuration that exists today) keep draining it with no code or
+# config change on their side. A symmetric comfy:queue:<default> would strand
+# that backlog on a list nothing polls, silently, at the exact moment the
+# operator is watching the new tiers instead. Non-default tiers get
+# f"{QUEUE_KEY}:{tier}", each polled only by workers that declare that tier
+# via WORKER_TIER (worker_agent.py) and each scaled by its own KEDA
+# ScaledObject naming that list (enterprise/manifests/03-autoscale.yaml).
+#
+# Tier names are pinned to DNS-label characters because they travel: into a
+# Redis key, a Prometheus label value, a KEDA listName, a machine pool name
+# (setup.sh's gpu-<tier>) and a node label value. Refused at import like a
+# bad EVENT_STREAM_TTL, not clamped — a tier that silently became a different
+# string would route jobs to a queue no worker polls.
+# ---------------------------------------------------------------------------
+
+TIER_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def parse_gpu_tiers(raw: str) -> tuple:
+    """The ordered tier list, or () for tiering off. Raises on a name that
+    could not survive the places a tier name is used (see above) and on a
+    duplicate, which would make "which queue?" ambiguous."""
+    names = [name.strip() for name in raw.split(",") if name.strip()]
+
+    for name in names:
+        if not TIER_NAME_PATTERN.match(name):
+            raise ValueError(
+                f"GPU_TIERS name {name!r} is not a valid tier name: lowercase "
+                f"letters, digits and '-', starting with a letter or digit, "
+                f"at most 32 chars — it becomes a Redis key suffix, a metric "
+                f"label and a machine pool name")
+
+    if len(set(names)) != len(names):
+        raise ValueError(f"GPU_TIERS contains a duplicate tier name: {raw!r}")
+
+    return tuple(names)
+
+
+GPU_TIERS = parse_gpu_tiers(os.environ.get("GPU_TIERS", ""))
+
+# The tier a submission that names none lands on — the first, smallest one.
+# "" when tiering is off, which is also what every pre-N2 envelope carries in
+# its (then-reserved) tier field: absence and default are the same lane.
+DEFAULT_TIER = GPU_TIERS[0] if GPU_TIERS else ""
+
+
+def tier_queue_key(tier: str) -> str:
+    """The one Redis list a tier's jobs wait on. The default tier (and the
+    empty string an old envelope carries) is the bare QUEUE_KEY — see the
+    block comment above for why that asymmetry is the migration path."""
+    if not tier or tier == DEFAULT_TIER:
+        return QUEUE_KEY
+
+    return f"{QUEUE_KEY}:{tier}"
+
+
+def tier_queues() -> list:
+    """Every (tier, queue key) this gateway serves, default tier first. One
+    entry, ("", QUEUE_KEY), when tiering is off — so a caller iterating this
+    behaves identically to the pre-N2 single-queue code in that mode."""
+    if not GPU_TIERS:
+        return [("", QUEUE_KEY)]
+
+    return [(tier, tier_queue_key(tier)) for tier in GPU_TIERS]
+
+
+def resolve_tier(requested) -> str:
+    """
+    The tier a submission runs on, from the request's own `tier` field.
+
+    Absent, empty or null is the DEFAULT tier — the smallest card — because
+    "I didn't ask" must mean the cheap lane, never a guess at a big one.
+    Anything else must name a configured tier EXACTLY, or the submission is
+    refused (ValueError; generate() turns it into a 400): a tier this pool
+    does not run would strand the job on a queue no worker polls and no KEDA
+    trigger watches, with the browser parked on "queued" forever — so a typo
+    fails loudly at submit, where the caller can still fix it, rather than
+    silently at wait-forever. That includes ANY tier on an untiered pool:
+    accepting "l40s" where every queue is the same queue would be a routing
+    promise this deployment cannot keep.
+    """
+    if requested is None or requested == "":
+        return DEFAULT_TIER
+
+    if not isinstance(requested, str):
+        raise ValueError("tier must be a string naming a configured GPU tier")
+
+    if not GPU_TIERS:
+        raise ValueError(
+            f"this pool has no GPU tiers configured (GPU_TIERS is empty), so "
+            f"a submission cannot request tier {requested!r} — omit the tier "
+            f"field")
+
+    if requested not in GPU_TIERS:
+        raise ValueError(
+            f"unknown GPU tier {requested!r} — this pool's tiers are "
+            f"{', '.join(GPU_TIERS)} (smallest first; omit the field for "
+            f"{DEFAULT_TIER})")
+
+    return requested
+
+# END VRAM TIERS
+# ---------------------------------------------------------------------------
+
 # The queue carries an ordering record and the workflow itself sits beside it
 # at payload_key(job_id) — see BEGIN SHARED ENVELOPE. This is the backstop on
 # that key, not the reclaim path: the reclaim path is the explicit delete every
@@ -193,11 +314,12 @@ def log(message: str) -> None:
 #      "queue_key":     "",                               # reserved for Q1
 #      "attempt":       {"count": 0, "phase": "queued"},   # Q2: retry + phase
 #      "user":          "",                               # reserved for Q4
-#      "submitted_at":  1756400000.0}                     # reserved for Q6
+#      "submitted_at":  1756400000.0,                     # reserved for Q6
+#      "tier":          ""}                               # N2: VRAM tier
 #
 # — except that `workflow`, alone among those fields, is stored BESIDE the
 # queue rather than on it, at payload_key(job_id), and the entry on the list
-# carries the other six. The split is not about the envelope; it is about what
+# carries the other seven. The split is not about the envelope; it is about what
 # a submit costs. Q1's fair-queueing insert has to look at every entry already
 # queued to decide where the new one goes, Redis is single-threaded, and the
 # workflow is the only field whose size is the client's to choose — tens of KB
@@ -237,6 +359,15 @@ def log(message: str) -> None:
 # Each field therefore exists NOW: it has a default, it round-trips through
 # Redis, and nothing reads it. The item that owns a field changes what reads
 # it, not the wire format.
+#
+# `tier` (N2) arrived after that reservation wave and follows the same rules
+# rather than getting a version bump: every producer writes it with its
+# default, every consumer defaults it on read, and an entry with no tier at
+# all — a pre-N2 gateway's, mid-rollout — is a default-tier job, which is the
+# same lane it would have been on before tiers existed. The empty string and
+# the default tier's own name are deliberately the SAME lane (see
+# tier_queue_key() in hub.py), so "absent" never becomes a fourth routing
+# state.
 #
 # schema_version is bumped only for a change that is NOT backwards compatible —
 # a field removed, or one whose meaning changed under a name that stayed the
@@ -374,7 +505,7 @@ def attempt_count_of(envelope: dict) -> int:
 
 def build_envelope(job_id: str, workflow: dict, *, queue_key: str = "",
                    user: str = "", attempt: dict | None = None,
-                   submitted_at: float | None = None) -> dict:
+                   submitted_at: float | None = None, tier: str = "") -> dict:
     """
     The producer side. Every reserved field is written with its default rather
     than omitted, so no consumer ever has to ask whether a key is present —
@@ -389,6 +520,7 @@ def build_envelope(job_id: str, workflow: dict, *, queue_key: str = "",
         "attempt": dict(attempt) if isinstance(attempt, dict) else new_attempt(),
         "user": envelope_text(user),
         "submitted_at": time.time() if submitted_at is None else submitted_at,
+        "tier": envelope_text(tier),
     }
 
 
@@ -422,6 +554,7 @@ def parse_envelope(payload: dict) -> dict:
         "attempt": dict(attempt) if isinstance(attempt, dict) else new_attempt(),
         "user": envelope_text(payload.get("user")),
         "submitted_at": payload.get("submitted_at"),
+        "tier": envelope_text(payload.get("tier")),
     }
 
 
@@ -622,6 +755,27 @@ SHOWBACK_JOBS_FIELD = "jobs"
 # the spelling.
 SHOWBACK_USER_FIELD = "user"
 
+# On the job's own state hash, beside `user`: which VRAM tier ran this job
+# (docs/10-roadmap.md, N2). hub.py's generate() writes it at submit — the
+# VALIDATED tier name, never the raw request, which is what keeps this field
+# server-chosen on a hash whose `user` neighbour is client-supplied — and
+# writes NOTHING when tiering is off, so absence is what an untiered pool
+# looks like. The accrual below reads it so the period Hash records the same
+# seconds sliced by card class, and a later report can price an H100 second
+# differently from an L4 second without a second accounting pass.
+SHOWBACK_TIER_FIELD = "tier"
+
+# The per-tier fields inside the period Hash, beside the "u:" ones. Prefixed
+# for the same reason submitter fields are: a submitter calling themselves
+# "l40s" lands on "u:l40s" and can never collide with a tier's total. These
+# fields are deliberately EXEMPT from the SHOWBACK_MAX_USERS cap below, and
+# that is not a hole in the bound: a tier name only ever comes from the
+# operator's own GPU_TIERS list — generate() refuses any submission naming a
+# tier outside it before a state hash exists — so the field count here is
+# bounded by configuration the way the three reserved buckets are bounded by
+# this file, not by anything a client can vary.
+SHOWBACK_TIER_PREFIX = "t:"
+
 # On the job's own state hash. started_at is written by the worker when the
 # job starts running and REMOVED by the accrual below, in the same atomic
 # script that reads it: it is both the clock's start and the claim on it, so
@@ -691,6 +845,8 @@ local seconds_field = ARGV[10]
 local user_field = ARGV[11]
 local to_submitter = ARGV[12]
 local jobs_field = ARGV[13]
+local tier_prefix = ARGV[14]
+local tier_field = ARGV[15]
 
 -- The claim. HGET and HDEL in one script is what makes billing idempotent:
 -- a worker finishing a job whose heartbeat lapsed a moment earlier and the
@@ -749,6 +905,20 @@ if destination == to_submitter then
   redis.call('HINCRBY', bucket, jobs_field, 1)
 end
 
+-- The same seconds a second time, into the job's tier's own field (N2) — an
+-- attribution AXIS rather than a fourth bucket: the t: totals sum to the
+-- same GPU time the user/anonymous/excluded fields already account for,
+-- sliced by card class instead of by submitter, so per-tier pricing needs no
+-- second accounting pass. Guarded on the field being present because an
+-- untiered pool writes none, and exempt from the cap above because a tier
+-- name only ever comes from the operator's GPU_TIERS (see
+-- SHOWBACK_TIER_PREFIX) — never from a client.
+local tier = redis.call('HGET', state, tier_field)
+
+if tier and tier ~= '' then
+  redis.call('HINCRBYFLOAT', bucket, tier_prefix .. tier, seconds)
+end
+
 -- NX, and on every write rather than only the first. See point 2 of the
 -- block comment above: this is what keeps a `noeviction` Redis from
 -- accumulating a Hash per month forever.
@@ -793,7 +963,8 @@ def showback_accrue_call(state: str, destination: str,
          SHOWBACK_USER_PREFIX, SHOWBACK_ANONYMOUS_FIELD,
          SHOWBACK_EXCLUDED_FIELD, SHOWBACK_OTHER_FIELD, destination,
          STARTED_AT_FIELD, GPU_SECONDS_FIELD, SHOWBACK_USER_FIELD,
-         SHOWBACK_TO_SUBMITTER, SHOWBACK_JOBS_FIELD],
+         SHOWBACK_TO_SUBMITTER, SHOWBACK_JOBS_FIELD,
+         SHOWBACK_TIER_PREFIX, SHOWBACK_TIER_FIELD],
     )
 
 # END SHARED SHOWBACK
@@ -1288,9 +1459,21 @@ def fair_enqueue_call(envelope: dict) -> tuple[list, list]:
     reaper's requeue — and an argument order remembered in two places is an
     argument order that is wrong in one of them. It is also what a benchmark
     or a future third caller should use rather than re-deriving the split.
+
+    The queue is the ENVELOPE'S tier's queue (N2), derived here rather than
+    passed beside the envelope, because the two call sites must never be able
+    to disagree with the entry itself about where it belongs: a requeue that
+    took a queue key as a second argument could put an l40s job's retry back
+    on the l4 list, where a 24 GB card would OOM on it — the exact
+    wrong-card-class run tiering exists to prevent, arriving only on the
+    retry path where nobody is watching. Fair-queueing semantics are
+    unchanged and PER TIER by construction: the script walks only the one
+    list it is handed, so submitter round-robin plays out within each tier's
+    queue, which is the right scope — lanes only order jobs that contend for
+    the same cards.
     """
     return (
-        [QUEUE_KEY, payload_key(envelope["job_id"])],
+        [tier_queue_key(envelope.get("tier", "")), payload_key(envelope["job_id"])],
         [json.dumps(queue_record(envelope)),
          envelope["queue_key"],
          json.dumps(envelope["workflow"]),
@@ -1693,7 +1876,11 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int,
 
     # submitted_at is carried over unchanged, not reset: the user submitted
     # once, and Q6's estimated wait should measure from when they did rather
-    # than restarting its clock every time the cluster loses a pod.
+    # than restarting its clock every time the cluster loses a pod. tier is
+    # carried over for a harder reason: fair_enqueue_call() routes by it, and
+    # a retry that lost its tier would rejoin the DEFAULT queue — an l40s job
+    # handed to a 24 GB card, precisely on the path where its first worker
+    # already died and nobody is watching.
     envelope = build_envelope(
         job_id,
         entry["workflow"],
@@ -1701,6 +1888,7 @@ async def requeue_orphaned_job(conn: redis.Redis, entry: dict, attempt: int,
         user=entry["user"],
         attempt={"count": attempt, "phase": PHASE_QUEUED},
         submitted_at=entry["submitted_at"],
+        tier=entry.get("tier", ""),
     )
 
     # Through the same fair-queueing insert as a first submission, not an
@@ -1859,13 +2047,16 @@ async def reap_stranded_job(conn: redis.Redis, raw: str, entry_id: str) -> None:
         return
 
     # Backpressure applies to requeued work exactly as it does to new work:
-    # this is the same one physical list, bounded by the same ceiling, and a
-    # pool that is dying faster than it drains must not be the one path that
-    # gets to grow the queue past it. The bound itself is inside
-    # FAIR_ENQUEUE_LUA; this early read is so that a job refused on a full
-    # queue has not spent its retry, and requeue_orphaned_job() hands the
-    # retry back in the rare case the queue fills in between.
-    depth = await conn.llen(QUEUE_KEY)
+    # the retry rejoins the same physical list it came off — the entry's own
+    # TIER'S list (N2), read here the way fair_enqueue_call() derives it, so
+    # this early check and the enqueue below can never be looking at two
+    # different queues — bounded by the same ceiling, and a pool that is
+    # dying faster than it drains must not be the one path that gets to grow
+    # the queue past it. The bound itself is inside FAIR_ENQUEUE_LUA; this
+    # early read is so that a job refused on a full queue has not spent its
+    # retry, and requeue_orphaned_job() hands the retry back in the rare case
+    # the queue fills in between.
+    depth = await conn.llen(tier_queue_key(entry.get("tier", "")))
 
     if depth >= MAX_QUEUE_DEPTH:
         await fail_orphaned_job(
@@ -2097,6 +2288,18 @@ async def generate(request: Request):
     if not isinstance(workflow, dict) or not workflow:
         raise HTTPException(400, "body must be a ComfyUI workflow object, or {\"workflow\": {...}}")
 
+    # Which card class this job needs (N2): {"workflow": {...}, "tier": "l40s"}.
+    # Only read off the WRAPPED shape — a bare workflow posted as the whole
+    # body is all ComfyUI nodes, and a node that happened to be keyed "tier"
+    # must not be read as a routing request. Validated here, before the job_id
+    # exists and before anything is written, for the same leave-nothing-behind
+    # reason the quota check runs early: an unknown tier is a 400 with the
+    # valid names in it, not a job parked on a queue nothing drains.
+    try:
+        tier = resolve_tier(payload.get("tier") if "workflow" in payload else None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+
     conn = client()
 
     # Who spent the GPU, and — since Q1 — whose fair-queueing lane this job
@@ -2136,16 +2339,19 @@ async def generate(request: Request):
     # The envelope, not a hand-rolled dict: every reserved field is written
     # here with its default, so the worker never has to ask whether a key is
     # present. queue_key is the fair-queueing lane (Q1) — the same value as
-    # the reserved `user` field, not a second identity concept.
-    envelope = build_envelope(job_id, workflow, user=user, queue_key=user)
+    # the reserved `user` field, not a second identity concept. tier is the
+    # VALIDATED name from resolve_tier() above, never the raw request — it is
+    # what fair_enqueue_call() routes by and what the reaper's requeue reads.
+    envelope = build_envelope(job_id, workflow, user=user, queue_key=user, tier=tier)
 
-    # Atomically place the job in the single physical queue at its
+    # Atomically place the job in its TIER'S physical queue at its
     # fair-queueing position, rather than always at the back. `position` is
     # how many jobs will be served before this one under that ordering, which
     # is what index.html shows the caller as "N ahead" — it can differ from a
     # raw list-length snapshot once more than one lane is active, which is the
     # whole point. The overall backlog size (unaffected by fairness — it is
-    # still one list) stays available from gather_stats()'s queue_depth.
+    # still one list per tier) stays available from gather_stats()'s
+    # queue_depth.
     #
     # NAMING: this is a POSITION (how many jobs ahead of this one), not a
     # DEPTH (how many jobs total). Before this comment the response field and
@@ -2188,6 +2394,15 @@ async def generate(request: Request):
     if envelope["user"]:
         state["user"] = envelope["user"]
 
+    # The tier, beside the user, on the same terms: the validated name from
+    # the envelope, and NOTHING when tiering is off — so absence keeps meaning
+    # "untiered pool" to the accrual script (SHOWBACK_TIER_FIELD) and to
+    # anyone reading the hash raw. This write is what showback's per-tier
+    # totals hang off, and it is also what an operator reading
+    # comfy:job:<id>:state needs to answer "which card class ran this?".
+    if tier:
+        state[SHOWBACK_TIER_FIELD] = tier
+
     await conn.hset(state_key(job_id), mapping=state)
     await conn.expire(state_key(job_id), EVENT_STREAM_TTL)
 
@@ -2196,7 +2411,15 @@ async def generate(request: Request):
     await conn.xadd(stream_key(job_id), {"data": json.dumps({"type": "queued", "data": {"position": position}})})
     await conn.expire(stream_key(job_id), EVENT_STREAM_TTL)
 
-    return {"job_id": job_id, "status": "queued", "queue_position": position}
+    # `tier` only when tiering is on: an untiered pool's response shape is
+    # byte-for-byte what it was before N2, which is what keeps every existing
+    # caller and check honest about what they were already asserting.
+    response = {"job_id": job_id, "status": "queued", "queue_position": position}
+
+    if tier:
+        response["tier"] = tier
+
+    return response
 
 
 @app.get("/api/jobs/{job_id}")
@@ -2562,7 +2785,7 @@ async def readyz():
     return {"ok": True}
 
 
-async def estimated_wait_seconds(conn: redis.Redis) -> float | None:
+async def estimated_wait_seconds(conn: redis.Redis, queue: str = "") -> float | None:
     """
     Q6 (docs/10-roadmap.md) — how long has the job about to be served already
     been waiting, derived from the `submitted_at` F2 already reserved on the
@@ -2607,8 +2830,15 @@ async def estimated_wait_seconds(conn: redis.Redis) -> float | None:
     zero in the first place (see docs/10-roadmap.md's deferred_to_cluster note
     for I4's trigger contract) — the exact case an "honest unknown" would be
     most tempting, and least affordable, to report.
+
+    `queue` (N2) is which tier's list to read — the default tier's bare
+    QUEUE_KEY unless a caller says otherwise, so every pre-tier caller and
+    every untiered deployment reads exactly the number this function always
+    reported. Per-tier waits are this same measurement pointed at each tier's
+    list in turn (gather_stats()); there is no cross-tier blend, because a
+    blended wait is a number no single submitter will ever experience.
     """
-    raw = await conn.lindex(QUEUE_KEY, -1)
+    raw = await conn.lindex(queue or QUEUE_KEY, -1)
 
     if raw is None:
         return 0.0
@@ -2644,11 +2874,44 @@ async def gather_stats() -> dict:
     async for _ in conn.scan_iter(match=f"{WORKER_KEY_PREFIX}*", count=1000):
         workers += 1
 
-    return {
-        "queue_depth": await conn.llen(QUEUE_KEY),
+    # One depth and one wait PER TIER, then the same two top-level numbers
+    # this function has always returned. With tiering off, tier_queues() is
+    # [("", QUEUE_KEY)] and the arithmetic below collapses to exactly the old
+    # single-queue reads — same values, same shape, no `tiers` key — so an
+    # untiered deployment's /api/stats and /metrics are unchanged by N2.
+    #
+    # With tiering on, the top-level pair keeps its MEANING rather than its
+    # implementation: queue_depth is still "jobs waiting in the pool" (now a
+    # sum over the per-tier lists), and estimated_wait_seconds is still "how
+    # long the next-served job has already waited" read pessimistically — the
+    # MAX over tiers, because the scaler and the operator both want the worst
+    # lane, and an average is a wait nobody is actually experiencing. A tier
+    # whose wait is unknown (malformed head entry) is left out of the max the
+    # way the old single gauge went absent; the max is None only when every
+    # tier's wait is unknown.
+    depths = {}
+    waits = {}
+
+    for tier, key in tier_queues():
+        depths[tier] = await conn.llen(key)
+        waits[tier] = await estimated_wait_seconds(conn, key)
+
+    known_waits = [wait for wait in waits.values() if wait is not None]
+
+    stats = {
+        "queue_depth": sum(depths.values()),
         "workers_registered": workers,
-        "estimated_wait_seconds": await estimated_wait_seconds(conn),
+        "estimated_wait_seconds": max(known_waits) if known_waits else None,
     }
+
+    if GPU_TIERS:
+        stats["tiers"] = {
+            tier: {"queue_depth": depths[tier],
+                   "estimated_wait_seconds": waits[tier]}
+            for tier in GPU_TIERS
+        }
+
+    return stats
 
 
 # One snapshot per STATS_CACHE_SECONDS, shared by every caller of /api/stats
@@ -2718,6 +2981,7 @@ async def showback_report(period: str) -> dict:
     totals = await conn.hgetall(showback_key(period))
 
     users = {}
+    tiers = {}
     buckets = {SHOWBACK_ANONYMOUS_FIELD: 0.0,
                SHOWBACK_EXCLUDED_FIELD: 0.0,
                SHOWBACK_OTHER_FIELD: 0.0}
@@ -2745,6 +3009,8 @@ async def showback_report(period: str) -> dict:
 
         if field.startswith(SHOWBACK_USER_PREFIX):
             users[field[len(SHOWBACK_USER_PREFIX):]] = seconds
+        elif field.startswith(SHOWBACK_TIER_PREFIX):
+            tiers[field[len(SHOWBACK_TIER_PREFIX):]] = seconds
         elif field in buckets:
             buckets[field] = seconds
 
@@ -2772,6 +3038,13 @@ async def showback_report(period: str) -> dict:
         # treat as "unknown", not as "no jobs": the seconds beside it say
         # which it was.
         "billed_jobs": billed_jobs,
+        # GPU seconds by card class (N2) — a second SLICE of the same time
+        # the fields above already account for, not an addition to it, so
+        # per-tier rates can price a month without a second accounting pass.
+        # Empty for an untiered pool and for periods written before tiering
+        # was on. Left unscoped by scoped_showback(), like the totals: which
+        # cards the POOL spent names nobody.
+        "tiers": tiers,
         # True once the identity cap has sent at least one submitter's seconds
         # into the shared overflow field. Reported rather than hidden: a
         # truncated report that does not say so is a wrong report.
@@ -3092,6 +3365,41 @@ async def metrics():
             "# TYPE comfy_estimated_wait_seconds gauge\n"
             f"comfy_estimated_wait_seconds {wait:.3f}\n"
         )
+
+    # Per-tier series (N2), as NEW suffixed names labelled by tier rather than
+    # labels grown onto the three gauges above: a dashboard or alert built on
+    # comfy_queue_depth must keep reading the pool-wide number it always read,
+    # and a name that suddenly sprouted labels changes what sum() and simple
+    # selectors return. Absent entirely when tiering is off. The label set is
+    # bounded by construction — tier names come from the operator's GPU_TIERS,
+    # never from a request — which is the same cardinality argument that keeps
+    # per-USER series off this page (see the showback section): config may
+    # label a metric, clients may not.
+    tiers = data.get("tiers") or {}
+
+    if tiers:
+        text += (
+            "# HELP comfy_tier_queue_depth Jobs waiting in one GPU tier's "
+            "queue.\n"
+            "# TYPE comfy_tier_queue_depth gauge\n"
+        )
+        for tier, tier_data in tiers.items():
+            text += f'comfy_tier_queue_depth{{tier="{tier}"}} {tier_data["queue_depth"]}\n'
+
+        tier_waits = {tier: tier_data["estimated_wait_seconds"]
+                      for tier, tier_data in tiers.items()
+                      if tier_data["estimated_wait_seconds"] is not None}
+
+        # Same absent-not-zero rule as the pool gauge: a tier whose head
+        # entry is unreadable omits its sample rather than fabricating one.
+        if tier_waits:
+            text += (
+                "# HELP comfy_tier_estimated_wait_seconds Age of the entry "
+                "served next on one GPU tier's queue.\n"
+                "# TYPE comfy_tier_estimated_wait_seconds gauge\n"
+            )
+            for tier, tier_wait in tier_waits.items():
+                text += f'comfy_tier_estimated_wait_seconds{{tier="{tier}"}} {tier_wait:.3f}\n'
 
     return text
 

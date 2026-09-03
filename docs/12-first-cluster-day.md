@@ -76,6 +76,22 @@ cluster by CI. Ten minutes covers all of them.
 - **Showback names the right person.** `GET /api/showback` after two users
   have each run a job: each sees their own row and the totals; a name in
   `SHOWBACK_OPERATORS` sees both.
+- **Tier routing holds on real pools** (N2 — the laptop half is landed;
+  this is its cluster half). With `GPU_TIERS=l4,l40s` and
+  `GPU_INSTANCE_TYPE_L40S` set: a `{"workflow": ..., "tier": "l40s"}`
+  submission provokes the `gpu-l40s` pool 0 → 1 (`make status`; the `gpu`
+  pool stays put) via the `comfy-worker-l40s` ScaledObject, the job runs on
+  the node that appears, and a default submission provokes only the `gpu`
+  pool. Both drain back to zero after the cooldown. This is the per-tier
+  copy of the 0 → 1 → 0 pass the main trigger's comment in
+  `enterprise/manifests/03-autoscale.yaml` already owes cluster day.
+- **The tier node label came from the pool.** `oc get machinepool` (or
+  `rosa list machinepools`) shows `comfy/tier=l40s` in `gpu-l40s`'s own
+  declared labels — not applied to nodes some other way — because the
+  autoscaler's from-zero template only sees declared labels, and a tier
+  label applied any other way leaves every l40s pod Pending forever with
+  the pool sitting at zero (the long nodeSelector comment in
+  `enterprise/manifests/02-worker.yaml`).
 - **Scoping refuses a stranger.** As user B, request user A's job id:
   `GET /api/jobs/<id>` is 403 and the WebSocket closes with 4403.
 

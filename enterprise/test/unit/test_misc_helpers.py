@@ -140,12 +140,14 @@ def test_showback_accrue_call_keys_and_arg_order(hub_module):
     assert args[0] == 1700000000.0
     assert args[1] == hub_module.showback_ttl_seconds()
     assert args[2] == hub_module.SHOWBACK_MAX_USERS
-    # Strictly stronger than the pre-N3 `args[-1] == SHOWBACK_TO_SUBMITTER`
-    # it replaces: the jobs-field name rides at the end (ARGV[13], added for
-    # the billed-jobs counter), and the destination is pinned by position
-    # rather than by being last.
-    assert args[-2] == hub_module.SHOWBACK_TO_SUBMITTER
-    assert args[-1] == hub_module.SHOWBACK_JOBS_FIELD
+    # Strictly stronger than the `args[-1] == SHOWBACK_TO_SUBMITTER` this
+    # replaces: N3 appended the jobs-field name and N2 the tier pair, so the
+    # destination is pinned by absolute position and the whole tail order —
+    # which the script reads positionally — is contract.
+    assert args[-4] == hub_module.SHOWBACK_TO_SUBMITTER
+    assert args[-3] == hub_module.SHOWBACK_JOBS_FIELD
+    assert args[-2] == hub_module.SHOWBACK_TIER_PREFIX
+    assert args[-1] == hub_module.SHOWBACK_TIER_FIELD
 
 
 def test_showback_accrue_call_defaults_now_to_the_current_time(hub_module):

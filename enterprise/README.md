@@ -41,6 +41,9 @@ Everything comes from the repo's `.env`. The variables this configuration adds:
 | `QUOTA_GPU_SECONDS` | `0` (off) | per-user GPU-second quota per UTC month; over it, `/api/generate` refuses with 429 and says when it resets. Reads the same accounting `/api/showback` reports, and fails open |
 | `GPU_HOURLY_RATE` | `0.976` | all-in $/GPU-hour pricing `/api/showback?format=focus`, the FOCUS 1.2 chargeback CSV. The default is docs/02's g6.xlarge figure; it prices a report and spends nothing. Garbled values fall back to the default, loudly |
 | `SHOWBACK_OPERATORS` | empty | comma-separated identities, as oauth-proxy reports them, who may read every submitter's row of `/api/showback` under `AUTH_MODE=oauth`. Everyone else gets their own row plus the pool totals. Ignored under `none` |
+| `GPU_TIERS` | empty (off) | VRAM tiers, smallest card first, e.g. `l4,l40s`; see below |
+| `GPU_INSTANCE_TYPE_<TIER>` | — | instance type per non-default tier, e.g. `GPU_INSTANCE_TYPE_L40S=g6e.xlarge`; without it that tier's machine pool is skipped, loudly |
+| `MAX_GPU_WORKERS_<TIER>` | `MAX_GPU_WORKERS` | per-tier worker ceiling |
 
 Changing `AUTH_MODE` is also just an edit-and-re-run: switching oauth → none,
 `setup.sh` detects the leftover oauth-proxy sidecar and recreates the gateway
@@ -67,6 +70,33 @@ at ~$0.80, about $155, on top of whatever the queue itself provokes. Set
 
 It needs `SCALE_TO_ZERO=true`. The `false` path skips KEDA entirely, so there
 is no ScaledObject for the trigger to live in; `setup.sh` warns if you set both.
+
+### VRAM tiers — pools per card class
+
+`GPU_TIERS=l4,l40s` splits the pool by card class (`docs/10-roadmap.md`, N2):
+a job declares the tier it needs — `{"workflow": {...}, "tier": "l40s"}` —
+and only that tier's workers can ever pick it up, so nobody pays 80 GB prices
+for a 24 GB job. A submission that names no tier runs on the **first** tier
+in the list, the smallest card; one that names a tier the pool does not run
+is refused with a 400 listing the valid names, rather than queued somewhere
+nothing polls.
+
+The first tier is deliberately not a new thing: it rides the existing `gpu`
+machine pool, the plain `comfy:queue` and the `comfy-worker` Deployment
+unchanged, which is what makes turning tiering on safe with jobs already
+queued — the backlog keeps draining. Each later tier gets its own machine
+pool (`gpu-<tier>`, labelled `comfy/tier=<tier>`, on
+`GPU_INSTANCE_TYPE_<TIER>`), its own worker Deployment
+(`comfy-worker-<tier>`) and its own KEDA ScaledObject watching its own queue
+(`comfy:queue:<tier>`) — an l40s backlog buys l40s nodes and nothing else.
+Fair queueing (Q1) applies within each tier, which is the right scope: lanes
+only order jobs contending for the same cards. Showback records each job's
+tier (`tiers` in `/api/showback`), so per-tier pricing is a multiplication,
+not a second accounting pass.
+
+Routing is proven on a laptop by `enterprise/test/check-58-tier-routing.py`;
+the real tier pools autoscaling 0 → 1 → 0 is a cluster-day line
+(`docs/12-first-cluster-day.md`).
 
 ### Two Redis users, not one
 
@@ -129,6 +159,10 @@ curl -s "$GW/api/jobs/$JOB"
 curl -s "$GW/api/stats"
 ```
 
+With `GPU_TIERS` set, wrap the workflow to name the card class it needs —
+`{"workflow": <API export>, "tier": "l40s"}` — or name none and get the
+smallest tier. The response echoes the tier the job was routed to.
+
 **The first job after an idle period takes 8–17 minutes.** A GPU node has to be
 provisioned and a ~10 GB image pulled. Subsequent jobs start in seconds. This is
 the deal scale-to-zero makes; `docs/06-enterprise-architecture.md` covers when
@@ -145,7 +179,10 @@ make status                                      # burn rate
 ```
 
 The gateway also serves Prometheus gauges at `/metrics` (`comfy_queue_depth`,
-`comfy_workers_registered`, `comfy_estimated_wait_seconds`), and `setup.sh`
+`comfy_workers_registered`, `comfy_estimated_wait_seconds` — plus, with
+`GPU_TIERS` set, `comfy_tier_queue_depth{tier=...}` and
+`comfy_tier_estimated_wait_seconds{tier=...}`; the unlabelled names keep
+their pool-wide meaning), and `setup.sh`
 applies a ServiceMonitor so OpenShift's user-workload monitoring can graph and
 alert on them — "queue
 deeper than N for 30 minutes" is the alert that catches a wedged pool before

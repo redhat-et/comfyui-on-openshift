@@ -121,6 +121,7 @@ try:
     check("envelope carries the attribution field (Q4: user)", "user" in entry, entry)
     check("envelope carries the submit-timestamp field (Q6: submitted_at)",
           "submitted_at" in entry, entry)
+    check("envelope carries the VRAM-tier field (N2: tier)", "tier" in entry, entry)
 
     check("queue_key defaults to empty when the caller declared no lane",
           entry.get("queue_key") == "", entry.get("queue_key"))
@@ -128,6 +129,9 @@ try:
           entry.get("attempt") == {"count": 0, "phase": "queued"}, entry.get("attempt"))
     check("user defaults to empty when no X-Forwarded-User was sent",
           entry.get("user") == "", entry.get("user"))
+    check("tier defaults to empty on an untiered gateway -- the same lane an "
+          "old envelope's silence about the field already meant",
+          entry.get("tier") == "", entry.get("tier"))
 
     submitted_at = entry.get("submitted_at")
     check("submitted_at defaults to roughly the push time",

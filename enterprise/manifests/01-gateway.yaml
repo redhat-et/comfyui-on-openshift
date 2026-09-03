@@ -132,6 +132,16 @@ spec:
             # caller's own row plus totals.
             - name: SHOWBACK_OPERATORS
               value: "SHOWBACK_OPERATORS_PLACEHOLDER"
+            # N2's VRAM tiers, smallest card first (docs/10-roadmap.md) —
+            # substituted from .env's GPU_TIERS by enterprise/setup.sh, BY KEY
+            # (a sed on the name line's value) rather than through a
+            # *_PLACEHOLDER literal, deliberately: hub.py REFUSES an invalid
+            # tier list at import — a misrouted tier is a queue nothing
+            # drains — so an unsubstituted placeholder here would crash-loop
+            # a hand-applied gateway, where the empty string is simply
+            # tiering off, the safe pre-N2 pool.
+            - name: GPU_TIERS
+              value: ""
 
           resources:
             requests:

@@ -144,6 +144,33 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 
 QUEUE_KEY = os.environ.get("QUEUE_KEY", "comfy:queue")
+
+# Which VRAM tier this worker's card belongs to (docs/10-roadmap.md, N2) —
+# the worker's own declaration, set per machine-pool Deployment by
+# enterprise/setup.sh, and the ONLY thing tiering changes on this side: it
+# picks which one list the BLMOVE below polls. Unset (the default, and the
+# only configuration an untiered pool has) polls the bare QUEUE_KEY — which
+# is also the DEFAULT tier's queue on a tiered pool, deliberately, so the
+# worker never needs to know which tier the gateway considers the default:
+# the default-tier pool simply leaves this unset, exactly as it did before
+# tiers existed, and a mid-rollout backlog on the bare list keeps draining.
+# The suffix shape below is the other half of hub.py's tier_queue_key() —
+# change both or neither, the same rule the processing-list key already
+# follows. Routing correctness does NOT depend on this value being validated
+# here (a worker can only ever drain the queue it names), but a typo'd tier
+# polls a list no gateway fills, which looks exactly like a healthy idle
+# worker — so refuse names the gateway could never have routed to, at
+# import, the way a bad EVENT_STREAM_TTL is refused.
+WORKER_TIER = os.environ.get("WORKER_TIER", "").strip()
+
+if WORKER_TIER and not re.match(r"^[a-z0-9][a-z0-9-]{0,31}$", WORKER_TIER):
+    raise ValueError(
+        f"WORKER_TIER {WORKER_TIER!r} is not a valid tier name (lowercase "
+        f"letters, digits and '-', max 32 chars) — no gateway routes jobs to "
+        f"such a tier, so this worker would poll an empty list forever")
+
+POLL_QUEUE_KEY = f"{QUEUE_KEY}:{WORKER_TIER}" if WORKER_TIER else QUEUE_KEY
+
 EVENT_STREAM_TTL = int(os.environ.get("EVENT_STREAM_TTL", "3600"))
 
 # Refused at import, as hub.py refuses it: the executing claim's EXPIRE with a
@@ -323,11 +350,12 @@ AGENT_LIVENESS_FILE = os.environ.get("AGENT_LIVENESS_FILE", "/tmp/comfy-agent-al
 #      "queue_key":     "",                               # reserved for Q1
 #      "attempt":       {"count": 0, "phase": "queued"},   # Q2: retry + phase
 #      "user":          "",                               # reserved for Q4
-#      "submitted_at":  1756400000.0}                     # reserved for Q6
+#      "submitted_at":  1756400000.0,                     # reserved for Q6
+#      "tier":          ""}                               # N2: VRAM tier
 #
 # — except that `workflow`, alone among those fields, is stored BESIDE the
 # queue rather than on it, at payload_key(job_id), and the entry on the list
-# carries the other six. The split is not about the envelope; it is about what
+# carries the other seven. The split is not about the envelope; it is about what
 # a submit costs. Q1's fair-queueing insert has to look at every entry already
 # queued to decide where the new one goes, Redis is single-threaded, and the
 # workflow is the only field whose size is the client's to choose — tens of KB
@@ -367,6 +395,15 @@ AGENT_LIVENESS_FILE = os.environ.get("AGENT_LIVENESS_FILE", "/tmp/comfy-agent-al
 # Each field therefore exists NOW: it has a default, it round-trips through
 # Redis, and nothing reads it. The item that owns a field changes what reads
 # it, not the wire format.
+#
+# `tier` (N2) arrived after that reservation wave and follows the same rules
+# rather than getting a version bump: every producer writes it with its
+# default, every consumer defaults it on read, and an entry with no tier at
+# all — a pre-N2 gateway's, mid-rollout — is a default-tier job, which is the
+# same lane it would have been on before tiers existed. The empty string and
+# the default tier's own name are deliberately the SAME lane (see
+# tier_queue_key() in hub.py), so "absent" never becomes a fourth routing
+# state.
 #
 # schema_version is bumped only for a change that is NOT backwards compatible —
 # a field removed, or one whose meaning changed under a name that stayed the
@@ -504,7 +541,7 @@ def attempt_count_of(envelope: dict) -> int:
 
 def build_envelope(job_id: str, workflow: dict, *, queue_key: str = "",
                    user: str = "", attempt: dict | None = None,
-                   submitted_at: float | None = None) -> dict:
+                   submitted_at: float | None = None, tier: str = "") -> dict:
     """
     The producer side. Every reserved field is written with its default rather
     than omitted, so no consumer ever has to ask whether a key is present —
@@ -519,6 +556,7 @@ def build_envelope(job_id: str, workflow: dict, *, queue_key: str = "",
         "attempt": dict(attempt) if isinstance(attempt, dict) else new_attempt(),
         "user": envelope_text(user),
         "submitted_at": time.time() if submitted_at is None else submitted_at,
+        "tier": envelope_text(tier),
     }
 
 
@@ -552,6 +590,7 @@ def parse_envelope(payload: dict) -> dict:
         "attempt": dict(attempt) if isinstance(attempt, dict) else new_attempt(),
         "user": envelope_text(payload.get("user")),
         "submitted_at": payload.get("submitted_at"),
+        "tier": envelope_text(payload.get("tier")),
     }
 
 
@@ -752,6 +791,27 @@ SHOWBACK_JOBS_FIELD = "jobs"
 # the spelling.
 SHOWBACK_USER_FIELD = "user"
 
+# On the job's own state hash, beside `user`: which VRAM tier ran this job
+# (docs/10-roadmap.md, N2). hub.py's generate() writes it at submit — the
+# VALIDATED tier name, never the raw request, which is what keeps this field
+# server-chosen on a hash whose `user` neighbour is client-supplied — and
+# writes NOTHING when tiering is off, so absence is what an untiered pool
+# looks like. The accrual below reads it so the period Hash records the same
+# seconds sliced by card class, and a later report can price an H100 second
+# differently from an L4 second without a second accounting pass.
+SHOWBACK_TIER_FIELD = "tier"
+
+# The per-tier fields inside the period Hash, beside the "u:" ones. Prefixed
+# for the same reason submitter fields are: a submitter calling themselves
+# "l40s" lands on "u:l40s" and can never collide with a tier's total. These
+# fields are deliberately EXEMPT from the SHOWBACK_MAX_USERS cap below, and
+# that is not a hole in the bound: a tier name only ever comes from the
+# operator's own GPU_TIERS list — generate() refuses any submission naming a
+# tier outside it before a state hash exists — so the field count here is
+# bounded by configuration the way the three reserved buckets are bounded by
+# this file, not by anything a client can vary.
+SHOWBACK_TIER_PREFIX = "t:"
+
 # On the job's own state hash. started_at is written by the worker when the
 # job starts running and REMOVED by the accrual below, in the same atomic
 # script that reads it: it is both the clock's start and the claim on it, so
@@ -821,6 +881,8 @@ local seconds_field = ARGV[10]
 local user_field = ARGV[11]
 local to_submitter = ARGV[12]
 local jobs_field = ARGV[13]
+local tier_prefix = ARGV[14]
+local tier_field = ARGV[15]
 
 -- The claim. HGET and HDEL in one script is what makes billing idempotent:
 -- a worker finishing a job whose heartbeat lapsed a moment earlier and the
@@ -879,6 +941,20 @@ if destination == to_submitter then
   redis.call('HINCRBY', bucket, jobs_field, 1)
 end
 
+-- The same seconds a second time, into the job's tier's own field (N2) — an
+-- attribution AXIS rather than a fourth bucket: the t: totals sum to the
+-- same GPU time the user/anonymous/excluded fields already account for,
+-- sliced by card class instead of by submitter, so per-tier pricing needs no
+-- second accounting pass. Guarded on the field being present because an
+-- untiered pool writes none, and exempt from the cap above because a tier
+-- name only ever comes from the operator's GPU_TIERS (see
+-- SHOWBACK_TIER_PREFIX) — never from a client.
+local tier = redis.call('HGET', state, tier_field)
+
+if tier and tier ~= '' then
+  redis.call('HINCRBYFLOAT', bucket, tier_prefix .. tier, seconds)
+end
+
 -- NX, and on every write rather than only the first. See point 2 of the
 -- block comment above: this is what keeps a `noeviction` Redis from
 -- accumulating a Hash per month forever.
@@ -923,7 +999,8 @@ def showback_accrue_call(state: str, destination: str,
          SHOWBACK_USER_PREFIX, SHOWBACK_ANONYMOUS_FIELD,
          SHOWBACK_EXCLUDED_FIELD, SHOWBACK_OTHER_FIELD, destination,
          STARTED_AT_FIELD, GPU_SECONDS_FIELD, SHOWBACK_USER_FIELD,
-         SHOWBACK_TO_SUBMITTER, SHOWBACK_JOBS_FIELD],
+         SHOWBACK_TO_SUBMITTER, SHOWBACK_JOBS_FIELD,
+         SHOWBACK_TIER_PREFIX, SHOWBACK_TIER_FIELD],
     )
 
 # END SHARED SHOWBACK
@@ -2240,8 +2317,11 @@ def main() -> int:
     # Both identities, once, at the one moment an operator reading a restart
     # loop needs to tell two incarnations of one pod apart: same WORKER_ID,
     # different key suffix. See BEGIN WORKER IDENTITY.
+    # POLL_QUEUE_KEY, so an operator reading a tiered pool's logs sees which
+    # tier's list each worker actually drains — the whole of a mis-set
+    # WORKER_TIER's visible symptom is this one line naming an unexpected key.
     log(f"worker {WORKER_ID} (incarnation {WORKER_INCARNATION}) "
-        f"ready, polling {QUEUE_KEY}")
+        f"ready, polling {POLL_QUEUE_KEY}")
 
     try:
         while not shutting_down and not comfy_wedged:
@@ -2254,7 +2334,7 @@ def main() -> int:
             #
             # Short timeout rather than blocking forever, so the SIGTERM flag
             # is noticed promptly instead of at the end of the grace period.
-            raw = conn.blmove(QUEUE_KEY, PROCESSING_KEY, timeout=QUEUE_POLL_TIMEOUT,
+            raw = conn.blmove(POLL_QUEUE_KEY, PROCESSING_KEY, timeout=QUEUE_POLL_TIMEOUT,
                               src="RIGHT", dest="LEFT")
 
             if raw is None:

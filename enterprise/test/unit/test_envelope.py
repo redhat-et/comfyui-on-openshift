@@ -30,7 +30,7 @@ def test_round_trip_preserves_every_field(mod):
     envelope = mod.build_envelope(
         "job-1", {"1": {"class_type": "KSampler"}},
         queue_key="lane-a", user="alice", attempt={"count": 2, "phase": "executing"},
-        submitted_at=1700000000.0,
+        submitted_at=1700000000.0, tier="l40s",
     )
 
     parsed = mod.parse_envelope(envelope)
@@ -41,6 +41,7 @@ def test_round_trip_preserves_every_field(mod):
     assert parsed["user"] == "alice"
     assert parsed["attempt"] == {"count": 2, "phase": "executing"}
     assert parsed["submitted_at"] == 1700000000.0
+    assert parsed["tier"] == "l40s"
     assert parsed["schema_version"] == mod.SCHEMA_VERSION
 
 
@@ -51,6 +52,9 @@ def test_build_envelope_defaults_every_reserved_field(mod):
     assert envelope["user"] == ""
     assert envelope["attempt"] == {"count": 0, "phase": mod.PHASE_QUEUED}
     assert isinstance(envelope["submitted_at"], float)
+    # tier defaults to "" — the same lane as the default tier, and what a
+    # pre-N2 consumer's silence about the field already meant (N2).
+    assert envelope["tier"] == ""
     assert envelope["schema_version"] == mod.SCHEMA_VERSION
 
 
@@ -148,6 +152,9 @@ def test_parse_envelope_tolerates_the_pre_f2_shape(mod):
     assert parsed["user"] == ""
     assert parsed["attempt"] == mod.new_attempt()
     assert parsed["submitted_at"] is None
+    # An entry with no tier at all is a default-tier job (N2) — the empty
+    # string routes to the bare QUEUE_KEY, hub.tier_queue_key().
+    assert parsed["tier"] == ""
 
 
 def test_parse_envelope_ignores_an_unrecognised_field(mod):

@@ -6,6 +6,18 @@
 # is Redis. That is what makes the pool safe to scale between 0 and N: there is
 # no connection state, no load balancer affinity, and nothing for a user to
 # point a browser at.
+#
+# THE `#TIER ` LINES are N2's per-card-class variants (docs/10-roadmap.md),
+# committed commented out behind that prefix — the same convention the warm
+# floor uses in 03-autoscale.yaml — so that `oc apply -f` of this file bare
+# still deploys exactly the one default pool it always did. For each
+# NON-default tier in .env's GPU_TIERS, enterprise/setup.sh renders a copy of
+# this Deployment with the prefix stripped, TIER_NAME_PLACEHOLDER substituted,
+# `comfy-worker` renamed `comfy-worker-<tier>`, and the PDB below dropped
+# (see BEGIN POOL PDB). The default tier IS this file as committed: its
+# workers leave WORKER_TIER unset and poll the bare comfy:queue, which is the
+# same worker an untiered pool runs — that identity is the migration path,
+# docs/09-engineering-handoff.md §3.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -44,11 +56,18 @@ spec:
   selector:
     matchLabels:
       app: comfy-worker
+      # Tier renders select on the tier label TOO, so two tier Deployments
+      # can never adopt each other's ReplicaSets. `app` stays on every pod
+      # either way: 06-network-policy.yaml selects workers by it, and a tier
+      # pod outside the egress lockdown would be the invariant broken by a
+      # rename.
+      #TIER comfy/tier: "TIER_NAME_PLACEHOLDER"
 
   template:
     metadata:
       labels:
         app: comfy-worker
+        #TIER comfy/tier: "TIER_NAME_PLACEHOLDER"
     spec:
       # This label MUST be one the machine pool declares, not one Node Feature
       # Discovery applies at runtime — and that distinction silently breaks
@@ -67,6 +86,13 @@ spec:
       # GPU_NODE_LABEL here if your cluster labels its GPU nodes differently.
       nodeSelector:
         GPU_NODE_LABEL_KEY: "GPU_NODE_LABEL_VALUE"
+        # Tier renders ALSO select on comfy/tier=<tier>, and that label must
+        # be POOL-DECLARED (rosa create machinepool --labels, which setup.sh
+        # passes) for exactly the scale-from-zero reason above: at zero nodes
+        # the autoscaler matches against the pool's declared labels, so a
+        # tier label applied any other way leaves every tier pod Pending
+        # forever with the pool it needs sitting at zero.
+        #TIER comfy/tier: "TIER_NAME_PLACEHOLDER"
 
       tolerations:
         - key: nvidia.com/gpu
@@ -125,6 +151,14 @@ spec:
                   key: worker_password
             - name: QUEUE_KEY
               value: comfy:queue
+            # The worker's tier declaration (N2): picks which one list its
+            # BLMOVE polls — QUEUE_KEY:<tier>. Absent (this file as
+            # committed) polls the bare QUEUE_KEY above, which is both the
+            # untiered pool and the DEFAULT tier of a tiered one; only tier
+            # renders carry it, so the default pool's workers never need to
+            # know which tier is the default.
+            #TIER - name: WORKER_TIER
+            #TIER   value: "TIER_NAME_PLACEHOLDER"
             - name: JOB_TIMEOUT
               value: "1800"
             - name: PYTORCH_CUDA_ALLOC_CONF
@@ -306,6 +340,12 @@ spec:
             claimName: comfyui-output
         - name: scratch
           emptyDir: {}
+# BEGIN POOL PDB — setup.sh's tier renders delete from this marker to the end
+# of the file: this PDB selects on `app: comfy-worker` alone, which every tier
+# pod also carries, and Kubernetes REFUSES evictions for a pod matched by more
+# than one PDB — so a copy of this budget per tier would not be per-tier
+# protection, it would block every GPU node drain outright. One budget,
+# selecting the whole pool across tiers, is the correct amount of PDB.
 ---
 # Keep the pool from being drained all at once.
 #
@@ -314,6 +354,11 @@ spec:
 # time. A minAvailable of anything above 0 against a pool that is deliberately
 # empty would block every node drain in the namespace forever; minAvailable: 0
 # would be a no-op with a comment.
+#
+# On a tiered pool (N2) this one budget covers every tier's pods — see the
+# marker above — so a cluster upgrade drains GPU nodes one at a time POOL-WIDE
+# rather than one per tier. Slower upgrades on a many-tier pool; never a
+# blocked eviction.
 #
 # What this actually buys, and it is worth being precise because a PDB on an
 # autoscaled Deployment is easy to write and easy to overrate: a cluster
