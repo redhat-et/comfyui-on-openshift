@@ -19,6 +19,17 @@ updates:
       gateway-pip:
         patterns:
           - "*"
+    # redis majors are excluded, not merely expected to fail: the <7 ceiling
+    # is load-bearing (the requirements comment), and a PER-DIRECTORY redis
+    # major can never go green anyway — CI and every local flow install the
+    # gateway's and the worker's requirements into ONE environment, so a bump
+    # on either side alone is pip ResolutionImpossible against the other
+    # (how #10 and #11 actually failed). Lifting the ceiling is one
+    # deliberate cross-directory change after re-testing the blocking paths,
+    # made by a person, not proposed weekly by a bot.
+    ignore:
+      - dependency-name: redis
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: pip
     directory: /enterprise/worker
@@ -28,6 +39,10 @@ updates:
       worker-pip:
         patterns:
           - "*"
+    # Same reasoning as the gateway group's ignore above.
+    ignore:
+      - dependency-name: redis
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
