@@ -1087,13 +1087,18 @@ proven by a disconnected cluster day, eventually. Scoped into the
 tech-alignment agreement's Phase 2 — this lands on the receiving side; the
 entry stays here because the reasoning does.
 
-**N10 — Agent access to the pool.** Comfy Org ships an MCP server that
-assumes one dedicated instance; the pool needs agent principals — service
-accounts through the same oauth path, the same fair queue, quota and
-showback rows a human gets. If agent-initiated generation keeps compounding,
-this is the second market for the same architecture (`docs/14-market.md`).
-Spike first: the oauth-proxy SAR path for service-account tokens decides the
-shape.
+**N10 — Agent access to the pool.** Comfy MCP went official in June 2026 —
+a hosted Comfy Cloud connection plus an open-source local server
+(Comfy-Org/comfy-mcp) that drives a *self-hosted* install — and both assume
+one dedicated instance. The pool needs agent principals: service accounts
+through the same oauth path, the same fair queue, quota and showback rows a
+human gets. Agent-initiated generation is compounding (Higgsfield reports
+42× in three months, post its agent-product launch), which makes this the
+second market for the same architecture (`docs/14-market.md`) — and the
+current read is that it is the **highest-value open item on this list**:
+the rail exists upstream, only the multi-tenancy is missing, and this repo
+is the multi-tenancy. Spike first: the oauth-proxy SAR path for
+service-account tokens decides the shape.
 
 **N11 — Operator packaging (OLM).** The productization artifact: install,
 upgrade and configure via an operator rather than `setup.sh`. Sequenced

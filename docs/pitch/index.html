@@ -218,7 +218,7 @@
             <div class="v"><em>12 months</em><b>$20M → $700M</b><i>annualized revenue</i></div>
             <div class="v"><em>3 months</em><b>42×</b><i>agentic-usage growth</i></div>
           </div>
-          <p style="font-size:12.5px; color:var(--muted); margin-top:7px;">Not the better product — <b>the proof of demand.</b> The commercial suites lead on go-to-market; ComfyUI leads the open-source side of the same category, and this repo is its go-to-market gap, closed.</p>
+          <p style="font-size:12.5px; color:var(--muted); margin-top:7px;">Not the better product — <b>the proof of demand, and it is enterprise demand</b>: business customers went from under a quarter to the <b>majority of that revenue</b> in the same seven months; 390 of the Fortune 500 use the platform. Nor an outlier: Runway raised at $5.3B in February. ComfyUI leads the open-source side of the same category — this repo is its go-to-market gap, closed.</p>
         </div>
       </div>
       <div class="col">
@@ -232,14 +232,14 @@
         <div class="card">
           <h3>The open-source counterweight</h3>
           <ul>
-            <li>ComfyUI: <b>$30M raise at a $500M valuation</b> (Apr 2026, Craft Ventures); 60,000+ community nodes</li>
+            <li>ComfyUI: <b>4M users, 150k downloads/day, 60,000+ nodes</b>; $30M raise at a <b>$500M valuation</b> (Apr 2026); Comfy Cloud tracking $50M ARR</li>
             <li>Behind the first primarily-AI-generated Super Bowl ad; “<b>ComfyUI artist</b>” is a job title now</li>
             <li>Agents already speak it: Comfy Org ships an <b>official MCP server</b> — Claude Code, Codex &amp; co. drive graphs as tool calls</li>
           </ul>
         </div>
         <div class="card accent-card">
           <h3>The gap = the project</h3>
-          <p>The category's open-source leader has <b>no enterprise deployment story</b>: no SSO, no isolation, no shared-GPU economics, no per-user accounting.</p>
+          <p>The category's open-source leader has <b>no enterprise deployment story</b>: no SSO, no isolation, no shared-GPU economics, no per-user accounting. And <b>studios under NDA</b> — the segment that needs one most — can't use SaaS at any price: no vendor cloud can follow them.</p>
         </div>
       </div>
     </div>
@@ -331,7 +331,7 @@
             <li>E2E suite runs the <b>real gateway and worker</b> on a laptop — no cluster, no GPU, ~1 min (<span class="mono">make test</span>); <span class="mono">make demo-local</span> goes further — the real pool <b>rendering on the laptop's own GPU</b></li>
             <li>Shipped: per-user showback &amp; quota, warm-floor scheduling, dead-worker reaping, per-user workspaces, default-deny policy</li>
             <li>Docs 01–13, incl. scaling to hundreds of users and a first-cluster-day checklist</li>
-            <li>Ahead: VRAM-tier routing (L4 → L40S → H100) and pool-aware agent/MCP access — both on the written roadmap</li>
+            <li>Ahead: VRAM-tier routing (L4 → L40S → H100, laptop half merged) and pool-aware agent/MCP access — Comfy MCP went official in June; wiring it through the pool's SSO is the roadmap's next spike</li>
           </ul>
         </div>
       </div>
@@ -487,21 +487,27 @@
         <div class="card accent-card">
           <h3>The asks</h3>
           <ul>
-            <li><b>PM read</b> on the persona (30 min): a content-creation <em>studio</em> workload — is this a corner we stand in?</li>
-            <li><b>Customer-scenario session</b>: map the API-first scenarios against the two tiers</li>
-            <li><b>Demo budget</b>: a full live-cluster demo day is ~$25–50 at the repo's own rates</li>
+            <li><b>PM read</b> (30 min): is the <em>studio</em> a corner we stand in?</li>
+            <li><b>Scenario session</b>: API-first scenarios × the two tiers</li>
+            <li><b>Demo budget</b>: ~$25–50 for a live-cluster day</li>
             <li><b>Name the owner</b> of the "does this have a home" decision</li>
           </ul>
         </div>
       </div>
       <div class="col">
+        <div class="card accent-card">
+          <h3>The second market is already arriving</h3>
+          <p style="font-size:13.5px;">Higgsfield's 42× was <b>agent traffic</b>, not seats — and Comfy MCP went <b>official in June</b>: Claude, Codex &amp; co. drive even <b>self-hosted installs</b> as tool calls. Pointed at the pool: a <b>multi-agent pool</b>, same SSO and showback — agents wielding arbitrary Python need the unreachable workers <em>more</em> than humans. Next on the roadmap.</p>
+        </div>
+      </div>
+      <div class="col">
         <div class="card">
           <h3>Zero-cost due diligence, today</h3>
-          <p style="font-size:13.5px;"><span class="mono">make test</span> runs the real gateway and worker on a laptop in about a minute — no cluster, no GPU, no AWS account — and <span class="mono">make demo-local</span> renders through the same pool on the laptop's own GPU (slide 4). The README's comparison table and <span class="mono">docs/13-vllm-omni.md</span> are the homework in written form; a workflow blog post series is the cheapest proof after that.</p>
+          <p style="font-size:13.5px;"><span class="mono">make test</span>: the real gateway and worker on a laptop, ~1 min, no cluster or GPU. <span class="mono">make demo-local</span>: renders through the same pool on the laptop's GPU (slide 4). The README's table and <span class="mono">docs/13</span> are the homework in writing.</p>
         </div>
       </div>
     </div>
-    <div class="foot"><span>docs/13-vllm-omni.md — the full cost arithmetic and the composition rule</span><span>6 / 6</span></div>
+    <div class="foot"><span>docs/13-vllm-omni.md — the cost arithmetic and composition rule · docs/14-market.md — the market case, sourced</span><span>6 / 6</span></div>
   </section>
 
 </div>
@@ -524,9 +530,32 @@
   }
   window.show = show;
 
+  let fitFrozen = false;
   function fit() {
+    if (fitFrozen) return;
     const scale = Math.min(innerWidth / 1320, innerHeight / 770);
     document.getElementById("stage").style.transform = "scale(" + Math.min(scale, 1.4) + ")";
+  }
+
+  // Deep links: #3 opens on slide 3. #3x additionally freezes the stage for
+  // a pixel-exact capture — nav hidden, no scaling, videos pinned to their
+  // poster frame — which is what export.py drives to regenerate slides/ and
+  // the PDF after any edit to this file.
+  const deep = location.hash.match(/^#(\d+)(x?)$/);
+  if (deep) {
+    show(parseInt(deep[1], 10) - 1);
+    if (deep[2]) {
+      fitFrozen = true;
+      document.getElementById("nav").style.display = "none";
+      document.getElementById("stage-wrap").style.position = "static";
+      document.getElementById("stage-wrap").style.display = "block";
+      document.getElementById("stage").style.transform = "none";
+      document.querySelectorAll("video").forEach((v) => {
+        v.removeAttribute("autoplay");
+        v.pause();
+        v.load();
+      });
+    }
   }
 
   document.getElementById("next").onclick = () => show(current + 1);
