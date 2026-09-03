@@ -52,6 +52,14 @@ with a GPU, Apple silicon included:
   browser panes queueing against the two-worker pool at once, progress
   streaming over WebSockets, two different renders landing.
 
+Since those takes, the fetch grew its product button: the gateway's Models
+section — paste the URL the missing-models panel hands you, **Install to
+pool**, watch the bar. Same validated server-side pull, one click, shown
+live on slide 4 (a real Hugging Face download at 40%). In the cluster this
+is the only road models can arrive by: the workers have no internet by
+design, so the gateway — which runs no user code — validates the source
+and the format and pulls once for everyone.
+
 Every number on these slides is backed in this repository: the cost model in
 [`../02-cost.md`](../02-cost.md), the comparison table on the
 [front page](../../README.md), the serving-tier arithmetic in
