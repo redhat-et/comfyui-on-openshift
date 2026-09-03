@@ -144,6 +144,30 @@ if ! "$PY" -c "import yaml, aiohttp" 2>/dev/null; then
     "$PY" -m pip install --quiet -r "${REPO_ROOT}/enterprise/gateway/requirements.txt" websocket-client
 fi
 
+# ComfyUI-Manager. The shared cluster ships it OFF by default — Manager
+# installs arbitrary Python with a nice button, and on a cluster node that
+# button is remote code execution (the worker Containerfile's argument).
+# This demo is the single-user sandbox that argument contrasts against: the
+# person clicking the button already owns this laptop. It is also half the
+# designer's loop — "see missing models, one-click load" goes through
+# Manager — so leaving it out would demo a worse product than the platform
+# ships. DEMO_ENABLE_MANAGER=false leaves it out.
+#
+# Installed as the pip package ComfyUI itself pins (manager_requirements.txt
+# says comfyui_manager==4.2.2 — the same form both Containerfiles use), NOT as
+# a custom_nodes checkout: at this ComfyUI ref, main.py imports
+# comfyui_manager as a module behind --enable-manager, and a bare checkout
+# in custom_nodes has no top-level __init__.py to import at all.
+DEMO_ENABLE_MANAGER="${DEMO_ENABLE_MANAGER:-true}"
+MANAGER_ARGS=()
+if [[ "$DEMO_ENABLE_MANAGER" == "true" ]]; then
+    if ! "$PY" -c "import comfyui_manager" 2>/dev/null; then
+        log "Installing ComfyUI-Manager (first run only)"
+        "$PY" -m pip install --quiet -r "${DEMO_HOME}/ComfyUI/manager_requirements.txt"
+    fi
+    MANAGER_ARGS=(--enable-manager)
+fi
+
 # ---------------------------------------------------------------------------
 # A model to render with
 # ---------------------------------------------------------------------------
@@ -207,11 +231,19 @@ for i in $(seq 1 "$DEMO_WORKERS"); do
     args_var="DEMO_WORKER_ARGS_${i}"
     read -r -a extra_args <<< "${!args_var:-}"
 
+    # --database-url per worker: all N workers share one ComfyUI checkout,
+    # and its default SQLite file (user/comfyui.db) takes an exclusive
+    # lock — every worker but the first then boots with a dead database,
+    # which quietly breaks the features built on it, model downloads
+    # included. In the cluster each pod has its own filesystem, so only
+    # this shared-checkout demo needs the split.
     ( cd "${DEMO_HOME}/ComfyUI" && exec "$PY" main.py \
         --listen 127.0.0.1 --port "$port" \
         --models-directory "${DEMO_HOME}/models" \
         --output-directory "${DEMO_HOME}/output" \
         --temp-directory "${DEMO_HOME}/tmp" \
+        --database-url "sqlite:///${DEMO_HOME}/comfy-db-${i}.sqlite" \
+        ${MANAGER_ARGS[@]+"${MANAGER_ARGS[@]}"} \
         ${extra_args[@]+"${extra_args[@]}"} \
       ) > "${DEMO_HOME}/comfy-${i}.log" 2>&1 &
     PIDS+=($!)
@@ -321,7 +353,15 @@ cat <<EOF
 
     open http://127.0.0.1:${GATEWAY_PORT}
 
-  Paste a workflow in API format, or drive it from a terminal:
+  Each worker's stock ComfyUI canvas — the frontend designers already
+  know, Manager included — is one tab away (the local-demo bonus; in the
+  cluster the workers are unreachable by design):
+
+    open http://127.0.0.1:${COMFY_BASE_PORT}    # +1 per additional worker
+
+  Authoring stays in ComfyUI; the gateway is where a finished workflow
+  goes to run on the pool. Paste a workflow in API format, or drive it
+  from a terminal:
 
     curl -s -X POST http://127.0.0.1:${GATEWAY_PORT}/api/generate \\
         -H 'Content-Type: application/json' -d @workflow_api.json
