@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <!-- Monthly GPU cost for a ten-person team, as the model library grows.
+       Rates from docs/02-cost.md: g6.xlarge $0.976/h all-in ($713/mo),
+       g6e.xlarge $2.03/h all-in ($1,483/mo). Pool band and SaaS band are
+       flat against model count by construction. -->
+  <rect x="0" y="0" width="900" height="470" fill="#ffffff"/>
+  <text x="70" y="22" font-size="15" font-weight="600" fill="#24292f">Monthly GPU cost, ten-person team, as the model library grows</text>
+
+  <!-- gridlines + y ticks -->
+  <g stroke="#e8eaed" stroke-width="1">
+    <line x1="70" y1="410" x2="880" y2="410"/>
+    <line x1="70" y1="283.3" x2="880" y2="283.3"/>
+    <line x1="70" y1="156.7" x2="880" y2="156.7"/>
+    <line x1="70" y1="30" x2="880" y2="30"/>
+  </g>
+  <g font-size="12" fill="#6a6e73" text-anchor="end">
+    <text x="62" y="414">$0</text>
+    <text x="62" y="287">$5,000</text>
+    <text x="62" y="161">$10,000</text>
+    <text x="62" y="34">$15,000</text>
+  </g>
+
+  <!-- x ticks -->
+  <g font-size="12" fill="#6a6e73" text-anchor="middle">
+    <text x="70" y="432">0</text>
+    <text x="232" y="432">2</text>
+    <text x="394" y="432">4</text>
+    <text x="556" y="432">6</text>
+    <text x="718" y="432">8</text>
+    <text x="880" y="432">10</text>
+  </g>
+  <text x="475" y="456" font-size="13" fill="#24292f" text-anchor="middle">distinct base models the team's templates touch</text>
+
+  <!-- SaaS band: 10 seats x $79-215/mo = $790-2,150, flat, credit-capped -->
+  <rect x="70" y="355.5" width="810" height="34.5" fill="#6a6e73" opacity="0.18"/>
+  <text x="876" y="349" font-size="12.5" fill="#57606a" text-anchor="end">credit-metered SaaS, ten seats: $790–2,150 (usage-capped)</text>
+
+  <!-- Pool band: $120-950, flat -->
+  <rect x="70" y="385.9" width="810" height="21.1" fill="#2a6e46" opacity="0.35"/>
+  <text x="120" y="403" font-size="12.5" font-weight="600" fill="#1d5334">the pool: $120–950 — follows concurrency, not catalog size</text>
+
+  <!-- Residency, L4-class: $713/mo per model -->
+  <polyline points="70,410 232,373.9 394,337.8 556,301.6 718,265.5 880,229.4" fill="none" stroke="#b8321f" stroke-width="3"/>
+  <g fill="#b8321f">
+    <circle cx="232" cy="373.9" r="4"/><circle cx="394" cy="337.8" r="4"/>
+    <circle cx="556" cy="301.6" r="4"/><circle cx="718" cy="265.5" r="4"/>
+    <circle cx="880" cy="229.4" r="4"/>
+  </g>
+  <text x="700" y="248" font-size="12.5" font-weight="600" fill="#b8321f" text-anchor="end">one resident engine per model (L4): +$713/mo each</text>
+
+  <!-- Residency, video-class: $1,483/mo per model -->
+  <polyline points="70,410 232,334.9 394,259.7 556,184.6 718,109.4 880,34.3" fill="none" stroke="#7a1c10" stroke-width="2.5" stroke-dasharray="7 5"/>
+  <text x="620" y="100" font-size="12.5" font-weight="600" fill="#7a1c10" text-anchor="end">as models go video-class (L40S): +$1,483/mo each</text>
+
+  <!-- axis -->
+  <line x1="70" y1="30" x2="70" y2="410" stroke="#57606a" stroke-width="1.5"/>
+  <line x1="70" y1="410" x2="880" y2="410" stroke="#57606a" stroke-width="1.5"/>
+</svg>

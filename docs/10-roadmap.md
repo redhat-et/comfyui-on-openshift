@@ -895,6 +895,96 @@ its ID above.
     `setup.sh`. *(Medium, and the right move once more than one person owns
     this.)*
 
+## The next horizon
+
+New items, N-series, in payoff-per-unit-of-work order like everything else
+here. No dates — order and dependency are the plan. Each entry says what it
+touches and what proves it, in the format the F/Q/I/S items used before they
+landed. The first two are worth more than the rest combined.
+
+**N1 — The blessed engine beside the pool** (`make omni-engine MODEL=...`).
+One command deploys a vLLM Omni engine into the namespace — Deployment,
+Service, the NetworkPolicy edit that lets workers reach it, and the
+[`comfyui-vllm-omni`](https://github.com/dougbtv/comfyui-vllm-omni) bridge
+nodes baked into the worker image — so the two-tier design in
+`docs/13-vllm-omni.md` is a shipped path rather than an argument. Touches
+`enterprise/setup.sh`, a new manifest, the worker egress policy (a §3
+invariant: the worker today reaches Redis and DNS and nothing else — this
+adds exactly one named Service, and the invariant gate applies), and
+`app/src/custom_nodes/`. Proven by kubeconform and the arbitrary-UID image
+job on a laptop; the real call is a cluster-day line. *The single most
+valuable item on this list: the repo itself would embody the composition
+rule.*
+
+**N2 — VRAM-tier routing.** Pools per card class (L4 / L40S / H100-class); a
+job declares the tier it needs and the queue places it — nobody pays 80 GB
+prices for a 24 GB job, and the tier ladder is how the pool absorbs the
+video-model growth curve (`docs/13`, "Two curves compound"). Touches the
+queue key shape in `hub.py` and `worker_agent.py` (a §3 invariant — the
+queue-lane review gate applies), `setup.sh` machine pools, and `.env`.
+Laptop-provable with fake tiers; real pools are a cluster-day line.
+
+**N3 — The savings report.** A monthly report assembled from data already
+collected — utilization, waits, cost per render, spend versus the
+card-per-person counterfactual — so the system generates its own business
+case. Touches a small reporter script and `docs/02`; proven by `make test`
+against seeded showback data. Pairs with **N4**.
+
+**N4 — FOCUS-format chargeback export.** `GET /api/showback` grown a
+`?format=focus` CSV in the FinOps FOCUS column set — the checkbox enterprise
+finance actually asks for. Touches `gather_stats`/showback read paths only;
+proven by a check that validates the column contract.
+
+**N5 — Grafana dashboard shipped.** A dashboard JSON beside the
+ServiceMonitor: queue depth, `comfy_estimated_wait_seconds`, worker count,
+showback top-N. Touches `enterprise/manifests/`; provable only by eyes on a
+cluster day, so it lands with one.
+
+**N6 — Golden-render CI.** A workflow registry (versioned template JSON) and
+a nightly job that renders pinned-seed goldens on tiny CPU-capable models and
+diffs the output — "renders don't regress," CI for creative pipelines.
+Touches `nightly.yaml` and a new `workflows/` convention; the CPU half is
+laptop-provable, which is the point.
+
+**N7 — The $50 challenge.** A scripted, reproducible ten-person design day —
+synthetic workload in, real bill out, published. Turns `docs/02`'s model into
+an artifact anyone can rerun. Cluster-day by construction; the script half is
+a laptop item.
+
+**N8 — Provenance end to end.** S1's `models.lock` extended with checksum
+verification at load, plus C2PA content credentials stamped onto outputs —
+the compliant creative pipeline `docs/14-market.md`'s captive segment needs,
+and something no credit-metered suite offers. Touches the S3 sync job and an
+output-write hook; the stamping half is laptop-provable.
+
+**N9 — Air-gapped install path.** Mirror-registry instructions plus the
+model lockfile make a disconnected install a documented path rather than a
+support question — the segment that cannot use SaaS structurally
+(`docs/14-market.md`). Doc-first; touches `docs/` and image references;
+proven by a disconnected cluster day, eventually.
+
+**N10 — Agent access to the pool.** Comfy Org ships an MCP server that
+assumes one dedicated instance; the pool needs agent principals — service
+accounts through the same oauth path, the same fair queue, quota and
+showback rows a human gets. If agent-initiated generation keeps compounding,
+this is the second market for the same architecture (`docs/14-market.md`).
+Spike first: the oauth-proxy SAR path for service-account tokens decides the
+shape.
+
+**N11 — Operator packaging (OLM).** The productization artifact: install,
+upgrade and configure via an operator rather than `setup.sh`. Sequenced
+after S2 (pipelines build) — packaging a laptop-built image is packaging the
+wrong thing. A spike, then a decision.
+
+**N12 — Hybrid render.** Local card for previews, burst to the pool for
+finals — the split that matches how artists already work. Frontend
+unchanged; needs a router node pack and a submission path from a local
+ComfyUI to the gateway. Spike; collides with nothing above.
+
+Deliberately *not* re-added: anything the "Deferred, with reasons" and
+"Not on this list" sections already decided against — those decisions stand
+unless their reasoning changes.
+
 ## Not on this list
 
 `docs/06-enterprise-architecture.md` ends with the things that are deliberately

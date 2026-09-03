@@ -58,6 +58,26 @@ cron line.
 Plus AWS Business support at the greater of $100/month or 10% of usage, which
 bills whether or not a cluster exists.
 
+## Three more ways to read the same bill
+
+**The idle tax.** A dedicated card at this workload's own duty cycles
+(4–26% — the README's "Sizing the pool" derives them) is idle 74–96% of the
+time. Ten always-on seats are ~$85,000/year of GPU line, of which roughly
+$63,000–82,000 buys idleness. Framing the pool as removing an idle tax,
+rather than as a discount, is the version finance acts on.
+
+**Cost per finished asset.** A 2.5-minute render on a `g6.xlarge` is about
+**four cents** of GPU time. On a credit-metered suite, top-tier video runs
+about $0.39 per second of output — ten seconds is ~$3.90 — before seat
+fees. The models differ, so this is not a like-for-like quality claim; it
+is a claim about who owns the meter.
+
+**The designer-hour.** The most expensive component in the loop is the
+person. A designer at $75/hour idled ten minutes by a cold start costs
+$12.50 — more than twelve hours of the warm-floor card ($0.976/hour) that
+removes the wait. Sizing the warm floor is not a GPU cost decision; it is
+a people-throughput decision that happens to involve GPUs.
+
 ## Park vs down
 
 `make park` scales the GPU pool to zero. Takes seconds, comes back in ~5
