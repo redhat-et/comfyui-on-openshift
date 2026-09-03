@@ -53,8 +53,6 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ARG TORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
-# 4.2.2 (the annotated tag object; it peels to commit bd4ede22)
-ARG MANAGER_REF=da5e88aae61c06e1396724e77dc5fa152732797f
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -146,9 +144,15 @@ RUN git init -q . \
 # /models, the persistent volume, where ComfyUI actually reads them (that is
 # the --models-directory flag at the bottom of this file doing its job).
 #
-# It lives in custom_nodes/ inside the ComfyUI install, like any other node
-# pack — before the permissions section below, so the arbitrary UID can write
-# its config and cache.
+# It is the pip package ComfyUI itself pins (manager_requirements.txt in the
+# tree fetched above says comfyui_manager==4.2.2), NOT a checkout into
+# custom_nodes/: at this COMFYUI_REF, main.py imports comfyui_manager as a
+# module gated behind the --enable-manager flag, and Manager 4.x has no
+# top-level __init__.py, so a bare checkout in custom_nodes is logged as
+# "Cannot import ... ComfyUI-Manager" and skipped — silently absent from an
+# image built to include it. The pin rides COMFYUI_REF's SHA: bumping ComfyUI
+# moves the Manager version with it, which is the pairing upstream actually
+# tests. Same form as enterprise/demo-local.sh.
 #
 # Know the limits: model downloads persist; runtime custom-NODE installs do
 # not (container filesystem, gone on restart, and their pip deps cannot
@@ -159,20 +163,15 @@ RUN git init -q . \
 
 ARG ENABLE_MANAGER=false
 
-# Pinned to MANAGER_REF (declared above, alongside COMFYUI_REF) — an
-# unpinned clone here means "install nodes and download models" behavior
-# can change on a rebuild with nobody touching this file. ltdrdata/ moved to
-# Comfy-Org/ upstream; the old URL still redirects, but point at the current
-# one so a redirect going away later doesn't silently break builds.
 RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
-        mkdir -p custom_nodes/ComfyUI-Manager && \
-        cd custom_nodes/ComfyUI-Manager && \
-        git init -q . && \
-        git remote add origin https://github.com/Comfy-Org/ComfyUI-Manager.git && \
-        git fetch --depth 1 origin ${MANAGER_REF} && \
-        git checkout -q FETCH_HEAD && \
-        python3 -m pip install -r requirements.txt; \
+        python3 -m pip install -r manager_requirements.txt; \
     fi
+
+# Baked through to runtime so the entrypoint at the bottom of this file can
+# pass --enable-manager exactly when the module was installed above — the
+# module alone does nothing without the flag, and the flag without the module
+# just logs an install hint and disables itself.
+ENV ENABLE_MANAGER=${ENABLE_MANAGER}
 
 # ---------------------------------------------------------------------------
 # Your code
@@ -232,8 +231,8 @@ RUN python3 -m pip uninstall -y pip \
 # ${APP_ROOT} ITSELF stays group-writable, one level, and that is not an
 # oversight — ComfyUI creates directories directly under its base directory at
 # boot, and a read-only parent turns that into a permission error at start.
-# custom_nodes is in the writable set because ComfyUI-Manager writes its config
-# and cache there, which the Manager section above promises it can.
+# custom_nodes is in the writable set because ComfyUI-Manager's runtime node
+# installs write there (its config and cache land under user/, also writable).
 #
 # The setgid bit on directories is the other half: files created later inherit
 # GID 0 rather than the creating process's group.
@@ -260,7 +259,16 @@ EXPOSE 8188
 # custom_nodes under /models/custom_nodes, so every node baked into this image
 # would silently never load. --models-directory moves only the model search
 # path, which is the thing the volume actually holds.
-ENTRYPOINT ["python3", "main.py"]
+#
+# The bash -c shim exists for one flag: main.py only loads Manager behind
+# --enable-manager, that choice was made at build time (ENABLE_MANAGER, baked
+# through as ENV above), and a JSON-form ENTRYPOINT cannot branch. CMD (and
+# anything appended to `podman run`) arrives as "$@"; the shim prepends
+# --enable-manager ahead of it so an appended flag still wins — argparse takes
+# the last occurrence. `exec` keeps python3 as PID 1 for signals.
+ENTRYPOINT ["/bin/bash", "-c", \
+    "if [ \"$ENABLE_MANAGER\" = \"true\" ]; then set -- --enable-manager \"$@\"; fi; exec python3 main.py \"$@\"", \
+    "comfyui"]
 CMD ["--listen", "0.0.0.0", \
      "--port", "8188", \
      "--models-directory", "/models", \

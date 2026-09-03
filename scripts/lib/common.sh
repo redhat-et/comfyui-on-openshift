@@ -70,8 +70,9 @@ load_env()
     # Kept identical to the ARG defaults in app/Containerfile so a bare
     # `podman build` and this repo's BuildConfig (scripts/05-deploy.sh) build
     # the same image. See that file's comment above ARG COMFYUI_REF for why
-    # the four torch values move together.
-    : "${MANAGER_REF:=da5e88aae61c06e1396724e77dc5fa152732797f}"   # 4.2.2
+    # the four torch values move together. (No MANAGER_REF: the Manager
+    # version is pinned by ComfyUI's own manager_requirements.txt at
+    # COMFYUI_REF, so it moves with that SHA.)
     : "${TORCH_INDEX:=https://download.pytorch.org/whl/cu128}"
     : "${TORCH_VERSION:=2.8.0}"
     : "${TORCHVISION_VERSION:=0.23.0}"
@@ -90,7 +91,7 @@ load_env()
     export STORAGE_MODE MODELS_SIZE OUTPUT_SIZE MODELS_S3_BUCKET
     export APP_NAMESPACE COMFYUI_IMAGE
     export AUTH_MODE MAX_GPU_WORKERS SCALE_TO_ZERO ENABLE_MANAGER COMFYUI_REF
-    export MANAGER_REF TORCH_INDEX TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION
+    export TORCH_INDEX TORCH_VERSION TORCHVISION_VERSION TORCHAUDIO_VERSION
     export MONTHLY_BUDGET_USD BUDGET_ALERT_EMAIL GPU_VCPU_REQUEST
     export NETWORK_STACK_NAME OPERATOR_ROLE_PREFIX
 }

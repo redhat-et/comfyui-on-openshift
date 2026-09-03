@@ -41,8 +41,6 @@ ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ARG TORCH_VERSION=2.8.0
 ARG TORCHVISION_VERSION=0.23.0
 ARG TORCHAUDIO_VERSION=2.8.0
-# 4.2.2 (the annotated tag object; it peels to commit bd4ede22)
-ARG MANAGER_REF=da5e88aae61c06e1396724e77dc5fa152732797f
 
 # ComfyUI-Manager lets any user with UI access install arbitrary Python from
 # the internet, which then runs in this pod — on a node with an instance role,
@@ -121,18 +119,23 @@ RUN git init -q . \
     && python3 -m pip install -r requirements.txt \
     && python3 -m pip install --upgrade "setuptools>=78.1.1" "msgpack>=1.2.1"
 
-# Pinned to MANAGER_REF, and pointed at Comfy-Org/ (ltdrdata/ moved there
-# upstream; the old URL still redirects today, but don't depend on that
-# lasting). Same rationale as app/Containerfile.
+# Installed as the pip package ComfyUI itself pins (manager_requirements.txt
+# in the tree fetched above says comfyui_manager==4.2.2), NOT as a checkout
+# into custom_nodes/: at this COMFYUI_REF, main.py imports comfyui_manager as
+# a module gated behind the --enable-manager flag, and Manager 4.x has no
+# top-level __init__.py, so a bare checkout in custom_nodes is logged as
+# "Cannot import ... ComfyUI-Manager" and skipped — Manager silently absent
+# from an image built to include it. The pin now rides COMFYUI_REF's SHA:
+# bumping ComfyUI moves the Manager version with it, which is the pairing
+# upstream actually tests. Same form as enterprise/demo-local.sh.
 RUN if [ "$ENABLE_MANAGER" = "true" ]; then \
-        mkdir -p custom_nodes/ComfyUI-Manager && \
-        cd custom_nodes/ComfyUI-Manager && \
-        git init -q . && \
-        git remote add origin https://github.com/Comfy-Org/ComfyUI-Manager.git && \
-        git fetch --depth 1 origin ${MANAGER_REF} && \
-        git checkout -q FETCH_HEAD && \
-        python3 -m pip install -r requirements.txt; \
+        python3 -m pip install -r manager_requirements.txt; \
     fi
+
+# Baked through to runtime so start.sh can pass --enable-manager exactly when
+# the module was installed above — the module alone does nothing without the
+# flag, and the flag without the module just logs and disables itself.
+ENV ENABLE_MANAGER=${ENABLE_MANAGER}
 
 # ---------------------------------------------------------------------------
 # The agent and your own nodes
