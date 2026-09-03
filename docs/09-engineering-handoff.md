@@ -24,6 +24,67 @@ from anything in the application.
 
 ---
 
+## The transfer, in the org's shape
+
+This project is moving between groups under the standard tech-alignment
+agreement. The signature record — stakeholders, dates, allocations — lives in
+that internal document; everything else the form asks for is here, in the
+repository, where it stays current and checkable. The two are meant to
+corroborate each other: if this section and the signed form ever disagree,
+one of them is stale, and this one carries the receipts.
+
+### Definition of done
+
+Graduation is two milestones:
+
+1. **Dev-Preview** — the stack validated end to end on a real cluster, Red
+   Hat midstream images (gateway and GPU worker) published from the
+   maintained nightly pipeline to a named registry, and CI ownership handed
+   over. Substantially complete: everything laptop-verifiable is green
+   today, and initial cluster validation was performed against an earlier
+   build; what remains is one batched re-validation cluster day
+   ([`12-first-cluster-day.md`](12-first-cluster-day.md)), the registry
+   target, and the handover itself.
+2. **Tech-Preview** — the product-hardened path in whichever form the
+   receiving group selects: a supported RHOAI module/workbench, or a
+   published validated pattern. Either way: downstream (Konflux) build
+   pipelines, internally-sourced Python dependencies — a deliberately small
+   surface, a handful of packages and no exotic wheels — and enterprise QE:
+   multi-user load against the published wait targets, soak, hardware
+   validation, and a security review of the isolation model.
+
+### The ledger
+
+| Phase 1 | |
+|---|---|
+| Application stack, tested end to end in CI | ☑ complete |
+| Documentation 01–14, this handoff included | ☑ complete |
+| Zero-cost evaluation: `make test`, `make demo-local`, the recorded demos | ☑ complete |
+| Initial cluster validation | ☑ complete, against an earlier build |
+| Re-validation cluster day against the current tree | ☐ — the one engineering item left; [`10-roadmap.md`](10-roadmap.md)'s cluster-day list rides along |
+| Midstream images to a named registry | ☐ — the nightly pipeline exists; only the push target is open |
+| CI ownership handover | ☐ |
+
+Phase 2's items — dependency onboarding, downstream pipelines, the
+module-or-pattern integration, QE — are scoped by the receiving group's
+choice above and owned mostly on their side; the signed agreement records
+the split.
+
+### Concerns, on the record
+
+The transfer-shaped ones, beyond section 0's engineering list: the
+**support boundary** — the platform and the gateway are the supportable
+surface; the 60,000-node community ecosystem is explicitly not, and is
+architecturally contained, a boundary any offering must state out loud. The
+**upstream cadence** — ComfyUI moves fast, the pin is a commit SHA, and
+bumping it is a deliberate reviewable act (section 7). The **serving-tier
+boundary** — [`13-vllm-omni.md`](13-vllm-omni.md) states plainly what the
+engine tier can and cannot absorb, and the size of that synergy is an open
+empirical question. And **GPU quota lead time** — days, so file early;
+`make preflight` checks it.
+
+---
+
 ## 0. Where this stands
 
 This is a working system rather than a proof of concept, and it is also not a
@@ -128,7 +189,9 @@ enterprise/         the multi-user configuration
   manifests/        Redis, gateway, worker, KEDA, oauth-proxy, Routes, NetworkPolicy
   test/             e2e suite: real Redis, stub ComfyUI, no cluster needed
 app/Containerfile   the single-user ComfyUI image
-docs/               twelve documents — 01-08, this file, the roadmap, scaling, first cluster day
+docs/               fourteen documents — 01-08, this file, the roadmap, scaling,
+                    first cluster day, the serving-tier relationship, the market
+                    case — plus pitch/, the stakeholder briefing
 .env                33 variables; the only configuration surface
 ```
 
@@ -723,8 +786,11 @@ good faith.
 7. `docs/10-roadmap.md` — where the work goes next, with lanes and gates.
 8. `docs/11-scaling.md` — how far this goes, what it costs per person, and
    which AWS cards it runs on.
-9. `docs/05-troubleshooting.md`, `docs/08-stuck-volumes.md` — bookmark, do not
-   read cover to cover.
+9. `docs/13-vllm-omni.md`, `docs/14-market.md` — the strategy conversations:
+   where the serving tier fits, and why this corner of the market is worth
+   standing in. Read before any meeting about where this lives.
+10. `docs/05-troubleshooting.md`, `docs/08-stuck-volumes.md` — bookmark, do not
+    read cover to cover.
 
 Then run `make test`, read `hub.py` and `worker_agent.py` top to bottom (they
 are ~5,100 lines together and both open with a numbered list of the things the
@@ -790,3 +856,66 @@ stop and solve it at the gateway instead. That single property is what the rest
 of this is built on, and it is the only one that cannot be recovered after the
 fact. Everything below that line is somebody else's pager. Everything above it
 is now yours, and section 10 says which parts of it you are free to move.
+
+---
+
+## 14. Making your life easier — the parts you would otherwise learn slowly
+
+Four things that are true about working on this repository that no single
+file states, each learned here the slow way.
+
+**It was built concurrently, and it survives being worked concurrently.**
+Much of this codebase landed as parallel work streams against one tree —
+several at once, sometimes in the same hour — and the discipline that made
+that survivable is written down rather than tribal: the lanes and gates in
+[`10-roadmap.md`](10-roadmap.md) say which files contend and which items
+must be sequenced; section 4's assertion-first rule is what let streams
+land without watching each other; and the sharpest cross-file contracts are
+mechanical rather than social — the mirrored accounting block in `hub.py`
+and `worker_agent.py` must be byte-identical, and `make lint` enforces that
+instead of a reviewer. Two operational rules with no other home: **one
+`enterprise/test/run.sh` at a time** — the suite owns port 6399, and a
+second run's cleanup kills the first mid-suite — and a new check claims its
+own e2e port and check-number rather than reusing one; grep before you
+pick. If you put agents or several people on this tree at once, hand each
+one the lane analysis first and this paragraph second.
+
+**The pins are decisions, and each one names its reason where you will
+meet it.**
+
+| Pin | Why, and where it is written |
+|---|---|
+| `COMFYUI_REF` is a commit SHA, not the tag it corresponds to | a tag is a mutable pointer upstream can move; `enterprise/setup.sh` says so above the default, and any ref still works |
+| `redis` pinned below its next major | redis-py 8's default 5-second socket timeout breaks every blocking `XREAD`/`BLMOVE` this design rests on; `enterprise/gateway/requirements.txt` carries the note, and dependabot is configured to propose redis majors as a decision rather than a weekly bump |
+| the four torch values move together | the CUDA wheel index and three package versions are one pin, not four; `app/Containerfile`, above the ARGs |
+| ComfyUI-Manager is not pinned here at all | ComfyUI's own `manager_requirements.txt` pins it at `COMFYUI_REF`, so it moves with the SHA and never independently |
+
+**The questions that will arrive, and where their answers already are.**
+
+- A designer: *"why did my first job take ten minutes?"* — section 8, and
+  the warm floor is the answer to recommend.
+- Finance: *"who spent this?"* — `GET /api/showback`; `?format=focus` is
+  the chargeback CSV their tooling ingests, and `scripts/savings-report.py`
+  writes the monthly story. Capture it before a teardown (section 5).
+- Security: *"you put ComfyUI on a shared cluster?"* —
+  [`04-exposing.md`](04-exposing.md),
+  [`06-enterprise-architecture.md`](06-enterprise-architecture.md),
+  `SECURITY.md`, and bin 1 of section 10: the workers are unreachable
+  rather than defended.
+- Strategy: *"why is this not just the serving engine?"* —
+  [`13-vllm-omni.md`](13-vllm-omni.md), which concedes everything worth
+  conceding and keeps the rest.
+- Anyone: *"can I see it?"* — `make demo-local`, or the videos in
+  [`pitch/`](pitch/) — nine seconds to the point, no cluster, no account.
+
+**A first week that front-loads the irreversible.** Day one is section 4.
+The rest of the week, ordered by regret-if-skipped: put your own address in
+`BUDGET_ALERT_EMAIL`; find the machine the teardown cron runs on and confirm
+it is always-on (section 5's two checks); run `make demo-local` once so you
+have watched the system behave before you need it to; read
+[`07-design-review.md`](07-design-review.md) — still the most useful hour;
+schedule the re-validation cluster day *now*, while the GPU quota request
+(multi-day lead time) is in flight rather than after it; and skim the open
+dependabot PRs knowing the policy — grouped weekly proposals, CI as the
+judge, redis majors deliberately excepted.
+
