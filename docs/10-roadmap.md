@@ -984,6 +984,19 @@ finals — the split that matches how artists already work. Frontend
 unchanged; needs a router node pack and a submission path from a local
 ComfyUI to the gateway. Spike; collides with nothing above.
 
+**N13 — The zero-hop model install.** The gateway's one-button model
+install (hub.py, BEGIN MODEL INSTALLS) closes the loop with one copy-paste
+hop: the canvas's missing-models panel names the model, Copy URL, paste
+into the gateway page, Install to pool. The desktop-identical version
+removes that hop — the panel's own Download button posting straight to
+`POST /api/models/install` instead of saving to the browser's machine.
+That needs a small frontend extension against the pinned ComfyUI frontend
+(at the current pin the panel's button is hardwired to a client-side
+download and nothing in the frontend calls a server-side install), so it
+waits on either an upstream hook for missing-model download handlers or a
+custom node shipping a JS extension in the worker image. Do not fork the
+frontend pin for it; the hop is one click and the pin is load-bearing.
+
 Deliberately *not* re-added: anything the "Deferred, with reasons" and
 "Not on this list" sections already decided against — those decisions stand
 unless their reasoning changes.

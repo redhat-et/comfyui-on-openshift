@@ -35,12 +35,15 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import threading
 import unicodedata
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import time
 import uuid
 
 import redis.asyncio as redis
+from redis import Redis as SyncRedis
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.concurrency import run_in_threadpool
@@ -2845,6 +2848,321 @@ async def metrics():
         )
 
     return text
+
+
+# ---------------------------------------------------------------------------
+# BEGIN MODEL INSTALLS — the one-button model load, on the gateway
+#
+# The designer's loop needs missing models to land on the POOL, and the
+# obvious place to put that button — ComfyUI-Manager on the worker — cannot
+# work here by design: the workers have no internet
+# (enterprise/manifests/06-network-policy.yaml, worker-egress-redis-only),
+# because a worker executes arbitrary custom-node Python and its only
+# legitimate conversation is with Redis. That policy's comment promises the
+# alternative: "a job that validates the source and the format, not an
+# egress hole". This section is that job. The gateway is the right pod for
+# it: it runs no user code, it already mounts the shared volume family, and
+# its egress policy already permits TLS on 443 — downloading a model is a
+# strict subset of what it may do today.
+#
+# What "validates the source and the format" means, concretely:
+#
+#   SOURCE  the URL's host must be on MODEL_INSTALL_ALLOWED_HOSTS (default:
+#           huggingface.co, exactly). The host is checked on the URL the
+#           caller names; redirects are then followed wherever that host
+#           sends us (HF hands large files to its CDN), because once the
+#           allowlisted host is trusted its redirect targets are its own
+#           choice — the threat is a caller naming an arbitrary source, not
+#           the trusted source naming its own mirror.
+#
+#   FORMAT  .safetensors only, and not just by name: the first nine bytes
+#           must parse as a safetensors header (a little-endian length that
+#           is plausible, then the JSON it promises). safetensors is the
+#           weights format that cannot smuggle code; a pickle checkpoint
+#           renamed to .safetensors dies on this check at byte nine, before
+#           anything is kept.
+#
+# The download runs in a plain thread with stdlib urllib — the gateway has
+# no async HTTP client dependency and a model fetch is exactly the workload
+# a thread is for: hours-long, I/O bound, zero interaction with the event
+# loop. Progress goes to Redis through a small SYNC client (same pinned
+# redis-py), so any gateway replica can serve /api/models/installs, and a
+# replica that dies mid-download leaves a status hash whose updated_at goes
+# stale instead of a lie that says "downloading" forever.
+# ---------------------------------------------------------------------------
+
+MODELS_ROOT = pathlib.Path(os.environ.get("MODELS_ROOT", "/models")).resolve()
+
+MODEL_INSTALL_ALLOWED_HOSTS = frozenset(
+    host.strip().lower()
+    for host in os.environ.get("MODEL_INSTALL_ALLOWED_HOSTS", "huggingface.co").split(",")
+    if host.strip())
+
+# The folders ComfyUI actually scans, spelled the way folder_paths spells
+# them. A fixed set rather than "any subdirectory": the folder name becomes
+# a path component, and an enum cannot traverse.
+MODEL_INSTALL_FOLDERS = frozenset({
+    "checkpoints", "clip", "clip_vision", "controlnet", "diffusion_models",
+    "embeddings", "loras", "text_encoders", "upscale_models", "vae",
+})
+
+MODEL_INSTALL_MAX_BYTES = int(os.environ.get("MODEL_INSTALL_MAX_BYTES", str(30 * 1024**3)))
+
+# Test/lab escape only: the e2e suite stands up a plain-HTTP model source on
+# loopback, and a self-signed-TLS stand-in would test OpenSSL configuration
+# rather than this feature. Off by default; production refuses http.
+MODEL_INSTALL_ALLOW_HTTP = os.environ.get("MODEL_INSTALL_ALLOW_HTTP", "") == "1"
+
+# A "downloading" hash whose updated_at is older than this is a dead
+# replica's leftover, not a download — a new install of the same file may
+# take over. Progress writes land at least every few seconds, so a minute
+# of silence is conclusive.
+MODEL_INSTALL_STALE_SECONDS = 60
+
+MODEL_INSTALL_STATUS_TTL = 24 * 3600
+
+
+def model_install_key(folder: str, filename: str) -> str:
+    return f"comfy:model_install:{folder}/{filename}"
+
+
+def validate_model_install(url: str, folder: str, filename: str) -> str | None:
+    """
+    The whole admission decision, as a pure function: the error text, or None
+    for a request this gateway is willing to fetch. Pure so the unit layer
+    can enumerate the refusals without a server.
+    """
+    parts = urlsplit(url)
+
+    if parts.scheme != "https" and not MODEL_INSTALL_ALLOW_HTTP:
+        return "url must be https"
+
+    host = (parts.hostname or "").lower()
+
+    if host not in MODEL_INSTALL_ALLOWED_HOSTS:
+        return f"host '{host}' is not on the allowlist ({', '.join(sorted(MODEL_INSTALL_ALLOWED_HOSTS))})"
+
+    if folder not in MODEL_INSTALL_FOLDERS:
+        return f"folder must be one of: {', '.join(sorted(MODEL_INSTALL_FOLDERS))}"
+
+    if not is_bare_filename(filename):
+        return "filename must be a single path component"
+
+    if not filename.endswith(".safetensors"):
+        return "only .safetensors files are installed — the weights format that cannot carry code"
+
+    return None
+
+
+def looks_like_safetensors(first_bytes: bytes) -> bool:
+    """
+    True iff the first nine bytes are a safetensors header: an 8-byte
+    little-endian JSON-header length that is plausible (positive, and under
+    512 MB — real headers are kilobytes), then the '{' it promises.
+    """
+    if len(first_bytes) < 9:
+        return False
+
+    header_len = int.from_bytes(first_bytes[:8], "little")
+
+    return 0 < header_len < (512 * 1024 * 1024) and first_bytes[8:9] == b"{"
+
+
+def _install_status_write(conn: SyncRedis, key: str, mapping: dict) -> None:
+    mapping = {**mapping, "updated_at": f"{time.time():.3f}"}
+    conn.hset(key, mapping=mapping)
+    conn.expire(key, MODEL_INSTALL_STATUS_TTL)
+
+
+def download_model(url: str, folder: str, filename: str) -> None:
+    """
+    Thread body. Streams `url` into MODELS_ROOT/folder/.<filename>.part and
+    renames into place only when everything checked out — the scan ComfyUI
+    runs over this volume must never see a half-written checkpoint under the
+    real name. All failure paths converge on one error write plus the .part
+    unlinked; the status hash is the ONLY channel back to the caller.
+    """
+    import urllib.request
+
+    key = model_install_key(folder, filename)
+    target_dir = MODELS_ROOT / folder
+    part_path = target_dir / f".{filename}.part"
+    final_path = target_dir / filename
+
+    conn = SyncRedis.from_url(REDIS_URL, password=REDIS_PASSWORD, decode_responses=True,
+                              socket_timeout=10, socket_connect_timeout=10)
+
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        request_obj = urllib.request.Request(url, headers={"User-Agent": "comfyui-gateway-model-install"})
+
+        with urllib.request.urlopen(request_obj, timeout=60) as response:
+            declared = response.headers.get("Content-Length", "")
+            total = int(declared) if declared.isdigit() else -1
+
+            if total > MODEL_INSTALL_MAX_BYTES:
+                raise ValueError(f"file is {total} bytes; the limit is {MODEL_INSTALL_MAX_BYTES}")
+
+            # Refuse before writing if the volume clearly cannot take it.
+            # Unknown sizes pass and are caught by the byte cap below.
+            if total > 0 and shutil.disk_usage(MODELS_ROOT).free < total + 1024**3:
+                raise ValueError("not enough free space on the models volume")
+
+            _install_status_write(conn, key, {"status": "downloading", "bytes": "0", "total": str(total)})
+
+            received = 0
+            last_report = 0.0
+            checked_magic = False
+
+            with open(part_path, "wb") as out:
+                while True:
+                    chunk = response.read(1024 * 1024)
+
+                    if not chunk:
+                        break
+
+                    if not checked_magic:
+                        # Byte nine is where a lie about the format dies —
+                        # see the section comment. Checked on the stream so
+                        # nothing but one buffer exists before the verdict.
+                        if not looks_like_safetensors(chunk):
+                            raise ValueError("not a safetensors file (bad header)")
+                        checked_magic = True
+
+                    received += len(chunk)
+
+                    if received > MODEL_INSTALL_MAX_BYTES:
+                        raise ValueError(f"download exceeded the {MODEL_INSTALL_MAX_BYTES}-byte limit")
+
+                    out.write(chunk)
+
+                    now = time.monotonic()
+
+                    if now - last_report >= 2:
+                        _install_status_write(conn, key, {"bytes": str(received), "total": str(total)})
+                        last_report = now
+
+            if received == 0:
+                raise ValueError("empty response")
+
+            part_path.rename(final_path)
+            _install_status_write(conn, key, {"status": "done", "bytes": str(received), "total": str(received)})
+    except Exception as error:  # one convergence point; the hash is the report
+        part_path.unlink(missing_ok=True)
+        _install_status_write(conn, key, {"status": "error", "error": str(error)[:500]})
+    finally:
+        conn.close()
+
+
+@app.post("/api/models/install")
+async def model_install(request: Request):
+    """
+    The one button. Takes {"url", "folder", "filename"} (filename defaults to
+    the URL's last path segment), validates the source and the format, and
+    starts the download onto the shared models volume — the pull happens ONCE
+    and every worker sees the file, which is the entire economic point of
+    that volume.
+
+    Deliberately not scoped per user under either AUTH_MODE: installing a
+    model is additive, the admission control that matters is the host
+    allowlist and the format check, and a per-user rule here would be the
+    kind of control that evaporates under AUTH_MODE=none (see output_file()
+    for that argument in full).
+    """
+    media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+
+    if media_type != "application/json":
+        raise HTTPException(415, "Content-Type must be application/json")
+
+    try:
+        payload = json.loads(await request.body())
+    except json.JSONDecodeError:
+        raise HTTPException(400, "body must be JSON") from None
+
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "body must be an object")
+
+    url = payload.get("url", "")
+    folder = payload.get("folder", "checkpoints")
+    filename = payload.get("filename") or urlsplit(url).path.rsplit("/", 1)[-1]
+
+    if not isinstance(url, str) or not isinstance(folder, str) or not isinstance(filename, str):
+        raise HTTPException(400, "url, folder and filename must be strings")
+
+    problem = validate_model_install(url, folder, filename)
+
+    if problem is not None:
+        raise HTTPException(400, problem)
+
+    if not MODELS_ROOT.is_dir():
+        raise HTTPException(503, f"no models volume at {MODELS_ROOT} — this gateway cannot install models")
+
+    if (MODELS_ROOT / folder / filename).exists():
+        return {"status": "done", "folder": folder, "filename": filename, "already_present": True}
+
+    key = model_install_key(folder, filename)
+    conn = client()
+    state = await conn.hgetall(key)
+
+    if state.get("status") == "downloading":
+        updated = float(state.get("updated_at", "0") or "0")
+
+        # A fresh hash is a live download on some replica; a stale one is a
+        # dead replica's leftover and the retry may take over.
+        if time.time() - updated < MODEL_INSTALL_STALE_SECONDS:
+            return {"status": "downloading", "folder": folder, "filename": filename,
+                    "bytes": int(state.get("bytes", "0") or "0"),
+                    "total": int(state.get("total", "-1") or "-1")}
+
+    await conn.hset(key, mapping={"status": "downloading", "url": url, "folder": folder,
+                                  "filename": filename, "bytes": "0", "total": "-1",
+                                  "error": "", "started_at": f"{time.time():.3f}",
+                                  "updated_at": f"{time.time():.3f}"})
+    await conn.expire(key, MODEL_INSTALL_STATUS_TTL)
+
+    threading.Thread(target=download_model, args=(url, folder, filename), daemon=True).start()
+
+    return {"status": "downloading", "folder": folder, "filename": filename, "bytes": 0, "total": -1}
+
+
+@app.get("/api/models/installs")
+async def model_installs():
+    """
+    Every install this Redis remembers (they expire after a day), stale
+    "downloading" entries labeled honestly as stalled — the UI polls this,
+    and a dashboard that says "downloading" forever about a dead replica's
+    download would be worse than no dashboard.
+    """
+    conn = client()
+    installs = []
+
+    async for key in conn.scan_iter(match="comfy:model_install:*", count=100):
+        state = await conn.hgetall(key)
+
+        if not state:
+            continue
+
+        status = state.get("status", "")
+        updated = float(state.get("updated_at", "0") or "0")
+
+        if status == "downloading" and time.time() - updated >= MODEL_INSTALL_STALE_SECONDS:
+            status = "stalled"
+
+        installs.append({
+            "folder": state.get("folder", ""),
+            "filename": state.get("filename", ""),
+            "status": status,
+            "bytes": int(state.get("bytes", "0") or "0"),
+            "total": int(state.get("total", "-1") or "-1"),
+            "error": state.get("error", ""),
+        })
+
+    installs.sort(key=lambda entry: (entry["folder"], entry["filename"]))
+    return {"installs": installs}
+
+# END MODEL INSTALLS
+# ---------------------------------------------------------------------------
 
 
 @app.get("/", response_class=HTMLResponse)
