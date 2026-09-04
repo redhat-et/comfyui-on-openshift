@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ComfyUI on OpenShift — the brief</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;700;900&family=Red+Hat+Text:wght@400;500;700&family=Red+Hat+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --stage: #151515; --body-bg: #000; --ink: #fff; --muted: #c4c7ca; --faint: #8a8d90;
+    --line: #33363a; --panel: #1f2124; --card: #1b1d20;
+    --red: #EE0000; --red-text: #ff5252; --red-dark: #2a1214;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body { background: var(--body-bg); color: var(--ink); font: 16px/1.4 "Red Hat Text", ui-sans-serif, system-ui, sans-serif; overflow: hidden; }
+  #stage-wrap { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  #stage { width: 1280px; height: 720px; background: var(--stage); position: relative; border-top: 4px solid var(--red);
+           box-shadow: 0 8px 60px rgba(238,0,0,.12), 0 4px 24px rgba(0,0,0,.8); transform-origin: center center; }
+  .slide { position: absolute; inset: 0; padding: 34px 54px 78px; display: none; flex-direction: column; }
+  .slide.active { display: flex; }
+
+  .eyebrow { font-family: "Red Hat Display", sans-serif; font-size: 12px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: var(--red-text); margin-bottom: 6px; }
+  .heard { border-left: 4px solid var(--red); background: var(--panel); border-radius: 0 9px 9px 0; padding: 7px 14px; margin: 0 0 10px; }
+  .heard .hl { font-family: "Red Hat Display", sans-serif; font-size: 10.5px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--red-text); display: block; margin-bottom: 1px; }
+  .heard p { font-size: 15px; font-style: italic; color: var(--ink); line-height: 1.35; }
+  h1 { font-family: "Red Hat Display", sans-serif; font-size: 33px; font-weight: 900; letter-spacing: -.01em; line-height: 1.12; margin-bottom: 14px; }
+  h1 em { font-style: normal; color: var(--red-text); }
+
+  .body { display: flex; gap: 24px; flex: 1; min-height: 0; }
+  .col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; }
+  .col.wide { flex: 1.35; }
+  .col.narrow { flex: .8; }
+  .col.center { justify-content: center; }
+
+  ul.pts { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 11px; }
+  ul.pts li { position: relative; padding-left: 22px; font-size: 17.5px; line-height: 1.38; color: var(--muted); }
+  ul.pts li::before { content: ""; position: absolute; left: 0; top: .5em; width: 11px; height: 11px; background: var(--red); border-radius: 2px; }
+  ul.pts li b { color: var(--ink); font-weight: 700; }
+  ul.pts.big li { font-size: 21px; gap: 16px; }
+  ul.pts.big li::before { top: .55em; width: 13px; height: 13px; }
+
+  .card { border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 12px 15px; }
+  .card h3 { font-family: "Red Hat Display", sans-serif; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin-bottom: 7px; }
+  .card p { font-size: 14.5px; color: var(--muted); }
+  .card p b { color: var(--ink); }
+  .card.accent { border-left: 4px solid var(--red); }
+  .card.honest { border-color: var(--line); background: var(--panel); }
+  .card.honest p { font-size: 13.5px; }
+
+  .tiles { display: flex; gap: 12px; }
+  .tile { flex: 1; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px 12px 10px; text-align: center; }
+  .tile b { display: block; font-family: "Red Hat Display", sans-serif; font-size: 26px; font-weight: 900; letter-spacing: -.01em; color: var(--ink); font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .tile b.red { color: var(--red-text); }
+  .tile em { display: block; font-style: normal; font-size: 10.5px; font-weight: 700; color: var(--red-text); text-transform: uppercase; letter-spacing: .08em; margin-bottom: 4px; font-family: "Red Hat Display", sans-serif; }
+  .tile i { display: block; font-style: normal; font-size: 12px; color: var(--faint); margin-top: 4px; line-height: 1.3; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chips span { border: 1px solid var(--line); background: var(--panel); border-radius: 7px; padding: 5px 11px; font-size: 14px; font-weight: 500; color: var(--ink); }
+
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th { text-align: left; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); font-weight: 700; padding: 5px 10px 5px 0; border-bottom: 1.5px solid var(--line); font-family: "Red Hat Display", sans-serif; }
+  td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--muted); }
+  td b { color: var(--ink); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.hl td { background: var(--red-dark); }
+  tr.hl td b { color: var(--ink); }
+  table.small { font-size: 12.5px; }
+  table.small td { padding: 5px 8px 5px 0; }
+  code { font-family: "Red Hat Mono", ui-monospace, Menlo, monospace; font-size: .88em; background: var(--panel); padding: .08em .35em; border-radius: 4px; color: var(--ink); }
+
+  .loop { display: flex; align-items: stretch; }
+  .loop .step { flex: 1; border: 1.5px solid var(--faint); background: var(--panel); border-radius: 8px; padding: 9px 8px; text-align: center; }
+  .loop .step.hot { border-color: var(--red); background: var(--red-dark); }
+  .loop .step b { display: block; font-size: 13.5px; line-height: 1.25; color: var(--ink); }
+  .loop .step span { font-size: 11px; color: var(--faint); }
+  .loop .step.hot span { color: var(--red-text); font-weight: 700; }
+  .loop .arrow { align-self: center; padding: 0 5px; color: var(--faint); font-size: 15px; }
+
+  .doors { display: flex; gap: 12px; }
+  .door { flex: 1; border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 11px 14px; border-top: 4px solid var(--red); }
+  .door h3 { font-family: "Red Hat Display", sans-serif; font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--red-text); margin-bottom: 5px; }
+  .door p { font-size: 15px; color: var(--muted); line-height: 1.38; }
+  .door p b { color: var(--ink); }
+
+  .shot { position: relative; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #000; }
+  .shot img { width: 100%; display: block; }
+  .shot .pin { position: absolute; width: 24px; height: 24px; border-radius: 50%; background: var(--red); color: #fff; font: 700 13px/24px "Red Hat Display", sans-serif; text-align: center; box-shadow: 0 0 0 3px rgba(0,0,0,.6); transform: translate(-50%, -50%); }
+  .legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+  .legend span b { display: inline-block; width: 18px; height: 18px; border-radius: 50%; background: var(--red); color: #fff; font: 700 11px/18px "Red Hat Display", sans-serif; text-align: center; margin-right: 5px; }
+
+  .stack { display: flex; flex-direction: column; gap: 6px; }
+  .stack div { border: 1.5px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px 14px; font-size: 15px; color: var(--muted); }
+  .stack div b { color: var(--ink); display: block; font-size: 16px; font-family: "Red Hat Display", sans-serif; }
+  .stack div.hot { border-color: var(--red); background: var(--red-dark); }
+  .stack div.hot b { color: var(--red-text); }
+
+  .takeaway { position: absolute; left: 54px; right: 54px; bottom: 36px; border-left: 5px solid var(--red); padding: 4px 14px;
+              font-family: "Red Hat Display", sans-serif; font-size: 19px; font-weight: 700; color: var(--ink); background: linear-gradient(90deg, rgba(238,0,0,.14), transparent 60%); }
+  .takeaway.thesis { font-size: 24px; font-weight: 900; padding: 8px 16px; }
+  .foot { position: absolute; left: 54px; right: 54px; bottom: 12px; display: flex; justify-content: space-between; align-items: baseline; font-size: 11px; color: var(--faint); }
+
+  .hub { min-height: 0; }
+  .hub svg { width: 100%; height: 100%; flex: 1; min-height: 0; display: block; }
+  .fill { flex: 1; min-height: 0; width: 100%; height: 100%; display: block; }
+  .hub text { font-family: "Red Hat Text", sans-serif; }
+  .hub .box { fill: #1f2124; stroke: #55595e; stroke-width: 1.5; }
+  .hub .box.sealed { fill: #2a1214; stroke: #EE0000; }
+  .hub .box.hot { stroke: #EE0000; stroke-width: 2.5; }
+  .hub .box.dim, .hub .dim { opacity: .38; }
+  .hub .t { fill: #fff; font-size: 15px; font-weight: 700; font-family: "Red Hat Display", sans-serif; }
+  .hub .s { fill: #b8bbbe; font-size: 11.5px; }
+  .hub .lbl { fill: #8a8d90; font-size: 12px; font-weight: 700; font-family: "Red Hat Display", sans-serif; letter-spacing: .04em; text-transform: uppercase; }
+  .hub .lbl.hot { fill: #ff5252; }
+  .hub .link { stroke: #8a8d90; stroke-width: 2; fill: none; }
+  .hub .link.hot { stroke: #EE0000; stroke-width: 3.5; }
+  .hub .link.dash { stroke-dasharray: 6 5; }
+
+  #nav { position: fixed; right: 18px; bottom: 14px; z-index: 10; display: flex; gap: 8px; align-items: center; color: #8a8d90; font-size: 13px; }
+  #nav button { background: var(--red); color: #fff; border: 0; border-radius: 7px; font: 700 14px/1 "Red Hat Display", sans-serif; padding: 8px 13px; cursor: pointer; }
+  #nav button:hover { background: #c00000; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div id="stage-wrap">
+<div id="stage">
+
+  <!-- ================= 1 · THE MARKET ================= -->
+  <section class="slide active" id="s1">
+    <div class="eyebrow">1 · The market</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>Is there real demand for this? And is it a content-creation studio, or another AI playground?</p></div>
+    <h1>A studio market, already large, <em>repricing quarterly</em></h1>
+    <div class="body">
+      <div class="col wide center">
+        <ul class="pts big">
+          <li>Category <b>~$5B in 2023 → ~$18.6B</b> projected for 2026.</li>
+          <li><b>Two companies passed $5B</b> valuation inside one year: Higgsfield and Runway.</li>
+          <li><b>Enterprise is the buyer</b>: business went from under a quarter to the majority of Higgsfield revenue in 7 months.</li>
+          <li><b>390 of the Fortune 500</b> use Higgsfield for visual production.</li>
+          <li><b>Agents are the next wave</b>: 42× agentic-usage growth in 3 months.</li>
+        </ul>
+      </div>
+      <div class="col">
+        <div class="tiles">
+          <div class="tile"><em>7 months</em><b>$1.3B → $5.4B</b><i>Higgsfield valuation</i></div>
+          <div class="tile"><em>12 months</em><b>$20M → $700M</b><i>annualized revenue</i></div>
+          <div class="tile"><em>3 months</em><b class="red">42×</b><i>agentic usage</i></div>
+        </div>
+        <div class="card" style="flex:1; display:flex; flex-direction:column;">
+          <h3>Professional AI image &amp; video, category size</h3>
+          <svg viewBox="0 0 520 200" class="fill" role="img" aria-label="Two bars: about five billion in 2023, about eighteen point six billion projected in 2026">
+            <line x1="40" y1="170" x2="500" y2="170" stroke="#33363a"/>
+            <rect x="110" y="126" width="120" height="44" fill="#55595e"/>
+            <text x="170" y="118" text-anchor="middle" fill="#fff" font-size="18" font-weight="700" font-family="Red Hat Display">$5.1B</text>
+            <text x="170" y="190" text-anchor="middle" fill="#8a8d90" font-size="13">2023</text>
+            <rect x="310" y="10" width="120" height="160" fill="#EE0000"/>
+            <text x="370" y="2" dy="0" text-anchor="middle" fill="#fff" font-size="18" font-weight="700" font-family="Red Hat Display" dominant-baseline="hanging" style="opacity:0">.</text>
+            <text x="370" y="34" text-anchor="middle" fill="#fff" font-size="18" font-weight="700" font-family="Red Hat Display">$18.6B</text>
+            <text x="370" y="190" text-anchor="middle" fill="#8a8d90" font-size="13">2026, projected</text>
+            <text x="270" y="100" text-anchor="middle" fill="#ff5252" font-size="14" font-weight="700" font-family="Red Hat Display">≈3.6×</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">Demand is real, it is enterprise, and it is repricing quarterly.</div>
+    <div class="foot"><span>Reuters · FT · PR Newswire, Aug 2026 · Runway Series E, Feb 2026 · AI-video market trackers, 2026 · docs/14-market.md</span><span>1 / 10</span></div>
+  </section>
+
+  <!-- ================= 2 · WHAT THIS IS ================= -->
+  <section class="slide" id="s2">
+    <div class="eyebrow">2 · What this is, in your terms</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>What is graph-based inference, and how is it different from serving a text model?</p></div>
+    <h1>A <em>graph</em> is a spreadsheet. A <em>model</em> is a file the job loads.</h1>
+    <div class="body">
+      <div class="col">
+        <div class="doors">
+          <div class="door"><h3>If you know vLLM</h3><p>In vLLM the model is a <b>deployment</b>: resident weights, one endpoint. In ComfyUI the model (checkpoint) is <b>data</b>: a file this job loads and the next job replaces.</p></div>
+          <div class="door"><h3>If you don't</h3><p>A prompt box is a <b>calculator</b>. A node graph (workflow) is a <b>spreadsheet</b>: change one cell and only the dependents recompute.</p></div>
+        </div>
+        <ul class="pts">
+          <li><b>One job</b>: 10+ reference images, text, a few LoRAs, two or three base models → a 40-node graph → one image.</li>
+          <li><b>Most nodes are not inference.</b> They mask, composite, and wire control signals.</li>
+          <li><b>Templates</b> are graphs someone else built, or you build yourself. The team's catalog of models only grows.</li>
+        </ul>
+      </div>
+      <div class="col">
+        <svg viewBox="0 0 560 118" style="width:100%; height:auto;" role="img" aria-label="Text serving: prompt to engine to tokens. Graph job: many inputs into a graph into one image">
+          <g font-family="Red Hat Text">
+            <text x="0" y="14" fill="#8a8d90" font-size="11" font-weight="700" font-family="Red Hat Display" letter-spacing=".08em">TEXT SERVING (vLLM)</text>
+            <rect x="0" y="24" width="90" height="34" rx="6" fill="#1f2124" stroke="#55595e"/><text x="45" y="45" text-anchor="middle" fill="#fff" font-size="12">prompt</text>
+            <line x1="90" y1="41" x2="112" y2="41" stroke="#8a8d90" stroke-width="2"/>
+            <rect x="112" y="24" width="120" height="34" rx="6" fill="#1f2124" stroke="#55595e"/><text x="172" y="45" text-anchor="middle" fill="#fff" font-size="12">one resident model</text>
+            <line x1="232" y1="41" x2="254" y2="41" stroke="#8a8d90" stroke-width="2"/>
+            <rect x="254" y="24" width="70" height="34" rx="6" fill="#1f2124" stroke="#55595e"/><text x="289" y="45" text-anchor="middle" fill="#fff" font-size="12">tokens</text>
+
+            <text x="0" y="82" fill="#ff5252" font-size="11" font-weight="700" font-family="Red Hat Display" letter-spacing=".08em">ONE GRAPH JOB (ComfyUI)</text>
+            <g fill="#1f2124" stroke="#55595e">
+              <rect x="0" y="90" width="62" height="22" rx="4"/><rect x="66" y="90" width="62" height="22" rx="4"/><rect x="132" y="90" width="62" height="22" rx="4"/><rect x="198" y="90" width="62" height="22" rx="4"/>
+            </g>
+            <g fill="#fff" font-size="9.5" text-anchor="middle">
+              <text x="31" y="105">10+ images</text><text x="97" y="105">text</text><text x="163" y="105">LoRAs</text><text x="229" y="105">2–3 models</text>
+            </g>
+            <line x1="260" y1="101" x2="282" y2="101" stroke="#8a8d90" stroke-width="2"/>
+            <rect x="282" y="88" width="150" height="26" rx="5" fill="#2a1214" stroke="#EE0000" stroke-width="2"/><text x="357" y="105" text-anchor="middle" fill="#fff" font-size="11.5" font-weight="700">40-node graph, per job</text>
+            <line x1="432" y1="101" x2="454" y2="101" stroke="#8a8d90" stroke-width="2"/>
+            <rect x="454" y="88" width="76" height="26" rx="5" fill="#1f2124" stroke="#55595e"/><text x="492" y="105" text-anchor="middle" fill="#fff" font-size="11.5">one image</text>
+          </g>
+        </svg>
+        <div class="shot" style="flex:1; min-height:0;">
+          <img src="../demo-local-canvas.png" alt="The stock ComfyUI canvas (frontend) with the SDXL template loaded and two missing models listed">
+          <span class="pin" style="left:16.7%; top:2.2%">1</span>
+          <span class="pin" style="left:30%; top:37%">2</span>
+          <span class="pin" style="left:86.5%; top:42%">3</span>
+          <span class="pin" style="left:67.5%; top:7%">4</span>
+        </div>
+        <div class="legend"><span><b>1</b>template</span><span><b>2</b>a model (checkpoint) loader node</span><span><b>3</b>missing-models panel</span><span><b>4</b>Run: the only GPU step</span></div>
+      </div>
+    </div>
+    <div class="takeaway">A graph is a spreadsheet; a model is a file. Everything after this follows.</div>
+    <div class="foot"><span>Vocabulary used from here on: model (checkpoint) · graph (workflow) · canvas (frontend) · worker (pod) · docs/13-vllm-omni.md</span><span>2 / 10</span></div>
+  </section>
+
+  <!-- ================= 3 · WHY COMFYUI ================= -->
+  <section class="slide" id="s3">
+    <div class="eyebrow">3 · Open source versus the commercial meter</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>Why ComfyUI, against the commercial tools?</p></div>
+    <h1>The category's open-source leader, <em>missing only its enterprise story</em></h1>
+    <div class="body">
+      <div class="col center">
+        <ul class="pts big">
+          <li><b>4M users, 150k downloads a day, $500M valuation</b>, 60,000+ community nodes.</li>
+          <li>In production at <b>Amazon Studios, Apple, Autodesk, Netflix, Nike, Tencent, Ubisoft</b>.</li>
+          <li>Undercutting a price umbrella with open source on a supported platform is <b>the house strategy</b>.</li>
+          <li><b>“ComfyUI artist” is a job title.</b> Behind the first mostly-AI Super Bowl ad.</li>
+        </ul>
+        <div class="chips"><span>Amazon Studios</span><span>Apple</span><span>Autodesk</span><span>Netflix</span><span>Nike</span><span>Tencent</span><span>Ubisoft</span><span>Pixomondo</span><span>HP</span><span>Lucid</span></div>
+      </div>
+      <div class="col">
+        <table>
+          <tr><th></th><th>Credit-metered SaaS<br><span style="font-weight:400; text-transform:none; letter-spacing:0">Higgsfield · Krea · Runway · Midjourney</span></th><th>ComfyUI, on this pool</th></tr>
+          <tr><td><b>Price</b></td><td>$79–215 per seat per month; video by the second</td><td>Open source; ten designers ~$120–950/mo of GPU</td></tr>
+          <tr><td><b>Models</b></td><td>The vendor's catalog</td><td>Any model (checkpoint), yours or public; 40–120 GB team libraries</td></tr>
+          <tr><td><b>Nodes</b></td><td>The vendor's pipeline</td><td>60,000+ community nodes, arbitrary Python</td></tr>
+          <tr><td><b>Your data</b></td><td>Prompts, models, outputs in the vendor's cloud</td><td><b>Your VPC, your SSO</b>; NDA studios can use it</td></tr>
+          <tr><td><b>Who buys</b></td><td>Studios, agencies, brand teams</td><td>The same buyers, on hardware they already have</td></tr>
+        </table>
+      </div>
+    </div>
+    <div class="takeaway">The tool professionals already use, with no enterprise deployment story. Until now.</div>
+    <div class="foot"><span>comfy.org · Craft Ventures round, Apr 2026 · vendor team-tier pricing, 2026 · README “Against the alternatives”</span><span>3 / 10</span></div>
+  </section>
+
+  <!-- ================= 4 · TODAY ================= -->
+  <section class="slide" id="s4">
+    <div class="eyebrow">4 · How teams run it today</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>Can the expensive machine under each creator's desk be broken up?</p></div>
+    <h1>A card per person, idle most of the day, <em>or one unauthenticated box</em></h1>
+    <div class="body">
+      <div class="col center">
+        <ul class="pts big">
+          <li><b>A $6–8k desktop per seat</b>, idle most of the day. Cloud equivalent: a card each.</li>
+          <li><b>Four of five loop steps never touch a GPU.</b> Only the run step does.</li>
+          <li><b>One shared box</b>: a whole team on one unauthenticated process; any custom node runs as the server.</li>
+          <li><b>NDA studios</b> cannot send frames to a vendor cloud at any price.</li>
+        </ul>
+      </div>
+      <div class="col">
+        <div class="tiles">
+          <div class="tile"><em>per seat</em><b>$6–8k</b><i>a capable desktop</i></div>
+          <div class="tile"><em>ten people, cloud</em><b class="red">~$7,100/mo</b><i>a card each, running</i></div>
+        </div>
+        <div class="card">
+          <h3>The designer's loop, every day</h3>
+          <div class="loop">
+            <div class="step"><b>Load a template</b><span>no GPU</span></div><div class="arrow">→</div>
+            <div class="step"><b>See missing models</b><span>no GPU</span></div><div class="arrow">→</div>
+            <div class="step"><b>Load the models</b><span>no GPU</span></div><div class="arrow">→</div>
+            <div class="step"><b>Wire &amp; fix the graph</b><span>no GPU</span></div><div class="arrow">→</div>
+            <div class="step hot"><b>Run</b><span>~2 min on a GPU</span></div>
+          </div>
+          <p style="margin-top:10px;">Setup between renders takes minutes; the render takes about two. A designer needs a card a small fraction of the day.</p>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">Four of five steps never touch a GPU.</div>
+    <div class="foot"><span>README “What changes for the people using it” · docs/02-cost.md · docs/14-market.md</span><span>4 / 10</span></div>
+  </section>
+
+  <!-- ================= 5 · PROPOSED ================= -->
+  <section class="slide" id="s5">
+    <div class="eyebrow">5 · The proposed state</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>GPUs to the datacenter, frontend untouched?</p></div>
+    <h1>Same application, unchanged. <em>Only the silicon moved.</em></h1>
+    <div class="body" style="flex-direction:column; gap:14px;">
+      <ul class="pts" style="flex-direction:row; flex-wrap:wrap; gap:10px 28px;">
+        <li style="flex:1 1 45%"><b>The application is untouched</b>: stock ComfyUI at a pinned commit, not a wrapper. Same canvas, same loop: template, missing models, one click, run.</li>
+        <li style="flex:1 1 45%"><b>Only GPU access changes</b>: efficient, scalable, and larger than the card under the desk.</li>
+        <li style="flex:1 1 45%"><b>Models pulled once</b> to shared storage at datacenter bandwidth. They outlive the workers.</li>
+        <li style="flex:1 1 45%"><b>Workers scale from zero to N</b> on queue depth, pods and nodes both.</li>
+      </ul>
+      <div class="card hub" data-hub="full" style="flex:1; display:flex; flex-direction:column;"><h3>The shape: hub and spoke, workers unreachable by design</h3></div>
+    </div>
+    <div class="takeaway">Same application. Only the silicon moved.</div>
+    <div class="foot"><span>docs/06-enterprise-architecture.md · README “How it fits together”</span><span>5 / 10</span></div>
+  </section>
+
+  <!-- ================= 6 · SPEND ================= -->
+  <section class="slide" id="s6">
+    <div class="eyebrow">6 · Efficient GPU spend</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>What actually drives GPU cost for this workload?</p></div>
+    <h1>Pooling is <em>queueing</em>, not division</h1>
+    <div class="body">
+      <div class="col">
+        <ul class="pts">
+          <li><b>Ten designers</b>: ~$7,100 a month as a card each; <b>$120–950</b> as one pool.</li>
+          <li><b>Savings widen with headcount</b>: 33% at five people, 64% at thirty.</li>
+          <li><b>Scale-to-zero means zero nodes</b>, not zero pods. Only the node layer saves money.</li>
+        </ul>
+        <div class="card" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+          <h3>Ten designers, monthly GPU line</h3>
+          <svg viewBox="0 0 520 180" class="fill" role="img" aria-label="Three bars: a card each about 7,100 dollars; the pool at light use about 120; the pool with a warm floor about 950">
+            <line x1="20" y1="150" x2="500" y2="150" stroke="#33363a"/>
+            <rect x="50" y="20" width="110" height="130" fill="#55595e"/>
+            <text x="105" y="12" text-anchor="middle" fill="#fff" font-size="17" font-weight="700" font-family="Red Hat Display">~$7,100</text>
+            <text x="105" y="168" text-anchor="middle" fill="#8a8d90" font-size="12">a card each</text>
+            <rect x="205" y="147.8" width="110" height="2.2" fill="#EE0000"/>
+            <text x="260" y="138" text-anchor="middle" fill="#ff5252" font-size="17" font-weight="700" font-family="Red Hat Display">~$120</text>
+            <text x="260" y="168" text-anchor="middle" fill="#8a8d90" font-size="12">one pool, light use</text>
+            <rect x="360" y="132.6" width="110" height="17.4" fill="#EE0000"/>
+            <text x="415" y="122" text-anchor="middle" fill="#ff5252" font-size="17" font-weight="700" font-family="Red Hat Display">~$950</text>
+            <text x="415" y="168" text-anchor="middle" fill="#8a8d90" font-size="12">pool, 5-worker warm floor</text>
+          </svg>
+        </div>
+      </div>
+      <div class="col">
+        <div class="card">
+          <h3>Concurrent workers grow far slower than headcount</h3>
+          <table class="small">
+            <tr><th class="num">Team</th><th class="num">Concurrent workers</th><th class="num">Pool, warm 9–6</th><th class="num">A card each</th><th class="num">Savings</th></tr>
+            <tr><td class="num">5</td><td class="num">3</td><td class="num">$3.99/hr</td><td class="num">$5.94/hr</td><td class="num"><b>33%</b></td></tr>
+            <tr class="hl"><td class="num"><b>10</b></td><td class="num">5</td><td class="num">$5.94/hr</td><td class="num">$10.82/hr</td><td class="num"><b>45%</b></td></tr>
+            <tr><td class="num">15</td><td class="num">6</td><td class="num">$6.92/hr</td><td class="num">$15.70/hr</td><td class="num"><b>56%</b></td></tr>
+            <tr><td class="num">20</td><td class="num">8</td><td class="num">$8.87/hr</td><td class="num">$20.58/hr</td><td class="num"><b>57%</b></td></tr>
+            <tr><td class="num">30</td><td class="num">10</td><td class="num">$10.82/hr</td><td class="num">$30.34/hr</td><td class="num"><b>64%</b></td></tr>
+          </table>
+          <p style="margin-top:8px; font-size:12.5px;">Both columns include the $1.06/hr cluster floor and $0.976/hr per L4. Average queue wait held under ~30 s.</p>
+        </div>
+        <div class="card honest">
+          <h3>Where this loses, honestly</h3>
+          <p><b>Cold start</b> of 8–17 min when nothing is warm (the warm floor is a setting, ~$190/mo per card). <b>Custom nodes</b> need an image rebuild, not a click. Both priced in the README, “Where this loses”.</p>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway">Doubling the team does not double the overlap.</div>
+    <div class="foot"><span>README “The number” and “Sizing the pool” · docs/02-cost.md · g6.xlarge (L4 24 GB) at $0.976/h all-in</span><span>6 / 10</span></div>
+  </section>
+
+  <!-- ================= 7 · CATALOG ================= -->
+  <section class="slide" id="s7">
+    <div class="eyebrow">7 · Scaling as the catalog grows</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>Why not simply serve every model behind an engine?</p></div>
+    <h1>Residency scales with <em>catalog size</em>. The pool scales with <em>concurrency</em>.</h1>
+    <div class="body">
+      <div class="col wide">
+        <div class="card" style="flex:1; display:flex; flex-direction:column;">
+          <h3>Ten people, growing model library — monthly GPU cost</h3>
+          <svg viewBox="0 0 760 470" class="fill" role="img" aria-label="Residency climbs a staircase per model; the pool stays flat">
+            <g stroke="#33363a" stroke-width="1"><line x1="60" y1="410" x2="740" y2="410"/><line x1="60" y1="280" x2="740" y2="280"/><line x1="60" y1="150" x2="740" y2="150"/><line x1="60" y1="20" x2="740" y2="20"/></g>
+            <g font-size="12" fill="#8a8d90" text-anchor="end"><text x="52" y="414">$0</text><text x="52" y="284">$5k</text><text x="52" y="154">$10k</text><text x="52" y="24">$15k</text></g>
+            <g font-size="12" fill="#8a8d90" text-anchor="middle"><text x="60" y="430">0</text><text x="196" y="430">2</text><text x="332" y="430">4</text><text x="468" y="430">6</text><text x="604" y="430">8</text><text x="740" y="430">10</text></g>
+            <text x="400" y="454" font-size="13" fill="#c4c7ca" text-anchor="middle">distinct base models the team's templates touch</text>
+            <rect x="60" y="354.1" width="680" height="35.4" fill="#8a8d90" opacity=".22"/>
+            <text x="736" y="348" font-size="12" fill="#b8bbbe" text-anchor="end">credit-metered SaaS, ten seats: $790–2,150 (usage-capped)</text>
+            <rect x="60" y="385.3" width="680" height="21.6" fill="#ffffff" opacity=".9"/>
+            <text x="100" y="400.5" font-size="12.5" font-weight="700" fill="#111">the pool: $120–950 — flat against the catalog</text>
+            <polyline points="60,410 196,372.9 332,335.8 468,298.8 604,261.7 740,224.6" fill="none" stroke="#EE0000" stroke-width="3.5"/>
+            <g fill="#EE0000"><circle cx="196" cy="372.9" r="4.5"/><circle cx="332" cy="335.8" r="4.5"/><circle cx="468" cy="298.8" r="4.5"/><circle cx="604" cy="261.7" r="4.5"/><circle cx="740" cy="224.6" r="4.5"/></g>
+            <text x="600" y="242" font-size="13" font-weight="700" fill="#ff5252" text-anchor="end">an engine per model (L4): +$713/mo each</text>
+            <polyline points="60,410 196,332.9 332,255.8 468,178.7 604,101.5 740,24.4" fill="none" stroke="#ff5252" stroke-width="3" stroke-dasharray="8 6"/>
+            <text x="560" y="86" font-size="13" font-weight="700" fill="#ff5252" text-anchor="end">as models go video-class (L40S): +$1,483/mo each</text>
+            <line x1="60" y1="20" x2="60" y2="410" stroke="#8a8d90" stroke-width="1.5"/><line x1="60" y1="410" x2="740" y2="410" stroke="#8a8d90" stroke-width="1.5"/>
+          </svg>
+        </div>
+      </div>
+      <div class="col narrow center">
+        <ul class="pts big">
+          <li><b>Residency</b> scales with catalog size. <b>The pool</b> scales with concurrency.</li>
+          <li>The marginal model costs <b>a machine</b> on a serving tier and <b>disk</b> on the pool.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="takeaway">The marginal model costs a machine on an engine, a disk on the pool.</div>
+    <div class="foot"><span>docs/13-vllm-omni.md “The catalog curve” · docs/02-cost.md rates: L4 $713/mo, L40S $1,483/mo</span><span>7 / 10</span></div>
+  </section>
+
+  <!-- ================= 8 · THE REPO ================= -->
+  <section class="slide" id="s8">
+    <div class="eyebrow">8 · What the repo delivers</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>What does this provide beyond the existing Omni–ComfyUI integration?</p></div>
+    <h1>The production layer: <em>queue, isolation, storage, scale</em></h1>
+    <div class="body" style="flex-direction:column; gap:14px;">
+      <ul class="pts" style="flex-direction:row; flex-wrap:wrap; gap:10px 28px;">
+        <li style="flex:1 1 45%"><b>Browser → gateway over WebSocket, gateway → workers over a Redis queue</b> that places each job by declared VRAM tier (L4 today; L40S, H100 as jobs grow). No browser ever touches a worker, so workers can vanish mid-job and scale to zero.</li>
+        <li style="flex:1 1 45%"><b>Common storage, least friction</b>: a model pulled once is there for everyone. Outputs outlive the worker and the cluster.</li>
+        <li style="flex:1 1 45%"><b>Storage not shared</b>: models to S3 with node-local hot copies, outputs to S3. Same shape, several hundred designers, low hundreds of GPUs, no rewrite.</li>
+        <li style="flex:1 1 45%"><b>Workers unreachable by design</b>: ComfyUI on loopback, no Service, no Route, default-deny. Cluster SSO, audit log, showback, quota.</li>
+      </ul>
+      <div class="card hub" data-hub="transport" style="flex:1; display:flex; flex-direction:column;"><h3>The same shape — the transport highlighted</h3></div>
+    </div>
+    <div class="takeaway">Workers are unreachable, replaceable, and scale to zero.</div>
+    <div class="foot"><span>github.com/redhat-et/comfyui-on-openshift · docs/06 architecture · docs/11-scaling.md “The bottleneck is storage, not GPUs”</span><span>8 / 10</span></div>
+  </section>
+
+  <!-- ================= 9 · OMNI ================= -->
+  <section class="slide" id="s9">
+    <div class="eyebrow">9 · Where vLLM Omni fits</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>Where does the strategic inference engine fit? Does any of this stray into the application layer?</p></div>
+    <h1>Two tiers, one stack. <em>Showback decides</em> when a model moves.</h1>
+    <div class="body" style="flex-direction:column; gap:12px;">
+      <div style="display:flex; gap:24px;">
+        <ul class="pts" style="flex:1.6; font-size:16px; gap:8px;">
+          <li><b>The engine is the throughput tier. The pool is the flexibility tier.</b></li>
+          <li><b>Promote</b> a model when showback shows it dominating GPU-seconds at sustained duty.</li>
+          <li><b>ComfyUI stays upstream's app.</b> This repo is deployment wiring only.</li>
+          <li><b>Omni joins the canvas as one more node.</b> The bridge already does this, so the two tiers compose today with no new integration.</li>
+        </ul>
+        <div class="card" style="flex:1;">
+          <h3>Showback: GPU-seconds per model, one month</h3>
+          <svg viewBox="0 0 300 120" style="width:100%; height:92px; display:block;" role="img" aria-label="Nine short bars and one tall bar: the tall one gets an engine">
+            <line x1="10" y1="100" x2="290" y2="100" stroke="#33363a"/>
+            <g fill="#55595e"><rect x="16" y="82" width="20" height="18"/><rect x="44" y="88" width="20" height="12"/><rect x="72" y="76" width="20" height="24"/><rect x="100" y="90" width="20" height="10"/><rect x="156" y="84" width="20" height="16"/><rect x="184" y="92" width="20" height="8"/><rect x="212" y="80" width="20" height="20"/><rect x="240" y="86" width="20" height="14"/><rect x="268" y="90" width="20" height="10"/></g>
+            <rect x="128" y="14" width="20" height="86" fill="#EE0000"/>
+            <text x="138" y="9" text-anchor="middle" fill="#ff5252" font-size="10" font-weight="700" font-family="Red Hat Display">→ ENGINE</text>
+            <text x="150" y="114" text-anchor="middle" fill="#8a8d90" font-size="9.5">the rest stay files on the pool</text>
+          </svg>
+        </div>
+      </div>
+      <div class="card hub" data-hub="omni" style="flex:1; display:flex; flex-direction:column;"><h3>The same shape — the engine beside the pool</h3></div>
+    </div>
+    <div class="takeaway">Two tiers, one stack. Showback decides when a model moves.</div>
+    <div class="foot"><span>docs/13-vllm-omni.md “The composition rule” · github.com/dougbtv/comfyui-vllm-omni · GET /api/showback</span><span>9 / 10</span></div>
+  </section>
+
+  <!-- ================= 10 · CLOSE ================= -->
+  <section class="slide" id="s10">
+    <div class="eyebrow">10 · Why Red Hat</div>
+    <div class="heard"><span class="hl">The question on the table</span><p>Why is this ours to do?</p></div>
+    <h1>Red Hat is the best place to run ComfyUI</h1>
+    <div class="body">
+      <div class="col wide center">
+        <ul class="pts big">
+          <li>An <b>$18B category</b> whose open-source leader has no enterprise deployment story. Untapped, and tripling in three years.</li>
+          <li><b>OpenShift already had the parts</b>: NVIDIA GPU Operator, cluster SSO, machine pools that scale to zero, network policy, audit. This repo is the wiring.</li>
+          <li><b>The same application, unchanged</b>, fitted to real studio workflows, cost-effective on constrained GPUs.</li>
+          <li><b>Inference at Red Hat needs a graph-input answer</b> beside the text-input one. The pool is that answer, and the on-ramp to Omni.</li>
+        </ul>
+      </div>
+      <div class="col narrow center">
+        <div class="stack">
+          <div><b>ComfyUI</b>upstream, pinned, unchanged</div>
+          <div class="hot"><b>The pool — this repo</b>queue · isolation · storage · showback</div>
+          <div><b>OpenShift</b>SSO · machine pools to zero · network policy · audit</div>
+          <div><b>NVIDIA GPU Operator</b>L4 today · L40S, H100 as jobs grow</div>
+        </div>
+      </div>
+    </div>
+    <div class="takeaway thesis">The graph-input half of inference, on the platform we already sell.</div>
+    <div class="foot"><span>docs/14-market.md · README “Why this platform, specifically”</span><span>10 / 10</span></div>
+  </section>
+
+  <!-- ================= APPENDIX A1 ================= -->
+  <section class="slide" id="a1">
+    <div class="eyebrow">Appendix A1 · Against the alternatives</div>
+    <h1 style="font-size:26px;">Every way to give a team ComfyUI, side by side</h1>
+    <div class="body">
+      <table class="small" style="align-self:flex-start;">
+        <tr><th></th><th>Cost at 10 users</th><th>SSO + audit</th><th>RCE containment</th><th>Custom nodes</th><th>Who operates it</th><th>Your VPC</th></tr>
+        <tr><td><b>Shared box, <code>--multi-user</code></b></td><td>one card, always on; ten queue on one process</td><td>none</td><td>none: any node runs as the server</td><td>live, for everyone</td><td>whoever owns the box</td><td>yours</td></tr>
+        <tr><td><b>A pod or VM per person</b></td><td>a card each, ~$7,100/mo</td><td>whatever you bolt on, ten times</td><td>one blast radius per person</td><td>per person, live</td><td>you, ten times</td><td>yours</td></tr>
+        <tr><td><b>Serverless ComfyUI (RunPod, Modal)</b></td><td>per-second with markup</td><td>the vendor's keys, not your IdP</td><td>the vendor's</td><td>your image; rebuild</td><td>the vendor</td><td>no</td></tr>
+        <tr><td><b>Hosted ComfyDeploy / ViewComfy / Comfy Cloud</b></td><td>per seat or per second</td><td>the vendor's login</td><td>the vendor's</td><td>the vendor's catalog</td><td>the vendor</td><td>no</td></tr>
+        <tr><td><b>Credit-metered SaaS</b></td><td>$79–215/seat/mo; video by the second</td><td>vendor login; SSO on enterprise plans</td><td>n/a, closed</td><td>no</td><td>the vendor</td><td>no</td></tr>
+        <tr><td><b>Generic Kubernetes Helm chart</b></td><td>a card per replica, always on</td><td>whatever ingress auth you add</td><td>a reachable Service by default</td><td>your image</td><td>you: cluster, driver, app</td><td>yours</td></tr>
+        <tr><td><b>KServe / Ray Serve</b></td><td>a resident GPU per served model</td><td>the platform's</td><td>the serving container</td><td>the model is the unit, not the graph</td><td>you, plus the serving stack</td><td>yours</td></tr>
+        <tr class="hl"><td><b>This repo</b></td><td><b>~$120–950/mo</b> + $1.06/h floor</td><td><b>cluster SSO; every grant audited</b></td><td><b>loopback, no Service, no Route, default-deny</b></td><td>baked into the image; a rebuild</td><td><b>one namespace</b>; the platform pages for the rest</td><td><b>yours</b></td></tr>
+      </table>
+    </div>
+    <div class="foot"><span>README “Against the alternatives”, condensed · the two places this loses are in its own row</span><span>A1</span></div>
+  </section>
+
+  <!-- ================= APPENDIX A2 ================= -->
+  <section class="slide" id="a2">
+    <div class="eyebrow">Appendix A2 · The cost ladder</div>
+    <h1 style="font-size:26px;">Every rung is one command with a known return time</h1>
+    <div class="body">
+      <div class="col">
+        <div class="card">
+          <h3>Smallest useful cluster: one ComfyUI worker on an L4, us-east-2</h3>
+          <table>
+            <tr><th>State</th><th class="num">$/hour</th><th>Getting back</th></tr>
+            <tr><td><b>Running</b></td><td class="num">~2.04</td><td>—</td></tr>
+            <tr><td><b>GPU parked</b> (<code>make park</code>)</td><td class="num">~1.06</td><td>~5 min</td></tr>
+            <tr><td><b>Cluster torn down</b> (<code>make down</code>)</td><td class="num">~0.05</td><td>~15 min</td></tr>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Rates behind every number in the deck</h3>
+          <p><b>g6.xlarge</b> (L4 24 GB) $0.976/h all-in: $0.805 to AWS, $0.171 to Red Hat. <b>g6e.xlarge</b> (L40S) $2.03/h. Cluster floor $1.06/h ≈ $775/mo. Per L4 per month: <b>$713</b>.</p>
+        </div>
+      </div>
+      <div class="col">
+        <div class="card">
+          <h3>Habit, monthly</h3>
+          <table>
+            <tr><th>Pattern</th><th class="num">Monthly</th></tr>
+            <tr><td>Left running 24/7</td><td class="num">~$1,490</td></tr>
+            <tr><td>Weekdays 9–6, <code>make park</code> nightly</td><td class="num">~$965</td></tr>
+            <tr class="hl"><td><b>Weekdays 9–6, <code>make down</code> nightly</b></td><td class="num"><b>~$425</b></td></tr>
+            <tr><td>Up one day a week</td><td class="num">~$114</td></tr>
+          </table>
+          <p style="margin-top:8px;">A single cron line is a <b>~70% cut</b>. The 15-minute rebuild is what makes teardown a habit rather than a heroic act.</p>
+        </div>
+        <div class="card">
+          <h3>The warm floor</h3>
+          <p><b>WARM_WORKERS=5</b>, weekdays 9–6: ~$190/mo per warm card. KEDA takes the max across the cron and queue triggers, so a busy afternoon still bursts past the floor.</p>
+        </div>
+      </div>
+    </div>
+    <div class="foot"><span>docs/02-cost.md · README “The cost ladder”</span><span>A2</span></div>
+  </section>
+
+  <!-- ================= APPENDIX A3 ================= -->
+  <section class="slide" id="a3">
+    <div class="eyebrow">Appendix A3 · Sources</div>
+    <h1 style="font-size:26px;">Every number on these slides is backed in the repository</h1>
+    <div class="body">
+      <div class="col">
+        <ul class="pts" style="gap:8px;">
+          <li style="font-size:15px"><b>Higgsfield</b> valuation, revenue, agentic growth, customer mix, Fortune 500 count: Reuters, Financial Times, PR Newswire, Aug 2026.</li>
+          <li style="font-size:15px"><b>Runway</b> Series E, $315M at $5.3B, ~$300M annualized revenue: press coverage, Feb 2026.</li>
+          <li style="font-size:15px"><b>Category size</b> $5.1B (2023) → $18.6B (2026, projected): AI-video market trackers, 2026.</li>
+          <li style="font-size:15px"><b>ComfyUI</b> raise and valuation: Craft Ventures round, Apr 2026; users, downloads, node count: raise announcement; adopters: comfy.org.</li>
+          <li style="font-size:15px"><b>Comfy MCP</b>, official hosted + open-source local server: comfy.org/mcp, June 30, 2026.</li>
+          <li style="font-size:15px"><b>SaaS pricing</b>: vendor team-tier pricing pages, 2026; Runway credit schedule.</li>
+        </ul>
+      </div>
+      <div class="col">
+        <ul class="pts" style="gap:8px;">
+          <li style="font-size:15px"><b>Cost model</b>, every rate and monthly figure: <code>docs/02-cost.md</code>; sizing tables: README “Sizing the pool”.</li>
+          <li style="font-size:15px"><b>Catalog curve</b> and the composition rule: <code>docs/13-vllm-omni.md</code>.</li>
+          <li style="font-size:15px"><b>Architecture</b>, WebSocket and Redis streams, unreachable workers: <code>docs/06-enterprise-architecture.md</code>.</li>
+          <li style="font-size:15px"><b>Scaling to hundreds</b>, storage ladder: <code>docs/11-scaling.md</code>.</li>
+          <li style="font-size:15px"><b>Market case</b>: <code>docs/14-market.md</code>. <b>Comparison table</b>: README “Against the alternatives”.</li>
+          <li style="font-size:15px"><b>The long deck</b>, six slides with the demo on video: <code>docs/pitch/</code>.</li>
+        </ul>
+      </div>
+    </div>
+    <div class="foot"><span>github.com/redhat-et/comfyui-on-openshift</span><span>A3</span></div>
+  </section>
+
+</div>
+</div>
+
+<div id="nav">
+  <span id="counter">1 / 13</span>
+  <button id="prev" aria-label="Previous slide">←</button>
+  <button id="next" aria-label="Next slide">→</button>
+</div>
+
+<script>
+  // One picture, learned once: the hub-and-spoke is drawn identically on
+  // slides 5, 8 and 9; only the red highlight moves.
+  function hub(mode) {
+    const T = mode === "transport", O = mode === "omni";
+    const dim = (k) => (O && k !== "w") ? " dim" : "";
+    const box = (x, k, title, sub, cls) =>
+      `<rect class="box ${cls || ""}${T && k === "w" ? " hot" : ""}${dim(k)}" x="${x}" y="30" width="160" height="80" rx="9"/>` +
+      `<text class="t${dim(k)}" x="${x + 80}" y="58" text-anchor="middle">${title}</text>` +
+      sub.map((s, i) => `<text class="s${dim(k)}" x="${x + 80}" y="${76 + i * 14}" text-anchor="middle">${s}</text>`).join("");
+    const link = (x1, x2, hot, label, k) =>
+      `<line class="link${hot ? " hot" : ""}${dim(k)}" x1="${x1}" y1="70" x2="${x2}" y2="70" marker-end="url(#ah${hot ? "r" : ""})"/>` +
+      (label ? `<text class="lbl${hot ? " hot" : ""}${dim(k)}" x="${(x1 + x2) / 2}" y="20" text-anchor="middle">${label}</text>` : "");
+    let s = `<svg viewBox="0 0 1160 ${O ? 292 : 262}" role="img" aria-label="Browser to route and SSO to gateway to Redis to GPU workers, KEDA scaling the workers, shared storage beneath">
+      <defs>
+        <marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8a8d90"/></marker>
+        <marker id="ahr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#EE0000"/></marker>
+      </defs>`;
+    s += box(0, "b", "Browser", ["canvas (frontend)", "stock ComfyUI"]);
+    s += box(200, "r", "Route + SSO", ["oauth-proxy", "namespace role"]);
+    s += box(400, "g", "Gateway", ["FastAPI, CPU nodes", "showback · quota"]);
+    s += box(600, "q", "Redis", ["queue + progress", "stream, replayable"]);
+    s += box(800, "w", "GPU workers 0..N", ["ComfyUI on loopback", "no Service, no Route"], "sealed");
+    s += box(1000, "k", "KEDA + machine pool", ["on queue depth:", "pods and nodes to zero"]);
+    s += link(160, 198, T, "WebSocket", "b");
+    s += link(360, 398, T, "", "r");
+    s += link(560, 598, T, "jobs", "g");
+    s += link(760, 798, T, "Redis queue", "q");
+    // KEDA scales the workers: an arc over the top, so the lower half stays free
+    s += `<path class="link dash${dim("k")}" d="M1060,30 C1060,14 900,14 900,28" marker-end="url(#ah)"/><text class="lbl${dim("k")}" x="980" y="11" text-anchor="middle">scales on queue depth</text>`;
+    // storage
+    s += `<line class="link${T ? " hot" : ""}${dim("w")}" x1="860" y1="110" x2="860" y2="188" marker-end="url(#ah${T ? "r" : ""})"/>`;
+    s += `<rect class="box${T ? " hot" : ""}${dim("s")}" x="480" y="190" width="435" height="66" rx="9"/>
+          <text class="t${dim("s")}" x="697" y="213" text-anchor="middle">Shared storage</text>
+          <text class="s${dim("s")}" x="697" y="231" text-anchor="middle">models (checkpoints) pulled once for everyone · outputs outlive the workers</text>
+          <text class="s${dim("s")}" x="697" y="246" text-anchor="middle">at hundreds of designers: models and outputs on S3, node-local hot copies</text>`;
+    s += `<path class="link dash${dim("s")}" d="M480,225 L440,225 L440,112" marker-end="url(#ah)"/><text class="lbl${dim("s")}" x="432" y="160" text-anchor="end">read-only</text>`;
+    if (O) {
+      s += `<rect class="box hot" x="1000" y="190" width="160" height="80" rx="9"/>
+            <text class="t" x="1080" y="218" text-anchor="middle">vLLM Omni engine</text>
+            <text class="s" x="1080" y="236" text-anchor="middle">one model, resident</text>
+            <text class="s" x="1080" y="250" text-anchor="middle">behind an API</text>
+            <path class="link" d="M945,110 L945,150 L1080,150 L1080,188" fill="none" marker-end="url(#ah)"/>
+            <text class="lbl" x="1012" y="143" text-anchor="middle">bridge node</text>
+            <line class="link hot" x1="915" y1="222" x2="998" y2="222" marker-end="url(#ahr)"/>
+            <text class="lbl hot" x="956" y="211" text-anchor="middle">promote</text>
+            <text class="s" x="956" y="240" text-anchor="middle">on showback</text>
+            <text class="s" x="1080" y="286" text-anchor="middle" fill="#8a8d90">the marginal model: a machine here, a disk on the pool</text>`;
+    }
+    return s + "</svg>";
+  }
+  document.querySelectorAll(".hub").forEach((el) => { el.insertAdjacentHTML("beforeend", hub(el.dataset.hub)); });
+
+  const slides = Array.from(document.querySelectorAll(".slide"));
+  let current = 0;
+  function show(index) {
+    current = Math.max(0, Math.min(slides.length - 1, index));
+    slides.forEach((slide, i) => slide.classList.toggle("active", i === current));
+    document.getElementById("counter").textContent = (current + 1) + " / " + slides.length;
+  }
+  window.show = show;
+  let fitFrozen = false;
+  function fit() {
+    if (fitFrozen) return;
+    const scale = Math.min(innerWidth / 1320, innerHeight / 770);
+    document.getElementById("stage").style.transform = "scale(" + Math.min(scale, 1.4) + ")";
+  }
+  // #3 opens on slide 3; #3x freezes the stage for a pixel-exact capture
+  // (nav hidden, no scaling) — what export.py drives.
+  const deep = location.hash.match(/^#(\d+)(x?)$/);
+  if (deep) {
+    show(parseInt(deep[1], 10) - 1);
+    if (deep[2]) {
+      fitFrozen = true;
+      document.getElementById("nav").style.display = "none";
+      document.getElementById("stage-wrap").style.position = "static";
+      document.getElementById("stage-wrap").style.display = "block";
+      document.getElementById("stage").style.transform = "none";
+    }
+  }
+  document.getElementById("next").onclick = () => show(current + 1);
+  document.getElementById("prev").onclick = () => show(current - 1);
+  addEventListener("keydown", (event) => {
+    if (event.key === "ArrowRight" || event.key === " " || event.key === "PageDown") show(current + 1);
+    if (event.key === "ArrowLeft" || event.key === "PageUp") show(current - 1);
+  });
+  addEventListener("resize", fit);
+  fit();
+</script>
+</body>
+</html>

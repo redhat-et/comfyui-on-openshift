@@ -6,6 +6,8 @@ does to enable it, the pool running live on a laptop, the one-sentence
 economics — *residency scales with catalog size; the pool scales with
 concurrency* — and where vLLM Omni fits.
 
+**The short version** — the same questions in ten light slides, bullets and one picture each, with a three-slide appendix for Q&A: [`brief/`](brief/README.md) ([PDF](brief/comfyui-on-openshift-brief.pdf), [live](brief/index.html)).
+
 *(GitHub renders this page when you browse the folder — the deck below is
 the deck. For presenting: [`index.html`](index.html) is the live version,
 arrow keys to navigate; [`comfyui-on-openshift-pitch.pdf`](comfyui-on-openshift-pitch.pdf)
