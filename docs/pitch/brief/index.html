@@ -172,17 +172,17 @@
   <section class="slide" id="s2">
     <div class="eyebrow">2 · What this is, in your terms</div>
     <div class="heard"><span class="hl">The question on the table</span><p>What is graph-based inference, and how is it different from serving a text model?</p></div>
-    <h1>A <em>graph</em> is a spreadsheet. A <em>model</em> is a file the job loads.</h1>
+    <h1>A <em>graph</em> is a production line. A <em>model</em> is a part on the shelf.</h1>
     <div class="body">
       <div class="col">
         <div class="doors">
-          <div class="door"><h3>If you know vLLM</h3><p>In vLLM the model is a <b>deployment</b>: resident weights, one endpoint. In ComfyUI the model (checkpoint) is <b>data</b>: a file this job loads and the next job replaces.</p></div>
-          <div class="door"><h3>If you don't</h3><p>A prompt box is a <b>calculator</b>. A node graph (workflow) is a <b>spreadsheet</b>: change one cell and only the dependents recompute.</p></div>
+          <div class="door"><h3>If you know vLLM</h3><p>In vLLM the model is a <b>deployment</b>: resident weights, one endpoint. In ComfyUI the model (checkpoint) is a <b>part</b>: pulled from the shelf for this job, swapped for the next.</p></div>
+          <div class="door"><h3>If you don't</h3><p>A prompt box is a <b>vending machine</b>. A node graph (workflow) is a <b>production line</b>: dozens of stations; change one, and only that one reruns.</p></div>
         </div>
         <ul class="pts">
           <li><b>One job</b>: 10+ reference images, text, a few LoRAs, two or three base models → a 40-node graph → one image.</li>
           <li><b>Most nodes are not inference.</b> They mask, composite, and wire control signals.</li>
-          <li><b>Templates</b> are graphs someone else built, or you build yourself. The team's catalog of models only grows.</li>
+          <li><b>Templates</b> are graphs someone else built, or you build yourself. The team's shelf of models only grows.</li>
         </ul>
       </div>
       <div class="col">
@@ -218,7 +218,7 @@
         <div class="legend"><span><b>1</b>template</span><span><b>2</b>a model (checkpoint) loader node</span><span><b>3</b>missing-models panel</span><span><b>4</b>Run: the only GPU step</span></div>
       </div>
     </div>
-    <div class="takeaway">A graph is a spreadsheet; a model is a file. Everything after this follows.</div>
+    <div class="takeaway">A graph is a production line; a model is a part on the shelf. Everything after this follows.</div>
     <div class="foot"><span>Vocabulary used from here on: model (checkpoint) · graph (workflow) · canvas (frontend) · worker (pod) · docs/13-vllm-omni.md</span><span>2 / 10</span></div>
   </section>
 
@@ -297,7 +297,7 @@
       <ul class="pts" style="flex-direction:row; flex-wrap:wrap; gap:10px 28px;">
         <li style="flex:1 1 45%"><b>The application is untouched</b>: stock ComfyUI at a pinned commit, not a wrapper. Same canvas, same loop: template, missing models, one click, run.</li>
         <li style="flex:1 1 45%"><b>Only GPU access changes</b>: efficient, scalable, and larger than the card under the desk.</li>
-        <li style="flex:1 1 45%"><b>Models pulled once</b> to shared storage at datacenter bandwidth. They outlive the workers.</li>
+        <li style="flex:1 1 45%"><b>One parts shelf for the whole floor</b>: models pulled once, at datacenter bandwidth, and they outlive the workers.</li>
         <li style="flex:1 1 45%"><b>Workers scale from zero to N</b> on queue depth, pods and nodes both.</li>
       </ul>
       <div class="card hub" data-hub="full" style="flex:1; display:flex; flex-direction:column;"><h3>The shape: hub and spoke, workers unreachable by design</h3></div>
@@ -365,7 +365,7 @@
     <div class="body">
       <div class="col wide">
         <div class="card" style="flex:1; display:flex; flex-direction:column;">
-          <h3>Ten people, growing model library — monthly GPU cost</h3>
+          <h3>Ten people, a growing shelf of models — monthly GPU cost</h3>
           <svg viewBox="0 0 760 470" class="fill" role="img" aria-label="Residency climbs a staircase per model; the pool stays flat">
             <g stroke="#33363a" stroke-width="1"><line x1="60" y1="410" x2="740" y2="410"/><line x1="60" y1="280" x2="740" y2="280"/><line x1="60" y1="150" x2="740" y2="150"/><line x1="60" y1="20" x2="740" y2="20"/></g>
             <g font-size="12" fill="#8a8d90" text-anchor="end"><text x="52" y="414">$0</text><text x="52" y="284">$5k</text><text x="52" y="154">$10k</text><text x="52" y="24">$15k</text></g>
