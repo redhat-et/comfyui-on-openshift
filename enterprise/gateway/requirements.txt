@@ -21,6 +21,6 @@
 # run_in_threadpool), none of which either project has deprecated within
 # their 0.x lines, and a minor ceiling was a rebuild that silently stopped
 # resolving every few months for no code reason.
-fastapi>=0.115,<1
-uvicorn[standard]>=0.32,<1
-redis>=5.2,<7
+fastapi>=0.141.1,<1
+uvicorn[standard]>=0.52.4,<1
+redis>=8.1.0,<9
