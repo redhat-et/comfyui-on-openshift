@@ -82,7 +82,7 @@
         <li>A pool of GPUs takes the jobs. Idle? <b>Zero machines.</b></li>
         <li>Models download once, to shared storage.</li>
       </ul>
-      <figure><svg data-draw="arch" viewBox="0 0 520 510" role="img" aria-label="Designers sign in through SSO to a gateway, which puts jobs on a queue; a row of GPU workers, scaling from zero to N, takes them; shared model storage sits underneath"></svg></figure>
+      <figure><svg data-draw="arch" viewBox="0 0 520 530" role="img" aria-label="Designers sign in through SSO to a gateway, which puts jobs on a queue; a row of GPU workers, scaling from zero to N, takes them; every worker reads and writes one shared storage volume underneath, and only the gateway pulls models onto it"></svg></figure>
     </div>
     <div class="foot"><span>ComfyUI on OpenShift</span><span>2 / 6</span></div>
   </section>
@@ -96,7 +96,7 @@
         <li>No internet out: models come in through the gateway, checked.</li>
         <li>Company SSO at the door. GPU time metered per person.</li>
       </ul>
-      <figure><svg data-draw="safe" viewBox="0 0 520 510" role="img" aria-label="The same diagram, with a red dashed line around the GPU workers marked unreachable; the queue is the only arrow that crosses it"></svg></figure>
+      <figure><svg data-draw="safe" viewBox="0 0 520 530" role="img" aria-label="The same diagram, with a red dashed line around the GPU workers marked unreachable; the queue is the only way in, and models reach the shared storage only through the gateway, checked"></svg></figure>
     </div>
     <div class="foot"><span>ComfyUI on OpenShift</span><span>3 / 6</span></div>
   </section>
@@ -176,14 +176,16 @@
     s += D.text(334, 266, "queue", "grey", "start");
     s += D.arrow(240, 278, 240, 344, safe ? "red" : "");
     s += D.text(254, 312, safe ? "the only way in" : "scales 0 → N", safe ? "red" : "grey", "start");
-    [44, 152, 260].forEach((x) => { s += D.box(x, 346, 96, 54) + D.text(x + 48, 380, "GPU", "bold"); });
-    s += D.box(368, 346, 96, 54, "off") + D.text(416, 380, "off", "grey");
-    s += D.arrow(240, 442, 240, 402);
-    s += D.path("M130,452 v36 a110,13 0 0 0 220,0 v-36", "") + `<ellipse class="box" cx="240" cy="452" rx="110" ry="13"/>`;
-    s += D.text(240, 490, "models, pulled once", "grey");
+    [44, 152, 260].forEach((x) => { s += D.box(x, 346, 96, 54) + D.text(x + 48, 380, "GPU", "bold") + D.line(x + 48, 400, x + 48, 438); });
+    s += D.box(368, 346, 96, 54, "off") + D.text(416, 380, "off", "grey") + D.line(416, 400, 416, 438, "grey dash");
+    // One volume under the whole row: every worker mounts it, and only the gateway writes models to it.
+    s += D.path("M44,450 v44 a210,14 0 0 0 420,0 v-44") + `<ellipse class="box" cx="254" cy="450" rx="210" ry="14"/>`;
+    s += D.text(254, 494, "shared storage: models + images", "bold");
+    s += D.path("M320,169 H500 V480") + D.arrow(500, 480, 470, 480);
+    s += D.text(334, 160, safe ? "models, checked" : "pulls models", "grey", "start");
     if (safe) {
-      s += `<rect class="wall" x="22" y="326" width="466" height="94" rx="10"/>`;
-      s += D.text(22, 312, "unreachable", "red bold", "start");
+      s += `<rect class="wall" x="26" y="326" width="458" height="92" rx="10"/>`;
+      s += D.text(26, 312, "unreachable", "red bold", "start");
     }
     return s;
   }
