@@ -9,6 +9,7 @@ Needs:  pip install playwright img2pdf
         playwright install chromium
 Run:    python3 docs/pitch/brief/export.py        (the brief: index.html)
         python3 docs/pitch/brief/export.py lean   (the lean brief: index-lean.html)
+        python3 docs/pitch/brief/export.py short  (the short brief: index-short.html)
 """
 import pathlib
 import sys
@@ -21,7 +22,7 @@ VARIANT = sys.argv[1] if len(sys.argv) > 1 else ""
 SUFFIX = f"-{VARIANT}" if VARIANT else ""
 HTML = HERE / f"index{SUFFIX}.html"
 SLIDES = HERE / f"slides{SUFFIX}"
-COUNT = {"": 13, "lean": 10}[VARIANT]  # keep in step with the <section class="slide"> counts
+COUNT = {"": 13, "lean": 10, "short": 6}[VARIANT]  # keep in step with the <section class="slide"> counts
 
 pngs = []
 with sync_playwright() as p:

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ComfyUI on OpenShift — the short brief</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;700&family=Red+Hat+Text:wght@400;500;700&display=swap">
+<style>
+  :root { --back:#1b1b1b; --white:#fff; --ink:#151515; --grey:#6a6e73; --rule:#d2d2d2; --red:#ee0000; }
+  * { box-sizing:border-box; margin:0; }
+  html, body { height:100%; -webkit-text-size-adjust:100%; text-size-adjust:100%; }
+  body { background:var(--back); overflow:hidden; }
+  #stage-wrap { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; }
+  #stage { width:1280px; height:720px; background:var(--white); position:relative; transform-origin:center center; box-shadow:0 8px 40px rgba(0,0,0,.5); }
+  .slide { position:absolute; inset:0; padding:52px 72px 64px; display:none; flex-direction:column; font-family:"Red Hat Text", "Segoe UI", Arial, sans-serif; color:var(--ink); }
+  .slide.active { display:flex; }
+
+  h2 { font-family:"Red Hat Display", "Segoe UI", Arial, sans-serif; font-size:42px; font-weight:700; line-height:1.15; letter-spacing:-.005em; }
+  h2::after { content:""; display:block; width:64px; height:5px; background:var(--red); margin-top:18px; }
+
+  .row { display:flex; gap:48px; flex:1; min-height:0; align-items:center; margin-top:8px; }
+  ul { list-style:none; padding:0; flex:1.1; display:flex; flex-direction:column; gap:26px; }
+  li { position:relative; padding-left:34px; font-size:28px; line-height:1.35; }
+  li::before { content:""; position:absolute; left:2px; top:.5em; width:12px; height:12px; border-radius:50%; background:var(--red); }
+  li b { font-weight:700; color:var(--red); }
+  ul.status li { padding-left:52px; }
+  ul.status li::before { display:none; }
+  li .mk { position:absolute; left:0; top:4px; width:30px; height:30px; }
+  figure { flex:1; margin:0; align-self:stretch; display:flex; align-items:center; justify-content:center; min-width:0; }
+  figure svg { width:100%; max-height:100%; }
+
+  .foot { position:absolute; left:72px; right:72px; bottom:24px; display:flex; justify-content:space-between; font-size:14px; color:var(--grey); }
+
+  svg text { font-family:"Red Hat Text", Arial, sans-serif; font-size:21px; fill:var(--ink); }
+  svg text.grey { fill:var(--grey); font-size:19px; }
+  svg text.red { fill:var(--red); }
+  svg text.bold { font-weight:700; }
+  svg text.white { fill:#fff; font-weight:700; font-size:24px; }
+  svg .box { fill:#fff; stroke:var(--ink); stroke-width:2; }
+  svg .box.soft { stroke:#9a9da1; }
+  svg .box.off { stroke:#9a9da1; stroke-dasharray:6 5; }
+  svg .box.run { fill:var(--red); stroke:var(--red); }
+  svg .wire { fill:none; stroke:var(--ink); stroke-width:2; }
+  svg .wire.grey { stroke:#9a9da1; }
+  svg .wire.red { stroke:var(--red); stroke-width:2.5; }
+  svg .wire.dash { stroke-dasharray:6 5; }
+  svg .wall { fill:none; stroke:var(--red); stroke-width:2.5; stroke-dasharray:9 7; }
+  svg .solid { fill:var(--ink); }
+  svg .solid.red { fill:var(--red); }
+  svg .solid.dark { fill:#3c3f42; }
+  svg .solid.grey { fill:#9a9da1; }
+
+  #nav { position:fixed; right:18px; bottom:14px; z-index:10; display:flex; gap:8px; align-items:center; color:#8a8d90; font:13px "Red Hat Text", sans-serif; }
+  #nav button { background:var(--red); color:#fff; border:0; border-radius:6px; font:700 14px/1 "Red Hat Display", sans-serif; padding:8px 13px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="stage-wrap">
+<div id="stage">
+
+  <section class="slide active">
+    <h2>What is ComfyUI, and why is it hard to share?</h2>
+    <div class="row">
+      <ul>
+        <li>The open-source standard for AI images and video. Netflix, Apple, Nike use it.</li>
+        <li>Paid tools: <b>$79–215 a seat</b>, your data in their cloud.</li>
+        <li>A desktop app: <b>no login</b>, add-ons <b>run any code</b>.</li>
+        <li>So teams give everyone a GPU, idle most of the day.</li>
+      </ul>
+      <figure><svg data-draw="loop" viewBox="0 0 520 470" role="img" aria-label="A designer's loop: load a template, find missing models, download them, wire up the graph — none of which needs a GPU — then Run, the only GPU step, about two minutes"></svg></figure>
+    </div>
+    <div class="foot"><span>ComfyUI on OpenShift</span><span>1 / 6</span></div>
+  </section>
+
+  <section class="slide">
+    <h2>So what's the design?</h2>
+    <div class="row">
+      <ul>
+        <li>Same ComfyUI, same canvas. <b>Only the GPUs move.</b></li>
+        <li>Every Run becomes a job on one queue.</li>
+        <li>A pool of GPUs takes the jobs. Idle? <b>Zero machines.</b></li>
+        <li>Models download once, to shared storage.</li>
+      </ul>
+      <figure><svg data-draw="arch" viewBox="0 0 520 510" role="img" aria-label="Designers sign in through SSO to a gateway, which puts jobs on a queue; a row of GPU workers, scaling from zero to N, takes them; shared model storage sits underneath"></svg></figure>
+    </div>
+    <div class="foot"><span>ComfyUI on OpenShift</span><span>2 / 6</span></div>
+  </section>
+
+  <section class="slide">
+    <h2>ComfyUI runs any code. How is sharing safe?</h2>
+    <div class="row">
+      <ul>
+        <li>GPU workers are <b>unreachable</b>, not defended.</li>
+        <li>No network address. The only way in is the queue.</li>
+        <li>No internet out: models come in through the gateway, checked.</li>
+        <li>Company SSO at the door. GPU time metered per person.</li>
+      </ul>
+      <figure><svg data-draw="safe" viewBox="0 0 520 510" role="img" aria-label="The same diagram, with a red dashed line around the GPU workers marked unreachable; the queue is the only arrow that crosses it"></svg></figure>
+    </div>
+    <div class="foot"><span>ComfyUI on OpenShift</span><span>3 / 6</span></div>
+  </section>
+
+  <section class="slide">
+    <h2>What does it cost, and what's the catch?</h2>
+    <div class="row">
+      <ul>
+        <li>Ten designers: <b>~$7,100/mo</b> as a GPU each, <b>$120–950</b> as a pool.</li>
+        <li>Works because few people hit Run at once.</li>
+        <li>Catch: 8–17 min cold start. One warm GPU fixes it, ~$190/mo.</li>
+        <li>Catch: new add-on code means an image rebuild.</li>
+      </ul>
+      <figure><svg data-draw="bars" viewBox="0 0 520 470" role="img" aria-label="Three bars, GPU spend per month for ten designers: a GPU each about 7,100 dollars; the pool on a busy day about 950; the pool on a quiet day about 120"></svg></figure>
+    </div>
+    <div class="foot"><span>ComfyUI on OpenShift</span><span>4 / 6</span></div>
+  </section>
+
+  <section class="slide">
+    <h2>Why not serve each model on vLLM?</h2>
+    <div class="row">
+      <ul>
+        <li>vLLM keeps a model loaded on a GPU. Best for <b>one busy model</b>.</li>
+        <li>A design job is a graph: 2–3 models, many non-model steps.</li>
+        <li>Each extra model on vLLM: <b>+$713/mo</b>. In the pool: disk.</li>
+        <li>Use both: move a model to vLLM Omni once it dominates usage.</li>
+      </ul>
+      <figure><svg data-draw="curve" viewBox="0 0 520 470" role="img" aria-label="Monthly cost as the team uses more models: a GPU per model climbs a staircase, 713 dollars a step; the pool stays flat"></svg></figure>
+    </div>
+    <div class="foot"><span>ComfyUI on OpenShift</span><span>5 / 6</span></div>
+  </section>
+
+  <section class="slide">
+    <h2>Where is it, and what do we need?</h2>
+    <div class="row">
+      <ul class="status" style="flex:none; max-width:960px; gap:32px;">
+        <li data-mark="done">Built: ~9,000 lines of wiring. OpenShift already had the parts.</li>
+        <li data-mark="done">Ran end to end on real GPUs. Also runs on a laptop.</li>
+        <li data-mark="todo">Not proven at scale: a handful of users, three workers.</li>
+        <li data-mark="ask">Ask: <b>an owner</b>, a 30-minute PM read, <b>~$50</b> for a cluster day.</li>
+      </ul>
+    </div>
+    <div class="foot"><span>github.com/redhat-et/comfyui-on-openshift</span><span>6 / 6</span></div>
+  </section>
+
+</div>
+</div>
+
+<div id="nav"><span id="counter">1 / 6</span><button id="prev" aria-label="Previous slide">←</button><button id="next" aria-label="Next slide">→</button></div>
+
+<script>
+  // Plain vector primitives: every diagram below is built from these, so the style lives in the CSS above.
+  const D = {
+    line: (x1, y1, x2, y2, cls = "") => `<line class="wire ${cls}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"/>`,
+    path: (d, cls = "") => `<path class="wire ${cls}" d="${d}"/>`,
+    head: (x, y, ang, cls = "") => {
+      const p = (da) => `${(x - 13 * Math.cos(ang + da)).toFixed(1)},${(y - 13 * Math.sin(ang + da)).toFixed(1)}`;
+      return `<polygon class="solid ${cls}" points="${x},${y} ${p(.42)} ${p(-.42)}"/>`;
+    },
+    arrow: (x1, y1, x2, y2, cls = "") => D.line(x1, y1, x2, y2, cls) + D.head(x2, y2, Math.atan2(y2 - y1, x2 - x1), cls.replace("dash", "")),
+    box: (x, y, w, h, cls = "") => `<rect class="box ${cls}" x="${x}" y="${y}" width="${w}" height="${h}" rx="6"/>`,
+    text: (x, y, t, cls = "", anchor = "middle") => `<text class="${cls}" x="${x}" y="${y}" text-anchor="${anchor}">${t}</text>`,
+    person: (x, y) => `<circle class="solid" cx="${x}" cy="${y + 12}" r="11"/><path class="solid" d="M${x - 20},${y + 52} a20,19 0 0 1 40,0 z"/>`,
+  };
+
+  // The architecture, drawn once; slide 3 is the same diagram with the red boundary added.
+  function arch(safe) {
+    let s = "";
+    [180, 240, 300].forEach((x) => { s += D.person(x, 20); });
+    s += D.text(340, 56, "designers", "grey", "start");
+    s += D.arrow(240, 84, 240, 136);
+    s += D.text(254, 118, "SSO", "grey", "start");
+    s += D.box(160, 144, 160, 50) + D.text(240, 176, "gateway");
+    s += D.arrow(240, 194, 240, 236);
+    s += D.box(160, 238, 160, 40);
+    [200, 240, 280].forEach((x) => { s += D.line(x, 238, x, 278, "grey"); });
+    s += D.text(334, 266, "queue", "grey", "start");
+    s += D.arrow(240, 278, 240, 344, safe ? "red" : "");
+    s += D.text(254, 312, safe ? "the only way in" : "scales 0 → N", safe ? "red" : "grey", "start");
+    [44, 152, 260].forEach((x) => { s += D.box(x, 346, 96, 54) + D.text(x + 48, 380, "GPU", "bold"); });
+    s += D.box(368, 346, 96, 54, "off") + D.text(416, 380, "off", "grey");
+    s += D.arrow(240, 442, 240, 402);
+    s += D.path("M130,452 v36 a110,13 0 0 0 220,0 v-36", "") + `<ellipse class="box" cx="240" cy="452" rx="110" ry="13"/>`;
+    s += D.text(240, 490, "models, pulled once", "grey");
+    if (safe) {
+      s += `<rect class="wall" x="22" y="326" width="466" height="94" rx="10"/>`;
+      s += D.text(22, 312, "unreachable", "red bold", "start");
+    }
+    return s;
+  }
+
+  const drawings = {
+    loop() {
+      let s = "";
+      ["load a template", "find missing models", "download them", "wire up the graph"].forEach((t, i) => {
+        const y = 10 + i * 88;
+        s += D.box(90, y, 220, 50, "soft") + D.text(200, y + 32, t);
+        s += D.arrow(200, y + 50, 200, y + 86);
+      });
+      s += D.box(110, 362, 180, 62, "run") + D.text(200, 402, "Run", "white");
+      s += D.path("M334,10 h14 v314 h-14", "grey") + D.text(362, 174, "no GPU", "grey", "start");
+      s += D.text(200, 458, "GPU, ~2 min", "red bold");
+      s += D.path("M110,393 H48 V35 H78", "grey dash") + D.head(88, 35, 0, "grey");
+      return s;
+    },
+    arch: () => arch(false),
+    safe: () => arch(true),
+    bars() {
+      let s = "";
+      const bar = (x, v, top, label, cls) => {
+        const h = Math.max(5, (v / 7100) * 320), y = 392 - h;
+        return `<rect class="solid ${cls}" x="${x}" y="${y.toFixed(1)}" width="116" height="${h.toFixed(1)}"/>` +
+               D.text(x + 58, y - 12, top, `bold ${cls === "red" ? "red" : ""}`) + D.text(x + 58, 424, label, "grey");
+      };
+      s += bar(38, 7100, "~$7,100", "a GPU each", "dark");
+      s += bar(202, 950, "~$950", "pool, busy", "red");
+      s += bar(366, 120, "~$120", "pool, quiet", "red");
+      s += D.line(20, 392, 505, 392, "grey");
+      s += D.text(262, 462, "ten designers, GPU cost per month", "grey");
+      return s;
+    },
+    curve() {
+      let s = D.arrow(60, 392, 500, 392, "grey") + D.arrow(60, 392, 60, 28, "grey");
+      s += D.text(280, 428, "models the team uses", "grey");
+      s += D.text(74, 34, "$ / month", "grey", "start");
+      let d = "M60,392", x = 60, y = 392;
+      for (let i = 0; i < 10; i++) { y -= 32; d += ` V${y} H${x += 43}`; }
+      s += D.path(d, "red") + D.text(300, 118, "a GPU per model", "red bold", "end") + D.text(300, 146, "+$713 each", "red", "end");
+      s += `<path class="wire" style="stroke-width:3" d="M60,346 H490"/>` + D.text(490, 332, "the pool: flat", "bold", "end");
+      return s;
+    },
+  };
+
+  const marks = {
+    done: D.box(2, 3, 24, 24) + `<path class="wire red" style="stroke-width:3" d="M7,15 l5,6 l10,-12"/>`,
+    todo: D.box(2, 3, 24, 24, "soft"),
+    ask: D.arrow(1, 15, 27, 15, "red"),
+  };
+
+  document.querySelectorAll("[data-draw]").forEach((el) => { el.innerHTML = drawings[el.dataset.draw](); });
+  document.querySelectorAll("li[data-mark]").forEach((li) => {
+    li.insertAdjacentHTML("afterbegin", `<svg class="mk" viewBox="0 0 30 30">${marks[li.dataset.mark]}</svg>`);
+  });
+
+  const slides = Array.from(document.querySelectorAll(".slide"));
+  let current = 0;
+  function show(index) {
+    current = Math.max(0, Math.min(slides.length - 1, index));
+    slides.forEach((slide, i) => slide.classList.toggle("active", i === current));
+    document.getElementById("counter").textContent = (current + 1) + " / " + slides.length;
+  }
+  let fitFrozen = false;
+  function fit() {
+    if (fitFrozen) return;
+    const scale = Math.min(innerWidth / 1320, innerHeight / 770);
+    document.getElementById("stage").style.transform = "scale(" + Math.min(scale, 1.4) + ")";
+  }
+  const deep = location.hash.match(/^#(\d+)(x?)$/);
+  if (deep) {
+    show(parseInt(deep[1], 10) - 1);
+    if (deep[2]) {
+      fitFrozen = true;
+      document.getElementById("nav").style.display = "none";
+      document.getElementById("stage-wrap").style.position = "static";
+      document.getElementById("stage-wrap").style.display = "block";
+      document.getElementById("stage").style.transform = "none";
+    }
+  }
+  document.getElementById("next").onclick = () => show(current + 1);
+  document.getElementById("prev").onclick = () => show(current - 1);
+  addEventListener("keydown", (e) => {
+    if (e.key === "ArrowRight" || e.key === " " || e.key === "PageDown") show(current + 1);
+    if (e.key === "ArrowLeft" || e.key === "PageUp") show(current - 1);
+  });
+  addEventListener("resize", fit);
+  fit();
+</script>
+</body>
+</html>

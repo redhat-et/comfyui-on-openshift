@@ -16,6 +16,8 @@ canvas (frontend), worker (pod).
 
 **Leaner still:** [`index-lean.html`](index-lean.html) / [`comfyui-on-openshift-brief-lean.pdf`](comfyui-on-openshift-brief-lean.pdf) is the same ten slides with the chrome stripped — the question large, three or four short bullets, one picture, no appendix. Fill the rest by talking, or point at this deck and the repo.
 
+**Shortest:** [`index-short.html`](index-short.html) / [`comfyui-on-openshift-brief-short.pdf`](comfyui-on-openshift-brief-short.pdf) is six plain slides, black and red on white. Each is a question, three or four short bullets and at most one simple diagram: why ComfyUI is hard to share, the design, why sharing it is safe, the cost and its two catches, where vLLM fits, and the status with the ask. Slides 2 and 3 use the same diagram, with the red boundary added on 3.
+
 *(For presenting: [`index.html`](index.html) is the live version, arrow keys
 to navigate; [`comfyui-on-openshift-brief.pdf`](comfyui-on-openshift-brief.pdf)
 is the same slides as a click-through PDF.)*
